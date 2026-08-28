@@ -54,6 +54,7 @@ export const VALID_CONFIG_KEYS = new Set([
     "compress.reasoning",
     "compress.reasoning.drop",
     "compress.reasoning.threshold",
+    "compress.completionReserveTokens",
     "gc",
     "gc.algorithm",
     "gc.promotionThreshold",
@@ -585,6 +586,28 @@ export function validateConfigTypes(config: Record<string, any>): ValidationErro
                         })
                     }
                 }
+            }
+
+            if (
+                compress.completionReserveTokens !== undefined &&
+                typeof compress.completionReserveTokens !== "number"
+            ) {
+                errors.push({
+                    key: "compress.completionReserveTokens",
+                    expected: "number",
+                    actual: typeof compress.completionReserveTokens,
+                })
+            }
+
+            if (
+                typeof compress.completionReserveTokens === "number" &&
+                compress.completionReserveTokens < 0
+            ) {
+                errors.push({
+                    key: "compress.completionReserveTokens",
+                    expected: "non-negative number (>= 0)",
+                    actual: `${compress.completionReserveTokens}`,
+                })
             }
 
             if (
