@@ -104,6 +104,11 @@ export interface CompressConfig {
      * `getConfig()` always populates it via `DEFAULT_COMPRESS_REASONING`.
      */
     reasoning?: CompressReasoningConfig
+     * Tokens reserved for the model's completion when enforcing the context
+     * budget guard (default: 32768 — covers opencode's 32000 max_tokens
+     * fallback for models with no declared limit.output).
+     */
+    completionReserveTokens?: number
 }
 
 /**
@@ -133,7 +138,7 @@ export interface CompressReasoningConfig {
 export const DEFAULT_COMPRESS_REASONING: Readonly<CompressReasoningConfig> = {
     drop: true,
     threshold: 2048,
-}
+}}
 
 export interface Commands {
     enabled: boolean
@@ -560,6 +565,7 @@ export function mergeCompress(
             base.reasoning?.threshold ??
             DEFAULT_COMPRESS_REASONING.threshold,
     },
+    completionReserveTokens: override.completionReserveTokens ?? base.completionReserveTokens,
     }
 }
 

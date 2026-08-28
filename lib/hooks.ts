@@ -29,6 +29,7 @@ import { filterMessages, filterMessagesInPlace } from "./messages/shape"
 import { getLastUserMessage } from "./messages/query"
 import { OUTPUT_RESERVE_TOKENS, truncateLargeToolOutputs } from "./messages/truncate-tools"
 import { resolveEffectiveContextLimit } from "./state/utils"
+import { enforceContextBudget } from "./messages/enforce-budget"
 import {
     handleContextCommand,
     handleStatsCommand,
@@ -270,6 +271,23 @@ export function createChatMessageTransformHandler(
                 })
             }
             await updatePerTurnState(state, logger, messages)
+
+            if (
+                state.modelContextLimit === undefined &&
+                !state.noContextLimitWarned &&
+                requestModel?.providerID &&
+                requestModel?.modelID &&
+                registry.resolveModelLimit(requestModel.providerID, requestModel.modelID) === undefined
+            ) {
+                state.noContextLimitWarned = true
+                logger.warn(
+                    'Model reports no context window and the catalog has no entry for it; all percentage thresholds (min/max/emergency, GC) and the context-budget guard are disabled. Set the model limit in opencode.json (e.g. "limit": {"context": 262144, "output": 16384}) or set an absolute compress.maxContextLimit in acp.jsonc.',
+                    {
+                        session: state.sessionId,
+                        model: `${requestModel.providerID}/${requestModel.modelID}`,
+                    },
+                )
+            }
         }
 
         syncCompressPermissionState(state, config, hostPermissions, output.messages)
@@ -332,6 +350,7 @@ export function createChatMessageTransformHandler(
         const prePruneTokens = getCurrentTokenUsage(state, output.messages)
         prune(state, logger, config, output.messages)
         truncateLargeToolOutputs(state, config, logger, output.messages)
+        enforceContextBudget(state, config, logger, output.messages)
         hideConsumedCompressCalls(state, output.messages)
         assignMessageRefs(state, output.messages)
         const compressionPriorities = buildPriorityMap(config, state, output.messages)

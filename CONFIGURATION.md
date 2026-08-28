@@ -377,6 +377,11 @@ In this example, for `anthropic/claude-sonnet-4-6`: the floor is 30%, the over-m
 }
 ```
   Resolution: model-level `reasoning` > provider-level `reasoning` > global `compress.reasoning`, field by field (a field set at a deeper level overrides only that field). Provider/model IDs come from the current request's model identity.
+#### `compress.completionReserveTokens`
+- **Type:** `number`
+- **Default:** `32768`
+- **Status:** ACTIVE
+- **Description:** Tokens reserved for the model's completion by the context-budget guard. The guard estimates the request's input size and, if it exceeds `window - completionReserveTokens`, deterministically truncates (then clears) old compressible tool outputs until it fits — summaries, protected tools, the first user message, and the last 3 messages are never touched. The default `32768` covers opencode's `32000` `max_tokens` fallback for models with no declared `limit.output`. The guard is a no-op unless a context window is known: the model's declared limit, or an absolute (number) `compress.maxContextLimit`.
 
 ---
 

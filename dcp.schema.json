@@ -625,6 +625,12 @@
                             "description": "Single-thinking size gate (chars): a closed-turn compress message's total reasoning length must exceed this to be dropped. Small thinkings are kept (not accumulated across messages). 0 drops any non-empty reasoning."
                         }
                     }
+                },
+                "completionReserveTokens": {
+                    "type": "number",
+                    "default": 32768,
+                    "minimum": 0,
+                    "description": "Tokens reserved for the model's completion when the context-budget guard prunes tool outputs so the request fits the window. Default 32768 covers opencode's 32000 max_tokens fallback for models with no declared limit.output. The guard is a no-op unless the model's context window is known (declared limit or catalog entry); an absolute maxContextLimit is a soft nudge threshold and does not enable the guard."
                 }
             },
             "default": {
@@ -653,7 +659,8 @@
                 "reasoning": {
                     "drop": true,
                     "threshold": 2048
-                }
+                },
+                "completionReserveTokens": 32768
             }
         },
         "gc": {
