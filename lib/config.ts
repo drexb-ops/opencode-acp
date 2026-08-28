@@ -3,9 +3,13 @@ import { join, dirname } from "path"
 import { homedir } from "os"
 import { parse } from "jsonc-parser/lib/esm/main.js"
 import type { PluginInput } from "@opencode-ai/plugin"
-import { VALID_CONFIG_KEYS, getInvalidConfigKeys, validateConfigTypes, type ValidationError } from "./config-validation"
+import {
+    VALID_CONFIG_KEYS,
+    getInvalidConfigKeys,
+    validateConfigTypes,
+    type ValidationError,
+} from "./config-validation"
 import type { LogLevel } from "./logger"
-
 
 type Permission = "ask" | "allow" | "deny"
 
@@ -24,7 +28,12 @@ type Permission = "ask" | "allow" | "deny"
  */
 export type CompressOverridableConfig = Omit<
     CompressConfig,
-    "permission" | "minContextLimit" | "modelMaxLimits" | "modelMinLimits" | "providers" | "reasoning"
+    | "permission"
+    | "minContextLimit"
+    | "modelMaxLimits"
+    | "modelMinLimits"
+    | "providers"
+    | "reasoning"
 >
 
 /** Per-model / per-provider override object (all overridable fields optional). */
@@ -104,6 +113,7 @@ export interface CompressConfig {
      * `getConfig()` always populates it via `DEFAULT_COMPRESS_REASONING`.
      */
     reasoning?: CompressReasoningConfig
+    /**
      * Tokens reserved for the model's completion when enforcing the context
      * budget guard (default: 32768 — covers opencode's 32000 max_tokens
      * fallback for models with no declared limit.output).
@@ -138,7 +148,7 @@ export interface CompressReasoningConfig {
 export const DEFAULT_COMPRESS_REASONING: Readonly<CompressReasoningConfig> = {
     drop: true,
     threshold: 2048,
-}}
+}
 
 export interface Commands {
     enabled: boolean
@@ -233,7 +243,12 @@ const COMPRESS_DEFAULT_PROTECTED_TOOLS = ["skill", "compress"]
  */
 const FORCE_COMPRESS_PROTECTED: readonly string[] = ["compress"]
 
-export { VALID_CONFIG_KEYS, getInvalidConfigKeys, validateConfigTypes, type ValidationError } from "./config-validation"
+export {
+    VALID_CONFIG_KEYS,
+    getInvalidConfigKeys,
+    validateConfigTypes,
+    type ValidationError,
+} from "./config-validation"
 
 function showConfigWarnings(
     ctx: PluginInput,
@@ -347,7 +362,7 @@ const defaultConfig: PluginConfig = {
                 layer1MinChars: 200,
                 layer1MinRetentionPct: 5.0,
                 layer2MaxRougeF1: 0.05,
-                layer2MaxTop20Recall: 0.20,
+                layer2MaxTop20Recall: 0.2,
             },
         },
     },
@@ -481,7 +496,7 @@ function stripUndefined<T extends object>(value: T): T {
  */
 function mergeModelOverrides(
     base: Record<string, CompressModelOverrides> | undefined,
-    override: Record<string, CompressModelOverrides> | undefined
+    override: Record<string, CompressModelOverrides> | undefined,
 ): Record<string, CompressModelOverrides> | undefined {
     if (base === undefined) return override
     if (override === undefined) return base
@@ -501,7 +516,7 @@ function mergeModelOverrides(
  */
 function mergeProviderOverrides(
     base: Record<string, CompressProviderOverrides> | undefined,
-    override: Record<string, CompressProviderOverrides> | undefined
+    override: Record<string, CompressProviderOverrides> | undefined,
 ): Record<string, CompressProviderOverrides> | undefined {
     if (base === undefined) return override
     if (override === undefined) return base
@@ -548,24 +563,26 @@ export function mergeCompress(
         protectTags: override.protectTags ?? base.protectTags,
         protectUserMessages: override.protectUserMessages ?? base.protectUserMessages,
         maxSummaryLengthHard: override.maxSummaryLengthHard ?? base.maxSummaryLengthHard,
-    minCompressRange: override.minCompressRange ?? base.minCompressRange,
-    minNudgeGrowthRatio: override.minNudgeGrowthRatio ?? base.minNudgeGrowthRatio,
-    minNudgeGrowthFloor: override.minNudgeGrowthFloor ?? base.minNudgeGrowthFloor,
-    emergencyThresholdPercent: override.emergencyThresholdPercent ?? base.emergencyThresholdPercent,
-    maxVisibleSegments: override.maxVisibleSegments ?? base.maxVisibleSegments,
-    keepEmbedMaxChars: override.keepEmbedMaxChars ?? base.keepEmbedMaxChars,
-    lastSegmentSoftBlock: override.lastSegmentSoftBlock ?? base.lastSegmentSoftBlock,
-    preserveRecentMessages: override.preserveRecentMessages ?? base.preserveRecentMessages,
-    preserveRecentTokens: override.preserveRecentTokens ?? base.preserveRecentTokens,
-    preserveLastUserMessage: override.preserveLastUserMessage ?? base.preserveLastUserMessage,
-    reasoning: {
-        drop: override.reasoning?.drop ?? base.reasoning?.drop ?? DEFAULT_COMPRESS_REASONING.drop,
-        threshold:
-            override.reasoning?.threshold ??
-            base.reasoning?.threshold ??
-            DEFAULT_COMPRESS_REASONING.threshold,
-    },
-    completionReserveTokens: override.completionReserveTokens ?? base.completionReserveTokens,
+        minCompressRange: override.minCompressRange ?? base.minCompressRange,
+        minNudgeGrowthRatio: override.minNudgeGrowthRatio ?? base.minNudgeGrowthRatio,
+        minNudgeGrowthFloor: override.minNudgeGrowthFloor ?? base.minNudgeGrowthFloor,
+        emergencyThresholdPercent:
+            override.emergencyThresholdPercent ?? base.emergencyThresholdPercent,
+        maxVisibleSegments: override.maxVisibleSegments ?? base.maxVisibleSegments,
+        keepEmbedMaxChars: override.keepEmbedMaxChars ?? base.keepEmbedMaxChars,
+        lastSegmentSoftBlock: override.lastSegmentSoftBlock ?? base.lastSegmentSoftBlock,
+        preserveRecentMessages: override.preserveRecentMessages ?? base.preserveRecentMessages,
+        preserveRecentTokens: override.preserveRecentTokens ?? base.preserveRecentTokens,
+        preserveLastUserMessage: override.preserveLastUserMessage ?? base.preserveLastUserMessage,
+        reasoning: {
+            drop:
+                override.reasoning?.drop ?? base.reasoning?.drop ?? DEFAULT_COMPRESS_REASONING.drop,
+            threshold:
+                override.reasoning?.threshold ??
+                base.reasoning?.threshold ??
+                DEFAULT_COMPRESS_REASONING.threshold,
+        },
+        completionReserveTokens: override.completionReserveTokens ?? base.completionReserveTokens,
     }
 }
 
@@ -616,15 +633,14 @@ export function deepCloneConfig(config: PluginConfig): PluginConfig {
                               ...(provider.models
                                   ? {
                                         models: Object.fromEntries(
-                                            Object.entries(provider.models).map(([modelId, model]) => [
-                                                modelId,
-                                                { ...model },
-                                            ])
+                                            Object.entries(provider.models).map(
+                                                ([modelId, model]) => [modelId, { ...model }],
+                                            ),
                                         ),
                                     }
                                   : {}),
                           },
-                      ])
+                      ]),
                   )
                 : undefined,
             protectedTools: [...config.compress.protectedTools],
@@ -698,7 +714,8 @@ function mergeLayer(config: PluginConfig, data: Record<string, any>): PluginConf
         debug: data.debug ?? config.debug,
         logLevel: data.logLevel ?? config.logLevel,
         storagePath: data.storagePath ?? config.storagePath,
-        allowSubAgents: data.allowSubAgents ?? data.experimental?.allowSubAgents ?? config.allowSubAgents,
+        allowSubAgents:
+            data.allowSubAgents ?? data.experimental?.allowSubAgents ?? config.allowSubAgents,
         pruneNotification: data.pruneNotification ?? config.pruneNotification,
         pruneNotificationType: data.pruneNotificationType ?? config.pruneNotificationType,
         commands: mergeCommands(config.commands, data.commands as any),
@@ -708,8 +725,14 @@ function mergeLayer(config: PluginConfig, data: Record<string, any>): PluginConf
         ],
         compress: mergeCompress(config.compress, data.compress as CompressOverride),
         gc: mergeGC(config.gc, data.gc as Partial<GCConfig>),
-        qualityGate: mergeQualityGate(config.qualityGate, data.qualityGate as Partial<QualityGateConfig>),
-        messageFilters: mergeMessageFilters(config.messageFilters, data.messageFilters as Partial<MessageFiltersConfig>),
+        qualityGate: mergeQualityGate(
+            config.qualityGate,
+            data.qualityGate as Partial<QualityGateConfig>,
+        ),
+        messageFilters: mergeMessageFilters(
+            config.messageFilters,
+            data.messageFilters as Partial<MessageFiltersConfig>,
+        ),
     }
 }
 
