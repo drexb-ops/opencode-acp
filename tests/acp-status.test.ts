@@ -285,7 +285,10 @@ test("acp_status: scope=uncompressed defaults to ranges view", async () => {
 
 test("acp_status: scope=uncompressed view=messages shows per-message listing", async () => {
     const mockMsgs = [
-        { info: { id: "raw-1", role: "assistant" }, parts: [{ type: "text", text: "hello world" }] },
+        {
+            info: { id: "raw-1", role: "assistant", sessionID: SID, time: { created: 1 } },
+            parts: [{ type: "text", text: "hello world" }],
+        },
     ]
     const mockClient = makeMockClient(mockMsgs)
     const state = makeState([], new Map())
@@ -302,12 +305,13 @@ test("acp_status: scope=uncompressed view=messages shows per-message listing", a
 
     assert.match(result, /UNCOMPRESSED/)
     assert.match(result, /Sorted by/)
+    assert.match(result, /m00001 \(\d+\) text/, "per-message listing must include the visible message")
 })
 
 test("acp_status: scope=uncompressed view=messages with tool filter shows filter in header", async () => {
     const mockMsgs = [
         {
-            info: { id: "raw-1", role: "assistant" },
+            info: { id: "raw-1", role: "assistant", sessionID: SID, time: { created: 1 } },
             parts: [{ type: "tool", tool: "bash", state: { input: { command: "ls" } } }],
         },
     ]
@@ -325,6 +329,7 @@ test("acp_status: scope=uncompressed view=messages with tool filter shows filter
     const result = await statusTool.execute({ scope: "uncompressed", view: "messages", tool: "bash" } as any, { sessionID: SID } as any)
 
     assert.match(result, /UNCOMPRESSED — bash:/)
+    assert.match(result, /m00001 \(\d+\) bash/, "filtered listing must include the bash message")
 })
 
 test("acp_status: invalid scope falls back to overview", async () => {

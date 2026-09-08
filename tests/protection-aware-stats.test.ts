@@ -220,7 +220,7 @@ test("estimateContextComposition: reasoning on protected message counted in prot
     setupRefs(state, messages)
 
     const comp = estimateContextComposition(messages, state, ["skill"])
-    assert.ok(comp.reasoningTokens >= 200, "reasoning tokens counted")
+    assert.equal(comp.reasoningTokens, 200, "reasoning tokens counted exactly (800 chars / 4)")
     assert.ok(
         comp.protectedTokens >= comp.reasoningTokens,
         "protected tokens include the protected message's reasoning",

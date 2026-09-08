@@ -646,6 +646,37 @@ test("E2E: nudge recommendation content includes composition breakdown and compr
     )
 })
 
+test("E2E: nudge breakdown line shows reasoning category with token count (#371)", () => {
+    const state = createSessionState()
+    state.modelContextLimit = 1_000_000
+    state.nudges.lastPerMessageNudgeTokens = 200_000
+    const config = buildConfig()
+    config.compress.maxContextLimit = 800_000
+    config.compress.minContextLimit = 200_000
+
+    const messages: WithParts[] = [
+        userMsg("u1", "hello"),
+        {
+            info: {
+                id: "a1", role: "assistant", sessionID: SID, agent: "a", time: { created: 2 },
+                tokens: { input: 200_000, output: 55_000 },
+            } as WithParts["info"],
+            parts: [
+                { id: "a1-r", messageID: "a1", sessionID: SID, type: "reasoning" as const, text: "z".repeat(8_000) },
+                textPart("a1", "done"),
+            ],
+        },
+    ]
+    injectCompressNudges(state, config, logger, messages, {} as any)
+
+    assert.equal(state.nudges.shouldInjectThisTurn, true, "should nudge (55K growth >= 50K threshold)")
+
+    const injected = suffixText(messages)
+    assert.ok(injected.includes("Breakdown:"), "nudge must include composition breakdown")
+    // 8_000 chars of reasoning / 4 = 2_000 tokens
+    assert.match(injected, /2\.0K reasoning \(\d+%\)/, "breakdown must show reasoning category with its token count")
+})
+
 test("growth floor: nudge suppressed when growth below floor (issue #27 anti-thrashing)", () => {
     // 1M model: growthFloor = max(5000, 0.45×50000) = 22500
     // Growth of 5K < 22500 → no nudge output at all

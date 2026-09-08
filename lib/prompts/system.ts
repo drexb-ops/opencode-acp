@@ -73,7 +73,7 @@ CONTEXT BREAKDOWN
 
 When context usage passes a threshold, the system appends a breakdown showing where your context tokens are spent:
 
-Breakdown: 5.2K system (21%) | 12.3K tool (40%) | 3.1K summaries (10%) | 8.5K code (28%) | 6.5K text (22%) | 2.4K reasoning (10%)
+Breakdown: 4.2K system (21%) | 8.0K tool (40%) | 2.0K summaries (10%) | 2.6K code (13%) | 2.2K text (11%) | 1.0K reasoning (5%)
 
 - "system" = system prompt tokens (AGENTS.md, tool definitions — not compressible)
 - "tool" = tool call outputs (largest category — compress first when consumed)
