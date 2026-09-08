@@ -115,6 +115,9 @@ interface VisibleMessageInfo {
     tokens: number
     tool: string
     index: number
+    // Reasoning (thinking) part tokens, tracked separately from `tokens`
+    // (text+tool) so the overview can show it as its own category (#371).
+    reasoning: number
 }
 
 export interface StatusRenderContext {
@@ -153,6 +156,7 @@ function collectVisibleMessages(
         if (!ref) return
 
         let tokens = 0
+        let reasoning = 0
         let toolName = ""
 
         for (const part of msg.parts || []) {
@@ -164,11 +168,13 @@ function collectVisibleMessages(
                 if (!toolName) {
                     toolName = (part as any)?.tool || "unknown"
                 }
+            } else if (part.type === "reasoning" && typeof (part as any).text === "string") {
+                reasoning += Math.round(((part as any).text as string).length / 4)
             }
         }
 
-        if (tokens > 0) {
-            result.push({ ref, tokens, tool: toolName || "text", index: idx })
+        if (tokens > 0 || reasoning > 0) {
+            result.push({ ref, tokens, tool: toolName || "text", index: idx, reasoning })
         }
     })
 
@@ -209,16 +215,18 @@ function renderOverview(
         const totalText = visibleMessages
             .filter((m) => m.tool === "text")
             .reduce((s, m) => s + m.tokens, 0)
-        const total = systemTokens + totalTool + totalText + summaryTokens
+        const totalReasoning = visibleMessages.reduce((s, m) => s + m.reasoning, 0)
+        const total = systemTokens + totalTool + totalText + summaryTokens + totalReasoning
 
         const sysPct = pct(systemTokens, total)
         const toolPct = pct(totalTool, total)
         const textPct = pct(totalText, total)
         const summaryPct = pct(summaryTokens, total)
+        const reasoningPct = pct(totalReasoning, total)
 
         lines.push("CONTEXT BREAKDOWN")
         lines.push(
-            `  ${formatTokens(systemTokens)} system (${sysPct}%) | ${formatTokens(totalTool)} tool (${toolPct}%) | ${formatTokens(totalText)} text (${textPct}%) | ${formatTokens(summaryTokens)} summaries (${summaryPct}%)`,
+            `  ${formatTokens(systemTokens)} system (${sysPct}%) | ${formatTokens(totalTool)} tool (${toolPct}%) | ${formatTokens(totalText)} text (${textPct}%) | ${formatTokens(summaryTokens)} summaries (${summaryPct}%) | ${formatTokens(totalReasoning)} reasoning (${reasoningPct}%)`,
         )
 
         const topTypes = Array.from(toolTypeMap.entries())
@@ -357,16 +365,18 @@ function renderUncompressedDrilldown(
         filtered = filtered.filter((m) => m.tool === toolFilter)
     }
 
+    const sizeOf = (m: VisibleMessageInfo) => m.tokens + m.reasoning
+
     if (sort === "time") {
         filtered.sort((a, b) => a.index - b.index)
     } else if (sort === "tool") {
-        filtered.sort((a, b) => a.tool.localeCompare(b.tool) || b.tokens - a.tokens)
+        filtered.sort((a, b) => a.tool.localeCompare(b.tool) || sizeOf(b) - sizeOf(a))
     } else {
-        filtered.sort((a, b) => b.tokens - a.tokens)
+        filtered.sort((a, b) => sizeOf(b) - sizeOf(a))
     }
 
-    const totalTokens = filtered.reduce((s, m) => s + m.tokens, 0)
-    const allTokens = visibleMessages.reduce((s, m) => s + m.tokens, 0)
+    const totalTokens = filtered.reduce((s, m) => s + sizeOf(m), 0)
+    const allTokens = visibleMessages.reduce((s, m) => s + sizeOf(m), 0)
 
     const header = toolFilter
         ? `UNCOMPRESSED — ${toolFilter}: ${formatTokens(totalTokens)} | ${filtered.length} msgs | ${pct(totalTokens, allTokens)}% of visible`
@@ -378,7 +388,7 @@ function renderUncompressedDrilldown(
 
     const shown = filtered.slice(0, limit)
     for (const m of shown) {
-        lines.push(`  ${m.ref} (${formatTokens(m.tokens)}) ${m.tool}`)
+        lines.push(`  ${m.ref} (${formatTokens(sizeOf(m))}) ${m.tool}`)
     }
 
     if (filtered.length > shown.length) {

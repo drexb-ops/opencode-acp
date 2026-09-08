@@ -73,13 +73,14 @@ CONTEXT BREAKDOWN
 
 When context usage passes a threshold, the system appends a breakdown showing where your context tokens are spent:
 
-Breakdown: 5.2K system (21%) | 12.3K tool (40%) | 3.1K summaries (10%) | 8.5K code (28%) | 6.5K text (22%)
+Breakdown: 5.2K system (21%) | 12.3K tool (40%) | 3.1K summaries (10%) | 8.5K code (28%) | 6.5K text (22%) | 2.4K reasoning (10%)
 
 - "system" = system prompt tokens (AGENTS.md, tool definitions — not compressible)
 - "tool" = tool call outputs (largest category — compress first when consumed)
 - "summaries" = existing compression block summaries (already compressed; do not re-compress standalone)
 - "code" = messages containing code blocks
 - "text" = plain text messages
+- "reasoning" = model thinking blocks (counted to match real API usage; freed when their message is compressed)
 
 Below the breakdown, the system lists compressible ranges grouped by conversation turn. All listed ranges should be compressed to summary format — the only exceptions are protected content, content the current step is actively using, or critical content you cannot reconstruct. Compress the largest ranges first when the current step no longer needs them.
 

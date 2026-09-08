@@ -601,7 +601,7 @@ export const injectCompressNudges = (
             const sysPart = composition.systemTokens > 0
                 ? `${fmt(composition.systemTokens)} system (${pct(composition.systemTokens)}%) | `
                 : ""
-            let breakdown = `${efficiencyNote}\nBreakdown: ${sysPart}${fmt(composition.toolTokens)} tool (${pct(composition.toolTokens)}%) | ${fmt(composition.summaryTokens)} summaries (${pct(composition.summaryTokens)}%) | ${fmt(composition.codeTokens)} code (${pct(composition.codeTokens)}%) | ${fmt(plainTextTokens)} text (${pct(plainTextTokens)}%)${growthStr}`
+            let breakdown = `${efficiencyNote}\nBreakdown: ${sysPart}${fmt(composition.toolTokens)} tool (${pct(composition.toolTokens)}%) | ${fmt(composition.summaryTokens)} summaries (${pct(composition.summaryTokens)}%) | ${fmt(composition.codeTokens)} code (${pct(composition.codeTokens)}%) | ${fmt(plainTextTokens)} text (${pct(plainTextTokens)}%) | ${fmt(composition.reasoningTokens)} reasoning (${pct(composition.reasoningTokens)}%)${growthStr}`
 
             const compressibleTokens =
                 composition.total -
