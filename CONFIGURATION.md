@@ -65,6 +65,17 @@ Status legend: **ACTIVE** = currently used | **DEPRECATED** = kept for backward 
 - **Status:** ACTIVE
 - **Description:** File log verbosity for `~/.config/opencode/logs/acp/daily/<date>.log`. Default `info` writes decision-level events by default (nudge decisions, transform summaries, auto-update checks, model switches). `warn`/`error` reduce output; `silent` disables file logging entirely; `debug` additionally enables per-request context snapshots and verbose dumps. Ignored when `debug: true`.
 
+#### `storagePath`
+- **Type:** `string`
+- **Default:** unset — `$XDG_DATA_HOME/opencode/storage/plugin/acp` (i.e. `~/.local/share/opencode/storage/plugin/acp`)
+- **Status:** ACTIVE
+- **Description:** Directory where per-session state files (`{sessionId}.json` — compression blocks, nudge state, token stats) are persisted. Path semantics:
+  - Absolute path → used as-is
+  - `~` / `~/...` → expanded against the home directory
+  - Relative path → resolved against the project directory (where opencode was started)
+
+  The directory is created automatically if it does not exist. If you set this option and the session's state file still exists at the default location, ACP logs a WARN (once per session) instead of migrating it — move the file manually if you want to keep the session history.
+
 #### `pruneNotification`
 - **Type:** `"off" | "minimal" | "detailed"`
 - **Default:** `"off"`
@@ -554,6 +565,15 @@ See the [`compress.providers`](#compressproviders) reference for the full overri
         "**/credentials.json",
         "**/secrets.*"
     ]
+}
+```
+
+### Relocate session state storage
+
+```jsonc
+{
+    // Absolute path, ~ expansion, or project-relative
+    "storagePath": "~/data/acp-state"
 }
 ```
 

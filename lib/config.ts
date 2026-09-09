@@ -171,6 +171,13 @@ export interface PluginConfig {
     debug: boolean
     /** Log verbosity when `debug` is false; `debug: true` forces full debug logging. Default: "info". */
     logLevel: LogLevel
+    /**
+     * Directory where per-session state files are persisted.
+     * Absolute paths are used as-is; `~`/`~/...` expand against the home
+     * directory; relative paths resolve against the project directory.
+     * Unset → `$XDG_DATA_HOME/opencode/storage/plugin/acp` (default).
+     */
+    storagePath?: string
     allowSubAgents: boolean
     pruneNotification: "off" | "minimal" | "detailed"
     pruneNotificationType: "chat" | "toast"
@@ -673,6 +680,7 @@ function mergeLayer(config: PluginConfig, data: Record<string, any>): PluginConf
         autoUpdate: data.autoUpdate ?? config.autoUpdate,
         debug: data.debug ?? config.debug,
         logLevel: data.logLevel ?? config.logLevel,
+        storagePath: data.storagePath ?? config.storagePath,
         allowSubAgents: data.allowSubAgents ?? data.experimental?.allowSubAgents ?? config.allowSubAgents,
         pruneNotification: data.pruneNotification ?? config.pruneNotification,
         pruneNotificationType: data.pruneNotificationType ?? config.pruneNotificationType,

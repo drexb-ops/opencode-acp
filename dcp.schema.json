@@ -31,6 +31,10 @@
             "default": "info",
             "description": "Log verbosity: decision-level events (info) are written by default. debug adds per-message detail; warn/error/silent reduce output."
         },
+        "storagePath": {
+            "type": "string",
+            "description": "Directory where per-session state files are persisted. Absolute paths are used as-is; ~/... expands against the home directory; relative paths resolve against the project directory. Unset: $XDG_DATA_HOME/opencode/storage/plugin/acp (default)."
+        },
         "pruneNotification": {
             "type": "string",
             "enum": [

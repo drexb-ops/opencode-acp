@@ -65,6 +65,17 @@ ACP 从最多三层配置文件中读取（后加载的覆盖先加载的）：
 - **状态：** ACTIVE
 - **说明：** 文件日志详细级别（`~/.config/opencode/logs/acp/daily/<日期>.log`）。默认 `info`：默认落盘决策级事件（压缩提示决策、转换摘要、自动更新检查、模型切换等）。`warn`/`error` 减少输出；`silent` 完全关闭文件日志；`debug` 额外启用按请求的上下文快照与详细转储。`debug: true` 时忽略此配置。
 
+#### `storagePath`
+- **类型：** `string`
+- **默认值：** 未设置 — `$XDG_DATA_HOME/opencode/storage/plugin/acp`（即 `~/.local/share/opencode/storage/plugin/acp`）
+- **状态：** ACTIVE
+- **说明：** 会话状态文件（`{sessionId}.json`，含压缩块、提示状态、token 统计）的持久化目录。路径语义：
+  - 绝对路径 → 原样使用
+  - `~` / `~/...` → 相对于主目录展开
+  - 相对路径 → 相对于项目目录（opencode 启动目录）解析
+
+  目录不存在时会自动创建。若设置了此项、但会话状态文件仍位于默认位置，ACP 会记录一条 WARN（每会话一次）而不会自动迁移——如需保留会话历史，请手动移动该文件。
+
 #### `pruneNotification`
 - **类型：** `"off" | "minimal" | "detailed"`
 - **默认值：** `"off"`
@@ -554,6 +565,15 @@ ACP 从最多三层配置文件中读取（后加载的覆盖先加载的）：
         "**/credentials.json",
         "**/secrets.*"
     ]
+}
+```
+
+### 自定义会话状态存储位置
+
+```jsonc
+{
+    // 绝对路径、~ 展开，或相对于项目目录
+    "storagePath": "~/data/acp-state"
 }
 ```
 
