@@ -9,6 +9,7 @@ export const VALID_CONFIG_KEYS = new Set([
     "autoUpdate",
     "debug",
     "logLevel",
+    "storagePath",
     "showUpdateToasts",
     "allowSubAgents",
     "pruneNotification",
@@ -117,6 +118,10 @@ export function validateConfigTypes(config: Record<string, any>): ValidationErro
 
     if (config.debug !== undefined && typeof config.debug !== "boolean") {
         errors.push({ key: "debug", expected: "boolean", actual: typeof config.debug })
+    }
+
+    if (config.storagePath !== undefined && typeof config.storagePath !== "string") {
+        errors.push({ key: "storagePath", expected: "string", actual: typeof config.storagePath })
     }
 
     if (config.allowSubAgents !== undefined && typeof config.allowSubAgents !== "boolean") {
