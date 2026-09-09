@@ -2,11 +2,14 @@ import "./test-env"
 import assert from "node:assert/strict"
 import test from "node:test"
 import * as fs from "fs/promises"
-import { existsSync, mkdtempSync, rmSync } from "fs"
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from "fs"
 import { join } from "path"
+import { cwd } from "process"
 import { homedir, tmpdir } from "os"
+import type { PluginInput } from "@opencode-ai/plugin"
 import { Logger } from "../lib/logger"
-import type { PluginConfig } from "../lib/config"
+import { getConfig, type PluginConfig } from "../lib/config"
+import { validateConfigTypes } from "../lib/config-validation"
 import {
     getDefaultStorageDir,
     loadAllSessionStats,
@@ -176,11 +179,14 @@ test("save/load without storagePath still use the default location (regression)"
     await saveSessionState(state, logger)
 
     const filePath = join(getDefaultStorageDir(), "sp-default-loc.json")
-    assert.ok(existsSync(filePath), "file should be in default dir")
-    const loaded = await loadSessionState("sp-default-loc", logger)
-    assert.ok(loaded, "should load from default dir")
-    assert.equal(loaded!.stats.totalPruneTokens, 789)
-    await fs.unlink(filePath)
+    try {
+        assert.ok(existsSync(filePath), "file should be in default dir")
+        const loaded = await loadSessionState("sp-default-loc", logger)
+        assert.ok(loaded, "should load from default dir")
+        assert.equal(loaded!.stats.totalPruneTokens, 789)
+    } finally {
+        await fs.unlink(filePath).catch(() => {})
+    }
 })
 
 test("loadAllSessionStats aggregates from the configured storageDir", async () => {
@@ -308,5 +314,140 @@ test("ensureSessionInitialized does not warn when storagePath is unset", async (
         )
     } finally {
         await fs.unlink(join(getDefaultStorageDir(), "sp-no-warn.json")).catch(() => {})
+    }
+})
+
+test("getConfig merges storagePath across global and project config layers", async () => {
+    const savedOpenCodeConfigDir = process.env.OPENCODE_CONFIG_DIR
+    delete process.env.OPENCODE_CONFIG_DIR
+    const globalConfigPath = join(
+        process.env.XDG_CONFIG_HOME || join(homedir(), ".config"),
+        "opencode",
+        "acp.jsonc",
+    )
+    const projectDir = mkdtempSync(join(tmpdir(), "acp-cfg-proj-"))
+    const opencodeDir = join(projectDir, ".opencode")
+    const projectConfigPath = join(opencodeDir, "acp.jsonc")
+    const globalConfigBackup = existsSync(globalConfigPath)
+        ? await fs.readFile(globalConfigPath, "utf-8")
+        : null
+
+    try {
+        mkdirSync(join(process.env.XDG_CONFIG_HOME!, "opencode"), { recursive: true })
+        await fs.writeFile(globalConfigPath, '{ "storagePath": "/global/acp" }', "utf-8")
+
+        const fakeCtx = {
+            directory: projectDir,
+            client: { tui: { showToast: () => {} } },
+        } as unknown as PluginInput
+
+        // Global layer only
+        let config = getConfig(fakeCtx)
+        assert.equal(config.storagePath, "/global/acp", "global layer should apply")
+
+        // Project layer overrides global
+        mkdirSync(opencodeDir, { recursive: true })
+        await fs.writeFile(projectConfigPath, '{ "storagePath": "/project/acp" }', "utf-8")
+        config = getConfig(fakeCtx)
+        assert.equal(config.storagePath, "/project/acp", "project layer should win")
+
+        // No config anywhere → unset (default location)
+        await fs.unlink(globalConfigPath)
+        rmSync(opencodeDir, { recursive: true, force: true })
+        config = getConfig(fakeCtx)
+        assert.equal(config.storagePath, undefined, "unset by default")
+    } finally {
+        if (globalConfigBackup !== null) {
+            await fs.writeFile(globalConfigPath, globalConfigBackup, "utf-8")
+        } else {
+            await fs.unlink(globalConfigPath).catch(() => {})
+        }
+        rmSync(projectDir, { recursive: true, force: true })
+        if (savedOpenCodeConfigDir === undefined) {
+            delete process.env.OPENCODE_CONFIG_DIR
+        } else {
+            process.env.OPENCODE_CONFIG_DIR = savedOpenCodeConfigDir
+        }
+    }
+})
+
+test("validateConfigTypes rejects non-string storagePath", () => {
+    assert.equal(
+        validateConfigTypes({ storagePath: 42 }).some((e) => e.key === "storagePath"),
+        true,
+        "numeric storagePath should produce a validation error",
+    )
+    assert.equal(
+        validateConfigTypes({ storagePath: "/valid/path" }).some((e) => e.key === "storagePath"),
+        false,
+        "string storagePath should not produce a validation error",
+    )
+})
+
+test("ensureSessionInitialized resumes state from the custom location without warning", async () => {
+    const customDir = makeCustomDir()
+    const warnings: string[] = []
+    const spyLogger = makeSpyLogger(warnings)
+    try {
+        // Seed DIFFERENT values at custom and default locations
+        const customSeeded = createSessionState()
+        customSeeded.sessionId = "sp-resume-custom"
+        customSeeded.storageDir = customDir
+        customSeeded.stats.totalPruneTokens = 111
+        await saveSessionState(customSeeded, logger)
+
+        const defaultSeeded = createSessionState()
+        defaultSeeded.sessionId = "sp-resume-custom"
+        defaultSeeded.stats.totalPruneTokens = 222
+        await saveSessionState(defaultSeeded, logger)
+
+        const state = createSessionState()
+        const config = buildConfig({ storagePath: customDir })
+        await ensureSessionInitialized(
+            null,
+            state,
+            "sp-resume-custom",
+            spyLogger,
+            [],
+            config,
+            "/some/project",
+        )
+
+        assert.equal(state.storageDir, customDir)
+        assert.equal(
+            state.stats.totalPruneTokens,
+            111,
+            "state must be restored from the custom location, not the default",
+        )
+        assert.equal(warnings.length, 0, `expected no warnings, got: ${JSON.stringify(warnings)}`)
+    } finally {
+        rmSync(customDir, { recursive: true, force: true })
+        await fs.unlink(join(getDefaultStorageDir(), "sp-resume-custom.json")).catch(() => {})
+    }
+})
+
+test("ensureSessionInitialized falls back to process.cwd() when projectDir is omitted", async () => {
+    const state = createSessionState()
+    const config = buildConfig({ storagePath: "data/acp-cwd" })
+
+    await ensureSessionInitialized(null, state, "sp-init-cwd", logger, [], config)
+
+    assert.equal(state.storageDir, join(cwd(), "data/acp-cwd"))
+})
+
+test("saveSessionState does not persist the transient storageDir field", async () => {
+    const customDir = makeCustomDir()
+    try {
+        const state = createSessionState()
+        state.sessionId = "sp-no-leak"
+        state.storageDir = customDir
+        state.stats.totalPruneTokens = 5
+
+        await saveSessionState(state, logger)
+
+        const raw = JSON.parse(await fs.readFile(join(customDir, "sp-no-leak.json"), "utf-8"))
+        assert.equal("storageDir" in raw, false, "storageDir must not appear in the persisted JSON")
+    } finally {
+        rmSync(customDir, { recursive: true, force: true })
     }
 })

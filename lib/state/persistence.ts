@@ -102,13 +102,6 @@ function getStorageDir(override?: string): string {
     return override || getDefaultStorageDir()
 }
 
-async function ensureStorageDir(logger: Logger, storageDir?: string): Promise<void> {
-    const dir = getStorageDir(storageDir)
-    if (!existsSync(dir)) {
-        await fs.mkdir(dir, { recursive: true })
-    }
-}
-
 function getSessionFilePath(sessionId: string, storageDir?: string): string {
     return join(getStorageDir(storageDir), `${sessionId}.json`)
 }
