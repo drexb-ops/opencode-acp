@@ -3,7 +3,7 @@
 - Task ID: `2026-09-09_custom-storage-path`
 - Home Repo: `opencode-acp`
 - Created: 2026-09-09
-- Status: InProgress
+- Status: Done
 - Priority: P2
 - Owner: ranxianglei
 - References: https://github.com/ranxianglei/opencode-acp/issues/379

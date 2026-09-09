@@ -2,7 +2,7 @@
 
 - Task ID: `2026-09-09_custom-storage-path`
 - Home Repo: `opencode-acp`
-- Status: InProgress
+- Status: Done
 - Updated: 2026-09-09
 
 ## 1. Summary
@@ -26,7 +26,7 @@
 
 | Commit | Description |
 |--------|-------------|
-| `<sha>` | feat: storagePath config for custom session-state storage location |
+| `7c1a2ba` | feat: storagePath config for custom session-state storage location |
 
 ### Key Files
 
@@ -93,7 +93,7 @@ npm run test
 - **Risk points**: relative-path base (mitigated: project dir); state
   "loss" on location switch (mitigated: WARN).
 - **Rollback method**:
-  - Revert commit(s): `<sha>`
+  - Revert commit(s): `7c1a2ba`
   - Rollback impact: none — option is additive and unset by default.
 - **Compatibility notes** (data format, config schema): No persisted-format
   change; schema gains one optional property.
