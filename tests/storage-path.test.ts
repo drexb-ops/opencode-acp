@@ -17,7 +17,12 @@ import {
     resolveStorageDir,
     saveSessionState,
 } from "../lib/state/persistence"
-import { createSessionState, ensureSessionInitialized } from "../lib/state"
+import {
+    SessionStateRegistry,
+    createSessionState,
+    ensureSessionInitialized,
+    resetSessionState,
+} from "../lib/state"
 
 const logger = new Logger(false)
 
@@ -382,6 +387,11 @@ test("validateConfigTypes rejects non-string storagePath", () => {
         false,
         "string storagePath should not produce a validation error",
     )
+    assert.equal(
+        validateConfigTypes({ storagePath: undefined }).some((e) => e.key === "storagePath"),
+        false,
+        "undefined storagePath should not produce a validation error",
+    )
 })
 
 test("ensureSessionInitialized resumes state from the custom location without warning", async () => {
@@ -450,4 +460,27 @@ test("saveSessionState does not persist the transient storageDir field", async (
     } finally {
         rmSync(customDir, { recursive: true, force: true })
     }
+})
+
+test("SessionStateRegistry.getOrCreate passes projectDir for relative storagePath resolution", async () => {
+    const projectDir = mkdtempSync(join(tmpdir(), "acp-registry-"))
+    try {
+        const registry = new SessionStateRegistry(logger, projectDir)
+        const config = buildConfig({ storagePath: "data/acp-registry" })
+
+        const state = await registry.getOrCreate(null, "sp-registry-proj", [], config)
+
+        assert.equal(state.storageDir, join(projectDir, "data/acp-registry"))
+    } finally {
+        rmSync(projectDir, { recursive: true, force: true })
+    }
+})
+
+test("resetSessionState clears the transient storageDir", () => {
+    const state = createSessionState()
+    state.storageDir = "/some/custom/dir"
+
+    resetSessionState(state)
+
+    assert.equal(state.storageDir, undefined)
 })

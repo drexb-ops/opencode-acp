@@ -302,7 +302,7 @@ export async function ensureSessionInitialized(
         const defaultPath = join(getDefaultStorageDir(), `${sessionId}.json`)
         if (state.storageDir && existsSync(defaultPath)) {
             logger.warn(
-                "storagePath is set but no state was found there; a state file exists at the default location — move it manually to keep history",
+                "storagePath is set but no valid state was found there; a state file exists at the default location — move it manually to keep history",
                 { sessionId, storageDir: state.storageDir, defaultPath },
             )
         }
@@ -331,7 +331,8 @@ export async function ensureSessionInitialized(
     state.nudges.lastPerMessageNudgeTokens = persisted.nudges.lastPerMessageNudgeTokens
     state.nudges.lastNudgeShownTokens = persisted.nudges.lastNudgeShownTokens
     state.nudges.lastToolOutputNudgeTokens = persisted.nudges.lastToolOutputNudgeTokens
-    state.nudges.lastTier2NudgeTokens = persisted.nudges.lastTier2NudgeTokens ?? persisted.nudges.lastTierNudgeTokens
+    state.nudges.lastTier2NudgeTokens =
+        persisted.nudges.lastTier2NudgeTokens ?? persisted.nudges.lastTierNudgeTokens
     state.nudges.lastTier3NudgeTokens = persisted.nudges.lastTier3NudgeTokens
     state.nudges.compressBaselineSet = persisted.nudges.compressBaselineSet ?? false
     state.stats = {
