@@ -27,6 +27,12 @@
 - `README.md` — `messageFilters` entry in Default Configuration block
 - `README.zh-CN.md` — same, translated
 
+### Merge conflict resolution (2026-09-09, after v1.16.0 landed on master)
+
+- `origin/master` (v1.15.0 + v1.16.0 storagePath) merged into the branch. Only conflict: both branches appended a new recipe to "Common Config Recipes" right after "Protect sensitive files" in CONFIGURATION.md / CONFIGURATION.zh-CN.md — this PR added the OMO messageFilters recipe, master added the `storagePath` recipe.
+- Resolution: keep **both** recipes (OMO filters first, then "Relocate session state storage" / "自定义会话状态存储位置"). No content dropped.
+- Re-verified after merge: `npm run typecheck` ✅, `npm run build` ✅, full test suite 1131/1131 pass ✅, `scripts/ci/check-pr.sh` all checks pass ✅.
+
 ## 3. Design & Implementation Notes
 
 - **Entry point / key function**: N/A (docs only)
@@ -46,7 +52,7 @@ node --import tsx --test tests/*.test.ts
 ### Test Coverage
 
 - New/modified test files: none (docs only)
-- Test count: 1112 total, 1112 pass, 0 fail
+- Test count: 1112 total, 1112 pass, 0 fail (at PR creation); 1131 total, 1131 pass, 0 fail after merging master (v1.15.0/v1.16.0 added storage-path tests)
 - Key scenarios verified: documented defaults cross-checked against `lib/config.ts:285-294` and `lib/messages/filter/builtin/*.ts`
 
 ### Results

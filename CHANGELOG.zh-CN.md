@@ -1,5 +1,59 @@
 # 更新日志
 
+### v1.16.0 — storagePath：自定义会话状态文件存储位置
+
+**问题**：ACP 的每会话状态文件（`{sessionId}.json` —— 压缩块、nudge 状态、token 统计）此前固定写入硬编码路径 `$XDG_DATA_HOME/opencode/storage/plugin/acp`。容器、NFS 家目录或 XDG data 目录空间紧张的用户无法迁移（issue #379）。
+
+**新功能**（#380，closes #379）：
+- 新增顶层可选配置 `storagePath`（字符串），用于自定义会话状态目录：
+
+| 取值 | 解析方式 |
+|---|---|
+| 未设置 / 空 | 默认 `$XDG_DATA_HOME/opencode/storage/plugin/acp`（不变） |
+| `/abs/path` | 原样使用 |
+| `~` / `~/x` | 展开到用户主目录 |
+| `rel/path` | 相对项目目录（opencode 工作目录）解析 |
+
+```jsonc
+// acp.jsonc —— 全局 / 配置目录 / 项目三层均支持
+{ "storagePath": "~/data/acp-state" }
+```
+
+- 解析结果在会话初始化时计算一次，挂在瞬态字段 `SessionState.storageDir` 上，**不会**写入持久化 JSON。
+- **不自动迁移**：设置了 `storagePath` 但该位置找不到有效状态、而默认位置存在状态文件时，每会话打一次性 WARN，提示手动迁移。
+- 配置校验、JSON schema、CONFIGURATION（中英）已更新；新增 19 个测试（路径解析、自定义目录读写往返、默认位置回归、三层合并、迁移 WARN、瞬态字段不泄漏、registry 接线）；全量 1131/1131 通过；双 agent 代码 + 测试评审。
+- 未设置时默认位置逐字节不变；所有 API 变更为纯新增。
+
+**安装**：`opencode plugin opencode-acp@latest --global`
+
+### v1.15.0 — compress.reasoning：按需丢弃已关闭轮次 compress 调用的超大思考
+
+**问题**：`compress` 工具调用消息被硬排除在一切压缩选择之外（Bug 39），每轮请求原样重发，其 `reasoning`（思考）部分随之永久驻留 —— 单调增长、压缩永远无法回收的上下文底座（实测会话中占残余上下文 83.5%；issue #368）。
+
+**新功能**（#377，替代 #370）：
+- 新增请求时 pass，仅当全部门条件成立时才移除消息的 `reasoning` 部分：（1）**轮次已关闭** —— 严格位于最后一条真实用户消息之前（活跃轮永不触碰；部分 provider 要求重放活跃轮 thinking）；（2）**选择器** —— 消息携带 `tool === "compress"` 工具 part（任意 status；仅 compress，不含 skill/task）；（3）**单条大小** —— 消息 reasoning 总长（多 part 求和）**严格大于** `threshold`（字符数）。小思考保留；长度不跨消息累计。持久化历史从不修改。
+- 新增嵌套配置 `compress.reasoning { drop: true, threshold: 2048 }`，三层配置文件与 #344 provider/model cascade 均为**字段级**合并（model > provider > 全局；深层只覆盖显式设置的字段）：
+
+```jsonc
+{
+    "compress": {
+        "reasoning": { "drop": true, "threshold": 2048 },
+        "providers": {
+            "my-gateway": { "reasoning": { "drop": false } },
+            "anthropic": { "models": { "claude-opus-4-5": { "reasoning": { "threshold": 8000 } } } }
+        }
+    }
+}
+```
+
+- provider/model 标识取自当前请求最后一条用户消息的 `info.model`，取不到回落 session state。`threshold: 0` 表示丢弃所有非空 reasoning。
+- 校验、JSON schema、README/CONFIGURATION（中英）全部更新；新增 29+ 测试（单元 / cascade / 校验 / hook 级 e2e，逐门变异验证）；全量 1112/1112 通过；双 agent review（代码 + 测试）。
+- 同时修复 review 中发现的两个配置校验缺陷：`compress.providers` 内的 `reasoning` 覆盖被误报为未知字段；`compress.reasoning: null` 会导致插件启动崩溃而非警告。
+
+**流程**（#367）：AGENTS.md 要求开发中发现/修复的问题必须建 issue 跟踪。
+
+**安装**：`opencode plugin opencode-acp@latest --global`
+
 ### v1.14.27 — 手动代理模式（/bili/ baseURL）也触发自动禁用
 
 **问题**：v1.14.25 的自动禁用只覆盖 `bili opencode` 启动器（环境变量 `BILLION_CONTEXT_PROXY`）。用户直接把某个 provider 的 `baseURL` 指向 billion-context 代理（手动模式）时，仍会同时加载两套上下文管理 —— ACP 的工具和 `/acp` 命令与代理在 wire 层的压缩并存（issue #337）。
