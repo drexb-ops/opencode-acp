@@ -196,7 +196,7 @@ Core compression behavior.
 - **Default:** `undefined`
 - **Status:** ACTIVE
 - **Description:** Nested per-provider / per-model overrides for **every tunable compress field**, resolved field-by-field with the cascade **model > provider > global** (mirrors the sibling project billion-context-pi, issue #344). Deeper levels only override when the field is explicitly set — unset fields never clear shallower values. `0` / `false` are explicit values, not "unset". Unknown provider/model ids fall back to the global value. Percentages and `"X%"` limits resolve against the active model's context window. Across the three config file layers (global → config dir → project) the maps deep-merge per provider/model key — a project layer can narrow one provider without wiping others configured in lower layers.
-- **Overridable fields:** `maxContextLimit`, `emergencyThresholdPercent`, `minNudgeContextPercent`, `nudgeFrequency`, `iterationNudgeThreshold`, `toolOutputNudgeThreshold`, `nudgeGrowthTokens`, `minNudgeGrowthRatio`, `minNudgeGrowthFloor`, `nudgeForce`, `protectedTools`, `showCompression`, `summaryBuffer`, `protectTags`, `protectUserMessages`, `maxSummaryLengthHard`, `minCompressRange`, `maxVisibleSegments`, `keepEmbedMaxChars`, `lastSegmentSoftBlock`, `preserveRecentMessages`, `preserveRecentTokens`, `preserveLastUserMessage`.
+- **Overridable fields:** `maxContextLimit`, `emergencyThresholdPercent`, `minNudgeContextPercent`, `nudgeFrequency`, `iterationNudgeThreshold`, `toolOutputNudgeThreshold`, `nudgeGrowthTokens`, `minNudgeGrowthRatio`, `minNudgeGrowthFloor`, `nudgeForce`, `protectedTools`, `showCompression`, `summaryBuffer`, `protectTags`, `protectUserMessages`, `maxSummaryLengthHard`, `minCompressRange`, `maxVisibleSegments`, `keepEmbedMaxChars`, `lastSegmentSoftBlock`, `preserveRecentMessages`, `preserveRecentTokens`, `preserveLastUserMessage`, `reasoning` (nested, field-wise).
 - **Not overridable:** `permission` (session-level, fixed before model info is known), the deprecated `minContextLimit` / `modelMinLimits` family, the flat `modelMaxLimits` / `modelMinLimits` maps themselves, and `providers` itself. `modelMaxLimits` itself is **not** deprecated — it remains fully supported (only outranked). For `maxContextLimit` the precedence when set nested is **nested override > `modelMaxLimits` flat map > global**. `protectedTools` set here affects the compress tool and nudge-side logic; the system-prompt protected-tools listing (shown at prompt build time, before model info is available) always reflects the global value.
 
 ```jsonc
@@ -334,6 +334,32 @@ In this example, for `anthropic/claude-sonnet-4-6`: the floor is 30%, the over-m
 - **Default:** `true`
 - **Status:** ACTIVE
 - **Description:** Always protect the most recent user message from compression, regardless of `preserveRecentMessages` or `preserveRecentTokens`.
+
+#### `compress.reasoning`
+- **Type:** `object { drop?: boolean; threshold?: number }`
+- **Default:** `{ "drop": true, "threshold": 2048 }`
+- **Status:** ACTIVE (#368)
+- **Description:** Config for dropping oversized reasoning (thinking) parts from historical `compress` tool calls. `compress` calls are hard-exempt from compression, so their thinking rides along every request as an unreclaimable context floor. This pass removes `reasoning` parts at request time (persisted history is never modified) from closed-turn compress messages whose total reasoning length exceeds `threshold`. The active round (from the last genuine user message onward) is never touched.
+- **Fields:**
+  - `drop` (`boolean`, default `true`) — master switch; `false` disables the whole pass.
+  - `threshold` (`number`, chars, default `2048`) — single-thinking size gate: the message's total reasoning length must **exceed** this to be dropped. Small thinkings are kept; lengths are NOT accumulated across messages. `0` drops any non-empty reasoning (only zero-length reasoning survives).
+- **Per-provider/model overrides (field-wise, via the `compress.providers` cascade):**
+
+```jsonc
+{
+    "compress": {
+        "reasoning": { "drop": true, "threshold": 2048 },
+        "providers": {
+            "my-gateway": { "reasoning": { "drop": false } },
+            "anthropic": {
+                "reasoning": { "threshold": 8000 },
+                "models": { "claude-opus-4-5": { "reasoning": { "threshold": 16000 } } }
+            }
+        }
+    }
+}
+```
+  Resolution: model-level `reasoning` > provider-level `reasoning` > global `compress.reasoning`, field by field (a field set at a deeper level overrides only that field). Provider/model IDs come from the current request's model identity.
 
 ---
 
