@@ -24,6 +24,11 @@
   still provides the raw transcript to every transform. Avoid reprocessing
   hidden raw content where the downstream operation already ignores it, and do
   not plan candidates on turns that cannot emit a nudge.
+- **Fork recovery follow-up** ([#375](https://github.com/ranxianglei/opencode-acp/issues/375)):
+  When a fork omits historical completed `compress` inputs, restore ACP block
+  state from the parent session's persisted state instead of leaving copied raw
+  history unpruned. The transfer must be local, all-or-nothing, and never
+  mutate the parent.
 
 ## 2. Reproduction (if applicable)
 
@@ -76,6 +81,10 @@
     - [x] Existing unit, property, build, and E2E suites pass.
     - [x] No-nudge turns do not invoke candidate planning.
     - [x] Unchanged active block membership does not rebuild every tracked message.
+     - [x] A matching fork receives translated parent block state before its
+          first model request, even without replayable historical compress inputs.
+     - [x] A mismatched fork falls back safely without partially applying parent
+          state or changing the parent state file.
 
 ## 5. Proposed Approach (optional)
 

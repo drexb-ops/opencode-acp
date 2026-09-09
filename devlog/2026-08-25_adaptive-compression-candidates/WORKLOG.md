@@ -97,6 +97,11 @@ npm run build
   sync; tool-cache ordering is retained because it records step-start turns.
   Candidate planning occurs before truncation, while synthetic nudge suffixes
   are excluded from truncation's real-message protection window.
+- **Fork recovery follow-up**: Approved automatic parent-state transfer with
+  strict ref-prefix validation and existing replay fallback; tracked in #375.
+  Parent/fork message and tool IDs are translated through verified refs before
+  first-request pruning, while parent state and fork-local cadence remain
+  independent.
 - **Key logs/data**: `npm run format:check` reports pre-existing formatting
   failures in unrelated files; all changed-file formatting checks pass.
 

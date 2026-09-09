@@ -99,6 +99,12 @@ proven range executor.
   once, then rebuilds it only when the active block set changes. Tool-cache and
   tool-ID ordering remains before prune because cache turn numbering depends on
   `step-start` parts that pruning removes.
+- **Fork state transfer**: On a new session with `parentID`, ACP assigns fork
+  refs, loads the parent persistence file, and validates a shared historical
+  prefix by ref. It translates block/message coverage through parent and fork
+  refs, applies the result only when every active block maps atomically, resets
+  fork-local cadence/cache/stat state, and saves the new fork state. Missing or
+  mismatched parent state falls back to historical compress-call replay.
 - **Security**: Protected tools/files and current-context protections remain
   executor authority; planner validation fails closed if selection differs.
 - **Dependencies** (new packages required): None.
