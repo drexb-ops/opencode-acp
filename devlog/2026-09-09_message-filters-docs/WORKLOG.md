@@ -2,8 +2,8 @@
 
 - Task ID: `2026-09-09_message-filters-docs`
 - Home Repo: `opencode-acp`
-- Status: InProgress
-- Updated: 2026-09-09 20:40
+- Status: Done
+- Updated: 2026-09-09 21:05
 
 ## 1. Summary
 
