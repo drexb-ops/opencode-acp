@@ -425,6 +425,21 @@ Each level overrides the previous, so project settings take priority over global
             },
         },
     },
+    // Message filters — strip/deduplicate third-party plugin injections
+    // (e.g. oh-my-opencode system reminders) from visible context before
+    // ACP processes them. Filtered content is never counted toward context
+    // usage. Five built-in OMO filters are on by default (v1.14.8+);
+    // per-filter reference and examples: CONFIGURATION.md → messageFilters
+    "messageFilters": {
+        "enabled": true,
+        "filters": {
+            "omo-system-reminder": { "enabled": true },
+            "omo-context": { "enabled": true },
+            "omo-task-directive": { "enabled": true },
+            "omo-todo-continuation": { "enabled": true },
+            "omo-mode-injection": { "enabled": true },
+        },
+    },
 }
 ```
 

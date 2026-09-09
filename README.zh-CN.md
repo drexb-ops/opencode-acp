@@ -376,6 +376,20 @@ ACP 使用自己的配置文件，按以下顺序搜索：
             },
         },
     },
+    // 消息过滤器——在 ACP 处理之前，从可见上下文中剥离/去重第三方插件注入
+    // （例如 oh-my-opencode 的 system reminder）。被过滤的内容不计入上下文使用量。
+    // 5 个内置 OMO 过滤器默认开启（v1.14.8+）；
+    // 按过滤器的参考与示例见 CONFIGURATION.zh-CN.md → messageFilters
+    "messageFilters": {
+        "enabled": true,
+        "filters": {
+            "omo-system-reminder": { "enabled": true },
+            "omo-context": { "enabled": true },
+            "omo-task-directive": { "enabled": true },
+            "omo-todo-continuation": { "enabled": true },
+            "omo-mode-injection": { "enabled": true },
+        },
+    },
 }
 ```
 
