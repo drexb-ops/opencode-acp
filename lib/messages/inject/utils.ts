@@ -14,7 +14,11 @@ import {
     type MessagePriority,
     listPriorityRefsBeforeIndex,
 } from "../priority"
-import { estimateSystemPromptTokens } from "../../token-utils"
+import {
+    countMessageCharacters,
+    estimateSystemPromptTokens,
+    getCurrentTokenUsage,
+} from "../../token-utils"
 import {
     appendToTextPart,
     appendToLastTextPart,
@@ -22,8 +26,7 @@ import {
     hasContent,
 } from "../utils"
 import { getLastUserMessage, isIgnoredUserMessage, isSyntheticMessage } from "../query"
-import { getCurrentTokenUsage } from "../../token-utils"
-import { getActiveSummaryTokenUsage } from "../../state/utils"
+import { getActiveSummaryTokenUsage, resolveEffectiveContextLimit } from "../../state/utils"
 
 export interface LastUserModelContext {
     providerId: string | undefined
@@ -109,6 +112,13 @@ export function resolveContextTokenLimit(
     modelId: string | undefined,
     threshold: "max" | "min",
 ): number | undefined {
+    // [FIX #346] Resolve percentage thresholds against the EFFECTIVE limit
+    // (model limit, or the configured fallback when the model limit is
+    // unknown). Previously a percentage threshold resolved to undefined when
+    // state.modelContextLimit was undefined — which, in headless spawn+resume
+    // mode, was every request — so no nudge anchor could ever be added.
+    const effectiveLimit = resolveEffectiveContextLimit(state, config)
+
     const parseLimitValue = (limit: number | `${number}%` | undefined): number | undefined => {
         if (limit === undefined) {
             return undefined
@@ -118,7 +128,7 @@ export function resolveContextTokenLimit(
             return limit
         }
 
-        if (!limit.endsWith("%") || state.modelContextLimit === undefined) {
+        if (!limit.endsWith("%") || effectiveLimit === undefined) {
             return undefined
         }
 
@@ -129,7 +139,7 @@ export function resolveContextTokenLimit(
 
         const roundedPercent = Math.round(parsedPercent)
         const clampedPercent = Math.max(0, Math.min(100, roundedPercent))
-        return Math.round((clampedPercent / 100) * state.modelContextLimit)
+        return Math.round((clampedPercent / 100) * effectiveLimit.limit)
     }
 
     // Per-provider / per-model nested override (compress.providers, issue #344):
@@ -205,11 +215,16 @@ export function isContextOverLimits(
         }
     }
 
+    // [FIX #346] Report the EFFECTIVE limit (model or fallback) so downstream
+    // consumers (emergency override, usage displays, block guidance) operate
+    // against the same window the thresholds above were computed from.
+    const effectiveLimit = resolveEffectiveContextLimit(state, config)
+
     return {
         overMaxLimit,
         overMinLimit,
         currentTokens,
-        modelContextLimit: state.modelContextLimit,
+        modelContextLimit: effectiveLimit?.limit,
     }
 }
 
@@ -288,10 +303,16 @@ export function resolveCompressOverrides(
     }
     const { models: _models, ...providerFields } = providerEntry
     const modelEntry = modelId !== undefined ? providerEntry.models?.[modelId] : undefined
-    if (modelEntry) {
-        return { ...providerFields, ...modelEntry }
+    // `reasoning` is a nested object: merge it field-wise (model > provider)
+    // instead of letting the model entry's whole object replace the
+    // provider-level one (#368).
+    const merged: CompressModelOverrides = modelEntry
+        ? { ...providerFields, ...modelEntry }
+        : providerFields
+    if (providerFields.reasoning !== undefined || modelEntry?.reasoning !== undefined) {
+        merged.reasoning = { ...providerFields.reasoning, ...modelEntry?.reasoning }
     }
-    return providerFields
+    return merged
 }
 
 export function resolveMinNudgeContextPercent(
@@ -335,8 +356,14 @@ export function resolveMinNudgeFloorTokens(
  * - `maxContextLimit`: nested > legacy flat `modelMaxLimits` > global — enforced
  *   inside resolveContextTokenLimit, so blanket-applying it here would let the
  *   flat map override the nested value (wrong precedence).
+ * - `reasoning` (#368): a nested object that merges FIELD-WISE (model > provider
+ *   > global) — blanket-applying the shallow-merged object would let an
+ *   override that sets only `drop` wipe the global `threshold`.
  */
-const OVERRIDE_BLANKET_APPLY_EXCLUDE = new Set< keyof CompressModelOverrides >(["maxContextLimit"])
+const OVERRIDE_BLANKET_APPLY_EXCLUDE = new Set<keyof CompressModelOverrides>([
+    "maxContextLimit",
+    "reasoning",
+])
 
 /**
  * Build the effective PluginConfig for the active provider/model: a shallow
@@ -355,12 +382,18 @@ export function applyCompressOverrides(
     const applied = Object.keys(overrides).filter(
         (key) => !OVERRIDE_BLANKET_APPLY_EXCLUDE.has(key as keyof CompressModelOverrides),
     )
-    if (applied.length === 0 || !config.compress) {
+    // `reasoning` is excluded from blanket apply — deep-merge it explicitly
+    // below. A reasoning-only override must NOT hit the identity early-return.
+    const reasoningOverride = overrides.reasoning
+    if ((applied.length === 0 && reasoningOverride === undefined) || !config.compress) {
         return config
     }
     const effectiveCompress: Record<string, unknown> = { ...config.compress }
     for (const key of applied) {
         effectiveCompress[key] = overrides[key as keyof CompressModelOverrides]
+    }
+    if (reasoningOverride !== undefined) {
+        effectiveCompress.reasoning = { ...config.compress.reasoning, ...reasoningOverride }
     }
     return { ...config, compress: effectiveCompress as unknown as CompressConfig }
 }
@@ -561,6 +594,7 @@ export interface ContextComposition {
     textTokens: number
     systemTokens: number
     protectedTokens: number
+    reasoningTokens: number
     total: number
     largestRanges: { ref: string; tokens: number }[]
     largestToolRanges: { ref: string; tokens: number; tool?: string }[]
@@ -594,6 +628,7 @@ export function estimateContextComposition(
     let summaryTokens = 0
     let messageTokens = 0
     let protectedTokens = 0
+    let reasoningTokens = 0
     const perMessage: { ref: string; tokens: number }[] = []
     const perTool: { ref: string; tokens: number; tool?: string }[] = []
     const perCode: { ref: string; tokens: number }[] = []
@@ -662,6 +697,12 @@ export function estimateContextComposition(
                 summaryTokens += summaryPartTokens
                 toolTypeMap.set(toolName, (toolTypeMap.get(toolName) || 0) + toolPartTokens)
                 if (!msgToolName) msgToolName = toolName
+            } else if (part.type === "reasoning" && typeof (part as any).text === "string") {
+                // Real usage includes reasoning (token-utils.ts) — track as its own
+                // category so display totals align with the usage formula (#371).
+                const tokens = Math.round(((part as any).text as string).length / 4)
+                msgTotal += tokens
+                reasoningTokens += tokens
             }
         }
 
@@ -700,7 +741,8 @@ export function estimateContextComposition(
         textTokens: Math.max(0, messageTokens - codeTokens),
         systemTokens,
         protectedTokens,
-        total: systemTokens + toolTokens + summaryTokens + messageTokens,
+        reasoningTokens,
+        total: systemTokens + toolTokens + summaryTokens + messageTokens + reasoningTokens,
         largestRanges: perMessage.slice(0, 15),
         largestToolRanges: perTool.slice(0, 15),
         largestCodeRanges: perCode.slice(0, 5),
@@ -782,13 +824,11 @@ export function buildCompressibleRanges(
             (protectedTools.length > 0 || protectedFilePatterns.length > 0) &&
             messageContainsProtectedTool(msg, protectedTools, protectedFilePatterns)
         ) {
-            let tokens = 0
+            // Issue #359: must match the pipeline min-size check counter; JSON.stringify(part) overstates tool parts
+            const tokens = Math.round(countMessageCharacters(msg) / 4)
             const tools = new Set<string>()
             for (const part of msg.parts || []) {
-                if (part.type === "text" && typeof (part as any).text === "string") {
-                    tokens += Math.round(((part as any).text as string).length / 4)
-                } else if (part.type !== "text" && part.type !== "reasoning") {
-                    tokens += Math.round(JSON.stringify(part).length / 4)
+                if (part.type !== "text" && part.type !== "reasoning") {
                     const toolName = (part as any)?.tool
                     const callID = (part as any)?.callID
                     if (toolName && callID) {
@@ -810,15 +850,14 @@ export function buildCompressibleRanges(
             continue
         }
 
-        let tokens = 0
+        // Issue #359: must match the pipeline min-size check counter; JSON.stringify(part) overstates tool parts
+        const tokens = Math.round(countMessageCharacters(msg) / 4)
         let isTool = false
         let hasMeaningfulPart = false
         for (const part of msg.parts || []) {
             if (part.type === "text" && typeof (part as any).text === "string") {
-                tokens += Math.round(((part as any).text as string).length / 4)
                 if ((part as any).text.trim().length > 0) hasMeaningfulPart = true
             } else if (part.type !== "text" && part.type !== "reasoning") {
-                tokens += Math.round(JSON.stringify(part).length / 4)
                 isTool = true
                 hasMeaningfulPart = true
             }

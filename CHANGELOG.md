@@ -1,5 +1,91 @@
 # Changelog
 
+### v1.17.0 — context-limit safety net + budget guard: no more silent 400 death loops
+
+Six fixes bundled, two of them new protection subsystems for sessions whose context window was unknown or exceeded:
+
+**1. Context-limit safety net for spawn+resume** (#349, fixes #346 — HIGH):
+In headless spawn+resume mode the model-limit catalog seed raced server readiness and stayed empty forever; `state.modelContextLimit` was learned and lost every message, disabling every percentage threshold (nudges, emergency override, GC, truncation). The session grew until the backend rejected it.
+- The system hook now persists the learned limit (and its model identity) to session state, so a freshly spawned process resumes with the limit already known.
+- `hydrateAndResolve()`: on a catalog miss during a request (server guaranteed up), hydration is retried once per process; concurrent callers await the same promise.
+- New `resolveEffectiveContextLimit()` — model limit if known, else new `compress.contextLimitFallback` (default 128000, `0` disables) — now drives nudge thresholds, emergency override, GC batch cleanup, and tool-output truncation uniformly.
+- Internal agents (title/summary/compaction) running on a different model no longer overwrite the session's limit.
+- `OUTPUT_RESERVE_TOKENS` (16384) subtracted from the GC truncation threshold — the serving wall is window minus system prompt minus max_tokens, not the full window.
+- Post-transform hard guard: ERROR log when the outgoing request still exceeds the real budget (the only signal before opencode's silent exit-0 on rejection).
+
+**2. Context budget guard** (#350, fixes #347 — HIGH):
+A model with no declared window (`limit.context = 0`, common on custom OpenAI-compatible providers) grew requests past the backend's real window → HTTP 400 → opencode swallows it as empty exit-0 — a permanently stuck session with no error surface.
+- New `enforceContextBudget` in `messages.transform`: deterministic truncate-then-clear of the oldest compressible tool outputs when the estimated wire size exceeds `modelContextLimit − compress.completionReserveTokens` (default 32768, covering opencode's 32000 max_tokens fallback). Guards first user message, last 3 messages, protected tools, and compress summaries (Bug 39 parity). Idempotent with GC's truncation marker.
+- Enforces ONLY the model-reported window — an absolute `compress.maxContextLimit` stays a soft nudge threshold (pruning to a guessed threshold starves the nudge of compressible targets; observed as an `e2e-blocks-nudges` regression during development).
+- One-time per-session WARN with actionable guidance when the model reports no window.
+- The competing design (#348, absolute-config fallback chain + clear-only) was closed in favor of this one.
+
+**3. Nudge/exec char-counter alignment** (#360, fixes #359): the compress-recommendation side counted tool parts via `JSON.stringify(part).length / 4` while the execution-side min-size check used `countMessageCharacters` — recommendations could point at ranges the executor then rejected as below floor. Both sides now use `countMessageCharacters(msg) / 4`.
+
+**4. Tier-aware cadence reset** (#365, fixes #364): every tier-1 capture reset the T2/T3 nudge baselines, re-arming the growthFloor wait — in compression-active sessions T2 distillation never fired. New `isCaptureOnlyCompress()`: only block-ref boundaries (real distillations/condensations) reset tier baselines; raw-message captures (all `mNNNNN`) don't. No-boundary/malformed calls conservatively keep the reset (#235 loop-prevention preserved).
+
+**5. Reasoning tokens in context estimates** (#374, fixes #371): `/acp status` overview and drilldowns, and the nudge CONTEXT BREAKDOWN, previously omitted `reasoning` parts entirely; reasoning is now its own tracked category, included in totals and size sorting.
+
+**6. `/acp` command error-log leak** (#297, fixes #296): the command handler's `throw new Error("__DCP_CONTEXT_HANDLED__")` sentinel leaked to opencode's error log on every `/acp` invocation; replaced with a plain `return` (commands already deliver output via `sendIgnoredMessage`).
+
+Files: `lib/state/state.ts`, `lib/state/utils.ts`, `lib/hooks.ts`, `lib/config.ts`, `lib/config-validation.ts`, `lib/messages/inject/utils.ts`, `lib/messages/truncate-tools.ts`, `lib/messages/enforce-budget.ts` (new), `lib/messages/query.ts`, `lib/messages/inject/inject.ts`, `lib/compress/status.ts`, `dcp.schema.json`, CONFIGURATION (EN/zh). Tests: `tests/context-limit-fallback.test.ts`, `tests/model-switch-limits.test.ts`, `tests/truncate-tools.test.ts`, `tests/enforce-budget.test.ts` (new), `tests/recommend-exec-counter-alignment.test.ts` (new), `tests/inject.test.ts`, `tests/query-pure.test.ts`, `tests/acp-status.test.ts`, `tests/hooks-permission.test.ts`. Full suite 1207/1207; all six PRs locally re-verified (typecheck + tests + build) before merge.
+
+**Install**: `opencode plugin opencode-acp@latest --global`
+
+### v1.16.0 — storagePath: custom storage location for session state files
+
+**Problem**: ACP's per-session state files (`{sessionId}.json` — compression blocks, nudge state, token stats) were always written to the hardcoded `$XDG_DATA_HOME/opencode/storage/plugin/acp`. Users on containers, NFS homes, or tight XDG data dirs had no way to relocate them (issue #379).
+
+**Feature** (#380, closes #379):
+- New optional top-level config `storagePath` (string) relocating the session-state directory:
+
+| Value | Resolution |
+|---|---|
+| unset / empty | default `$XDG_DATA_HOME/opencode/storage/plugin/acp` (unchanged) |
+| `/abs/path` | as-is |
+| `~` / `~/x` | expanded against the home directory |
+| `rel/path` | resolved against the project directory (opencode cwd) |
+
+```jsonc
+// acp.jsonc — global / config-dir / project layers all supported
+{ "storagePath": "~/data/acp-state" }
+```
+
+- The resolved directory is computed once per session and carried on a transient `SessionState.storageDir` field that is never written to the persisted JSON.
+- **No auto-migration**: when `storagePath` is set, no valid state is found there, but a state file exists at the default location, ACP logs a one-time WARN per session pointing at the file to move manually.
+- Config validation, JSON schema, and CONFIGURATION (EN/zh) updated; 19 new tests (path resolution, custom-dir save/load round-trip, default-location regression, 3-layer merge, migration WARN, non-persistence, registry wiring); full suite 1131/1131; dual-agent code + test review.
+- Default location is byte-for-byte unchanged when the option is unset; all API changes are additive.
+
+**Install**: `opencode plugin opencode-acp@latest --global`
+
+### v1.15.0 — compress.reasoning: drop oversized thinking from closed-turn compress calls
+
+**Problem**: `compress` tool-call messages are hard-exempt from every compression selection (Bug 39) and are therefore re-sent verbatim on every LLM request. Their `reasoning` (thinking) parts ride along forever — a monotonically growing, unreclaimable context floor (measured at 83.5% of residual context in a real session; issue #368).
+
+**Feature** (#377, supersedes #370):
+- New request-time pass that removes `reasoning` parts from a message only when ALL gates hold: (1) **closed turn** — strictly before the last genuine user message (the active round is never touched; some providers require replaying active-round thinking); (2) **selector** — the message carries a `tool === "compress"` part (any status; only compress, not skill/task); (3) **single-thinking size** — the message's total reasoning length (summed across parts) **strictly exceeds** `threshold` chars. Small thinkings are kept; lengths are not accumulated across messages. Persisted history is never modified.
+- New nested config `compress.reasoning { drop: true, threshold: 2048 }`, merged **field-wise** across the three config layers and the #344 provider/model cascade (model > provider > global; a deeper layer overrides only the fields it sets):
+
+```jsonc
+{
+    "compress": {
+        "reasoning": { "drop": true, "threshold": 2048 },
+        "providers": {
+            "my-gateway": { "reasoning": { "drop": false } },
+            "anthropic": { "models": { "claude-opus-4-5": { "reasoning": { "threshold": 8000 } } } }
+        }
+    }
+}
+```
+
+- Provider/model identity comes from the current request's last user message `info.model`, falling back to session state. `threshold: 0` drops any non-empty reasoning.
+- Validation, JSON schema, README/CONFIGURATION (EN/zh) all updated; 29+ new tests (unit, cascade, validation, hook-level e2e — mutation-verified per gate); full suite 1112/1112; dual-agent reviewed (code + test).
+- Also fixes two config-validation defects found in review: `reasoning` overrides inside `compress.providers` were spuriously rejected as unknown fields, and `compress.reasoning: null` crashed plugin startup instead of producing a warning.
+
+**Process** (#367): AGENTS.md now requires issue tracking for problems discovered/fixed during development.
+
+**Install**: `opencode plugin opencode-acp@latest --global`
+
 ### v1.14.27 — Self-disable also triggers in manual proxy mode (/bili/ baseURL detection)
 
 **Problem**: The v1.14.25 self-disable only covered the `bili opencode` launcher (env var `BILLION_CONTEXT_PROXY`). Users pointing a provider `baseURL` at the billion-context proxy directly (manual mode) still got duplicate context-management stacks — ACP's tools and `/acp` command alongside the proxy's wire-level compression (issue #337).

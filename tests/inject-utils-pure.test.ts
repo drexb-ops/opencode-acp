@@ -487,3 +487,55 @@ test("cacheSystemPromptTokens: keeps undefined when no reliable assistant token 
     cacheSystemPromptTokens(state, [mkText("u1", "no assistant yet")])
     assert.equal(state.systemPromptTokens, undefined)
 })
+
+function mkReasoning(id: string, text: string): WithParts {
+    return {
+        info: { id } as any,
+        parts: [{ type: "reasoning", text, id: `${id}-p`, sessionID: "s", messageID: id }] as any,
+    }
+}
+
+test("estimateContextComposition: reasoning part counted in reasoningTokens and total (#371)", () => {
+    const msg = mkReasoning("m1", "x".repeat(800))
+    const c = estimateContextComposition([msg])
+    assert.equal(c.reasoningTokens, 200)
+    assert.equal(c.messageTokens, 0, "reasoning is not message/text")
+    assert.equal(c.toolTokens, 0)
+    assert.equal(c.total, 200)
+})
+
+test("estimateContextComposition: total = system + tool + summary + message + reasoning (#371)", () => {
+    const msgs = [
+        mkText("m1", "hello world"),
+        mkTool("m2", '{"a":1}'),
+        mkSummary("b0", "recap text"),
+        mkReasoning("m3", "z".repeat(800)),
+    ]
+    const c = estimateContextComposition(msgs)
+    assert.equal(
+        c.total,
+        c.systemTokens + c.toolTokens + c.summaryTokens + c.messageTokens + c.reasoningTokens,
+    )
+    assert.equal(c.reasoningTokens, 200)
+})
+
+test("estimateContextComposition: reasoning on mixed message adds to msgTotal but not messageTokens (#371)", () => {
+    const msg = {
+        info: { id: "m1" } as any,
+        parts: [
+            { type: "text", text: "x".repeat(2400) },
+            { type: "reasoning", text: "y".repeat(800) },
+        ] as any,
+    }
+    const c = estimateContextComposition([msg])
+    assert.equal(c.messageTokens, 600)
+    assert.equal(c.reasoningTokens, 200)
+    assert.equal(c.total, 800)
+    assert.equal(c.largestRanges.length, 1)
+    assert.equal(c.largestRanges[0].tokens, 800, "per-message range reflects full footprint")
+})
+
+test("estimateContextComposition: no reasoning parts → reasoningTokens 0 (#371)", () => {
+    const c = estimateContextComposition([mkText("m1", "hello")])
+    assert.equal(c.reasoningTokens, 0)
+})

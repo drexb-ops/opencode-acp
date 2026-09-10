@@ -60,21 +60,21 @@ the turn counter for real conversation turns.
 
 ## Scenarios
 
-| File                                              | Description                                                                                                                                                                                                                         |
-| ------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `01-basic-compress.json`                          | 3 text turns → compress all → verify 1 block                                                                                                                                                                                        |
-| `02-quality-reject.json`                          | Bad summary → quality gate rejects → verify 0 blocks                                                                                                                                                                                |
-| `03-quality-acknowledge.json`                     | Reject → retry with `acknowledgeRisk` → verify 1 block                                                                                                                                                                              |
-| `04-batch-compress.json`                          | 4 text turns → batch compress 3 ranges → verify 3 blocks                                                                                                                                                                            |
-| `05-subagent-compress.json`                       | Subagent session → compress → verify parent + child blocks                                                                                                                                                                          |
-| `06-nudge-triggered.json`                         | Text turns grow context → ACP auto-injects nudge → fake LLM detects nudge and compresses → verify block count + nudge baseline                                                                                                      |
-| `07-protection-filtered.json`                     | Production config (preserveRecentMessages:5) → compress all → verify protected messages excluded from compressed set (soft-filter, not hard-reject)                                                                                 |
-| `08-nudge-with-protection.json`                   | Nudge→compress WITH protection enabled → verify compress succeeds despite protected zone, nudge baseline set, protected messages survived                                                                                           |
-| `09-nudge-refire-after-compress.json`             | Multi-turn nudge→compress→growth→re-nudge→re-compress. Verifies minBlockCount ≥ 1 (full re-nudge cycle with baseline reset is in scenario 10 + unit tests), maxBlockCount ≤ 8                                                       |
-| `10-autonomous-nudge-refire.json`                 | Issue #176: Autonomous session (bash tool calls grow context) → first nudge→compress → continued growth → second nudge→second compress → verify minBlockCount ≥ 2, maxCompressCallsVisible ≤ 2                                      |
-| `11-tier2-baseline-preserved-after-compress.json` | Bug #235 regression: verify lastTier2NudgeTokens preserved (not reset to undefined) after compress. Tests compress handler baseline preservation, not T2 cadence (T2 never fires — consumption chain leaves only 1 active T1 block) |
-| `12-consumed-call-hiding.json`                    | Bug #236 regression: T1 compresses auto-consume previous blocks → verify lastRequestCompressCalls=1 (consumed calls hidden from LLM)                                                                                                |
-| `13-adaptive-compression-candidates.json`         | Real nudge→compress flow where the fake model selects an advertised MICRO candidate and verifies candidate selection plus state baseline                                                                                            |
+| File | Description |
+|------|-------------|
+| `01-basic-compress.json` | 3 text turns → compress all → verify 1 block |
+| `02-quality-reject.json` | Bad summary → quality gate rejects → verify 0 blocks |
+| `03-quality-acknowledge.json` | Reject → retry with `acknowledgeRisk` → verify 1 block |
+| `04-batch-compress.json` | 4 text turns → batch compress 3 ranges → verify 3 blocks |
+| `05-subagent-compress.json` | Subagent session → compress → verify parent + child blocks |
+| `06-nudge-triggered.json` | Text turns grow context → ACP auto-injects nudge → fake LLM detects nudge and compresses → verify block count + nudge baseline |
+| `07-protection-filtered.json` | Production config (preserveRecentMessages:5) → compress all → verify protected messages excluded from compressed set (soft-filter, not hard-reject) |
+| `08-nudge-with-protection.json` | Nudge→compress WITH protection enabled → verify compress succeeds despite protected zone, nudge baseline set, protected messages survived |
+| `09-nudge-refire-after-compress.json` | Multi-turn nudge→compress→growth→re-nudge→re-compress. Verifies minBlockCount ≥ 1 (full re-nudge cycle with baseline reset is in scenario 10 + unit tests), maxBlockCount ≤ 8 |
+| `10-autonomous-nudge-refire.json` | Issue #176: Autonomous session (bash tool calls grow context) → first nudge→compress → continued growth → second nudge→second compress → verify minBlockCount ≥ 2, maxCompressCallsVisible ≤ 2 |
+| `11-tier2-baseline-preserved-after-compress.json` | Issue #364: verify raw-message T1 captures (m-refs) do NOT touch lastTier2NudgeTokens — stays unset when T2 never fired. The #235 never-undefined invariant is locked by unit tests on the distill/conservative reset path (filename kept from the pre-#364 revision because the CI e2e job hardcodes scenario paths) |
+| `12-consumed-call-hiding.json` | Bug #236 regression: T1 compresses auto-consume previous blocks → verify lastRequestCompressCalls=1 (consumed calls hidden from LLM) |
+| `13-adaptive-compression-candidates.json` | Real nudge→compress flow where the fake model selects an advertised MICRO candidate and verifies candidate selection plus state baseline |
 
 ### Scenario Format
 

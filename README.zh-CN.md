@@ -33,6 +33,19 @@ ACP 将上下文管理的所有权限全部交给模型自己，而不依靠外�
 
 ---
 
+## 该选哪个?
+
+按客户端选:
+
+| 客户端 | 用这个 |
+|---|---|
+| **pi** | [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi)(进程内扩展) |
+| **opencode** | [`opencode-acp`](https://github.com/ranxianglei/opencode-acp)(进程内扩展) |
+| **omp** | [`billion-context`](https://github.com/ranxianglei/billion-context),`bili omp`(内置插件) |
+| **其余所有**(没有上下文 hook) | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili <client>`(启动器,优先)或 `/bili/` 前缀 |
+
+---
+
 ## 实战验证
 
 真实工程中的上下文情况。
@@ -334,6 +347,14 @@ ACP 使用自己的配置文件，按以下顺序搜索：
         // Preserve your messages during compression.
         // Warning: large copy-pasted prompts will never be compressed away
         "protectUserMessages": false,
+        // [#368] 请求时丢弃历史 compress 工具调用中超大的 reasoning（思考）。
+        // compress 调用被硬排除在压缩之外，其思考内容会随每次请求原样重发，
+        // 形成无法回收的上下文底座。仅作用于已关闭的轮次，活跃轮永不触碰；
+        // 低于阈值的小思考保留。
+        "reasoning": {
+            "drop": true,
+            "threshold": 2048
+        },
     },
     // 垃圾回收与批量清理
     "gc": {
@@ -366,6 +387,20 @@ ACP 使用自己的配置文件，按以下顺序搜索：
                 // 当 top-20 关键词召回低于此值时（与 rougeF1 经 AND 合并）L2 失败
                 "layer2MaxTop20Recall": 0.20,
             },
+        },
+    },
+    // 消息过滤器——在 ACP 处理之前，从可见上下文中剥离/去重第三方插件注入
+    // （例如 oh-my-opencode 的 system reminder）。被过滤的内容不计入上下文使用量。
+    // 5 个内置 OMO 过滤器默认开启（v1.14.8+）；
+    // 按过滤器的参考与示例见 CONFIGURATION.zh-CN.md → messageFilters
+    "messageFilters": {
+        "enabled": true,
+        "filters": {
+            "omo-system-reminder": { "enabled": true },
+            "omo-context": { "enabled": true },
+            "omo-task-directive": { "enabled": true },
+            "omo-todo-continuation": { "enabled": true },
+            "omo-mode-injection": { "enabled": true },
         },
     },
 }

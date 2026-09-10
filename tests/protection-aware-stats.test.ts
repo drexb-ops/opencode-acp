@@ -205,3 +205,24 @@ test("formatCompressibleRanges shows PROTECTED-only line when entire area is pro
     assert.ok(formatted.includes("skill"), "shows protected tool name")
     assert.ok(formatted.includes("task"), "shows protected tool name")
 })
+
+test("estimateContextComposition: reasoning on protected message counted in protectedTokens (#371)", () => {
+    const state = createSessionState()
+    const protectedMsg: WithParts = {
+        info: { id: "m2", role: "assistant", sessionID: SID, agent: "a", time: { created: 1 } } as any,
+        parts: [
+            { type: "text", text: "protected skill output" },
+            toolPart("t1", "skill"),
+            { type: "reasoning", text: "z".repeat(800) },
+        ],
+    }
+    const messages = [makeMsg("m1", "user", "hello"), protectedMsg]
+    setupRefs(state, messages)
+
+    const comp = estimateContextComposition(messages, state, ["skill"])
+    assert.equal(comp.reasoningTokens, 200, "reasoning tokens counted exactly (800 chars / 4)")
+    assert.ok(
+        comp.protectedTokens >= comp.reasoningTokens,
+        "protected tokens include the protected message's reasoning",
+    )
+})

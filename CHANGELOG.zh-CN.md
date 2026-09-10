@@ -1,5 +1,89 @@
 # 更新日志
 
+### v1.17.0 — 上下文窗口安全网 + 预算守卫：终结静默 400 死循环
+
+捆绑六项修复，其中两项是针对“窗口未知/超出窗口”会话的新保护子系统：
+
+**1. spawn+resume 模式的上下文窗口安全网**（#349，修复 #346 —— 高危）：
+headless spawn+resume 模式下，模型目录的初始化种子与服务器就绪竞态，永久空置；`state.modelContextLimit` 每条消息学到即丢，所有百分比阈值（nudge、紧急覆盖、GC、截断）全部失效，会话无限增长直到后端拒绝。
+- system hook 现在把学到的窗口（及其模型身份）持久化到会话状态，新进程启动即已知晓。
+- `hydrateAndResolve()`：请求内目录未命中时（此时服务器必然已就绪）每进程重试一次 hydrate；并发调用等待同一 promise。
+- 新 `resolveEffectiveContextLimit()` —— 已知模型窗口，否则新的 `compress.contextLimitFallback`（默认 128000，`0` 禁用）—— 统一驱动 nudge 阈值、紧急覆盖、GC 批量清理、工具输出截断。
+- 内部 agent（标题/摘要/compaction）跑在不同模型上时不再覆盖会话窗口。
+- GC 截断阈值减去 `OUTPUT_RESERVE_TOKENS`（16384）—— 服务端真正的墙是窗口减系统提示减 max_tokens，不是完整窗口。
+- 变换后硬守卫：出站请求仍超真实预算时打 ERROR 日志（opencode 静默 exit-0 拒绝前唯一的信号）。
+
+**2. 上下文预算守卫**（#350，修复 #347 —— 高危）：
+未声明窗口的模型（`limit.context = 0`，自定义 OpenAI 兼容供应商常见）请求增长超过后端真实窗口 → HTTP 400 → opencode 吞掉报错、空响应 exit-0 —— 会话永久卡死且无错误可见。
+- 新 `enforceContextBudget`（messages.transform 内）：估算线包超过 `modelContextLimit − compress.completionReserveTokens`（默认 32768，覆盖 opencode 对未声明 limit.output 的 32000 max_tokens 回退）时，确定性“先截断后清空”最老的可压缩工具输出。保护首条用户消息、最近 3 条、保护工具、compress 摘要（Bug 39 同等保护）；与 GC 截断标记幂等。
+- 只强制模型上报的窗口 —— 绝对值 `compress.maxContextLimit` 保持软 nudge 阈值语义（剪到猜测的阈值会饿死 nudge 的可压缩目标；开发中曾触发 `e2e-blocks-nudges` 回归）。
+- 模型未报窗口时每会话一次性 WARN，给出可操作的配置指引。
+- 竞争方案（#348，绝对配置回退链 + 只清空）已关闭，采纳本方案。
+
+**3. nudge/执行侧字符计数统一**（#360，修复 #359）：压缩推荐侧用 `JSON.stringify(part).length / 4` 计数工具 part，而执行侧下限检查用 `countMessageCharacters` —— 推荐可能指向执行侧判定低于下限的范围。两侧统一为 `countMessageCharacters(msg) / 4`。
+
+**4. 分层感知的节奏重置**（#365，修复 #364）：每次 T1 捕获都重置 T2/T3 nudge 基线，重新武装 growthFloor 等待 —— 压缩活跃会话中 T2 蒸馏永远不触发。新 `isCaptureOnlyCompress()`：只有块引用边界（真正的蒸馏/凝结）重置分层基线；纯消息捕获（全部 `mNNNNN`）不重置。无边界/畸形输入保守地保持重置（保留 #235 防循环）。
+
+**5. 上下文估算计入 reasoning token**（#374，修复 #371）：`/acp status` 总览与下钻、nudge 的 CONTEXT BREAKDOWN 此前完全遗漏 `reasoning` part；现作为独立类别追踪，计入总量与大小排序。
+
+**6. `/acp` 命令错误日志泄漏**（#297，修复 #296）：命令处理器的 `throw new Error("__DCP_CONTEXT_HANDLED__")` 哨兵每次 `/acp` 调用都泄漏到 opencode 错误日志；改为普通 `return`（命令本就通过 `sendIgnoredMessage` 交付输出）。
+
+文件：`lib/state/state.ts`、`lib/state/utils.ts`、`lib/hooks.ts`、`lib/config.ts`、`lib/config-validation.ts`、`lib/messages/inject/utils.ts`、`lib/messages/truncate-tools.ts`、`lib/messages/enforce-budget.ts`（新增）、`lib/messages/query.ts`、`lib/messages/inject/inject.ts`、`lib/compress/status.ts`、`dcp.schema.json`、CONFIGURATION（中英）。测试：`tests/context-limit-fallback.test.ts`、`tests/model-switch-limits.test.ts`、`tests/truncate-tools.test.ts`、`tests/enforce-budget.test.ts`（新增）、`tests/recommend-exec-counter-alignment.test.ts`（新增）、`tests/inject.test.ts`、`tests/query-pure.test.ts`、`tests/acp-status.test.ts`、`tests/hooks-permission.test.ts`。全量 1207/1207；六个 PR 合并前均在本机重新验证（typecheck + 测试 + 构建）。
+
+### v1.16.0 — storagePath：自定义会话状态文件存储位置
+
+**问题**：ACP 的每会话状态文件（`{sessionId}.json` —— 压缩块、nudge 状态、token 统计）此前固定写入硬编码路径 `$XDG_DATA_HOME/opencode/storage/plugin/acp`。容器、NFS 家目录或 XDG data 目录空间紧张的用户无法迁移（issue #379）。
+
+**新功能**（#380，closes #379）：
+- 新增顶层可选配置 `storagePath`（字符串），用于自定义会话状态目录：
+
+| 取值 | 解析方式 |
+|---|---|
+| 未设置 / 空 | 默认 `$XDG_DATA_HOME/opencode/storage/plugin/acp`（不变） |
+| `/abs/path` | 原样使用 |
+| `~` / `~/x` | 展开到用户主目录 |
+| `rel/path` | 相对项目目录（opencode 工作目录）解析 |
+
+```jsonc
+// acp.jsonc —— 全局 / 配置目录 / 项目三层均支持
+{ "storagePath": "~/data/acp-state" }
+```
+
+- 解析结果在会话初始化时计算一次，挂在瞬态字段 `SessionState.storageDir` 上，**不会**写入持久化 JSON。
+- **不自动迁移**：设置了 `storagePath` 但该位置找不到有效状态、而默认位置存在状态文件时，每会话打一次性 WARN，提示手动迁移。
+- 配置校验、JSON schema、CONFIGURATION（中英）已更新；新增 19 个测试（路径解析、自定义目录读写往返、默认位置回归、三层合并、迁移 WARN、瞬态字段不泄漏、registry 接线）；全量 1131/1131 通过；双 agent 代码 + 测试评审。
+- 未设置时默认位置逐字节不变；所有 API 变更为纯新增。
+
+**安装**：`opencode plugin opencode-acp@latest --global`
+
+### v1.15.0 — compress.reasoning：按需丢弃已关闭轮次 compress 调用的超大思考
+
+**问题**：`compress` 工具调用消息被硬排除在一切压缩选择之外（Bug 39），每轮请求原样重发，其 `reasoning`（思考）部分随之永久驻留 —— 单调增长、压缩永远无法回收的上下文底座（实测会话中占残余上下文 83.5%；issue #368）。
+
+**新功能**（#377，替代 #370）：
+- 新增请求时 pass，仅当全部门条件成立时才移除消息的 `reasoning` 部分：（1）**轮次已关闭** —— 严格位于最后一条真实用户消息之前（活跃轮永不触碰；部分 provider 要求重放活跃轮 thinking）；（2）**选择器** —— 消息携带 `tool === "compress"` 工具 part（任意 status；仅 compress，不含 skill/task）；（3）**单条大小** —— 消息 reasoning 总长（多 part 求和）**严格大于** `threshold`（字符数）。小思考保留；长度不跨消息累计。持久化历史从不修改。
+- 新增嵌套配置 `compress.reasoning { drop: true, threshold: 2048 }`，三层配置文件与 #344 provider/model cascade 均为**字段级**合并（model > provider > 全局；深层只覆盖显式设置的字段）：
+
+```jsonc
+{
+    "compress": {
+        "reasoning": { "drop": true, "threshold": 2048 },
+        "providers": {
+            "my-gateway": { "reasoning": { "drop": false } },
+            "anthropic": { "models": { "claude-opus-4-5": { "reasoning": { "threshold": 8000 } } } }
+        }
+    }
+}
+```
+
+- provider/model 标识取自当前请求最后一条用户消息的 `info.model`，取不到回落 session state。`threshold: 0` 表示丢弃所有非空 reasoning。
+- 校验、JSON schema、README/CONFIGURATION（中英）全部更新；新增 29+ 测试（单元 / cascade / 校验 / hook 级 e2e，逐门变异验证）；全量 1112/1112 通过；双 agent review（代码 + 测试）。
+- 同时修复 review 中发现的两个配置校验缺陷：`compress.providers` 内的 `reasoning` 覆盖被误报为未知字段；`compress.reasoning: null` 会导致插件启动崩溃而非警告。
+
+**流程**（#367）：AGENTS.md 要求开发中发现/修复的问题必须建 issue 跟踪。
+
+**安装**：`opencode plugin opencode-acp@latest --global`
+
 ### v1.14.27 — 手动代理模式（/bili/ baseURL）也触发自动禁用
 
 **问题**：v1.14.25 的自动禁用只覆盖 `bili opencode` 启动器（环境变量 `BILLION_CONTEXT_PROXY`）。用户直接把某个 provider 的 `baseURL` 指向 billion-context 代理（手动模式）时，仍会同时加载两套上下文管理 —— ACP 的工具和 `/acp` 命令与代理在 wire 层的压缩并存（issue #337）。

@@ -5,6 +5,8 @@ import { assignMessageRefs } from "./message-ids"
 import {
     buildPriorityMap,
     buildToolIdList,
+    computeInputBudget,
+    dropCompressReasoning,
     dropEmptyMessages,
     injectCompressNudges,
     injectMessageIds,
@@ -13,10 +15,11 @@ import {
     stripHallucinationsFromString,
     stripStaleMetadata,
     syncCompressionBlocks,
-    computeInputBudget,
 } from "./messages"
+import { applyCompressOverrides } from "./messages/inject/utils"
 import { renderSystemPrompt, type PromptStore } from "./prompts"
 import { buildProtectedToolsExtension } from "./prompts/extensions/system"
+import { DEFAULT_COMPRESS_REASONING } from "./config"
 import {
     applyPendingCompressionDurations,
     buildCompressionTimingKey,
@@ -24,7 +27,9 @@ import {
 } from "./compress/timing"
 import { filterMessages, filterMessagesInPlace } from "./messages/shape"
 import { getLastUserMessage, isSyntheticMessage } from "./messages/query"
-import { truncateLargeToolOutputs } from "./messages/truncate-tools"
+import { OUTPUT_RESERVE_TOKENS, truncateLargeToolOutputs } from "./messages/truncate-tools"
+import { resolveEffectiveContextLimit } from "./state/utils"
+import { enforceContextBudget } from "./messages/enforce-budget"
 import { handleContextCommand, handleStatsCommand } from "./commands"
 import { handleExportCommand } from "./commands/export"
 import { sendIgnoredMessage } from "./ui/notification"
@@ -100,13 +105,6 @@ export function createSystemPromptHandler(
         // messages.transform creates the session state before this fires; if
         // absent (internal-agent early-return), there is nothing to attribute.
         const state = input.sessionID ? registry.get(input.sessionID) : undefined
-        if (state && input.model?.limit?.context) {
-            state.modelContextLimit = input.model.limit.context
-            // [FIX #312 follow-up] Record WHICH model the limit belongs to so
-            // the messages hook can detect staleness on a catalog miss.
-            state.modelProviderID = input.model?.providerID
-            state.modelID = input.model?.id
-        }
 
         if (!state || (state.isSubAgent && !config.allowSubAgents)) {
             return
@@ -116,6 +114,39 @@ export function createSystemPromptHandler(
         if (INTERNAL_AGENT_SIGNATURES.some((sig) => systemText.includes(sig))) {
             logger.info("Skipping DCP system prompt injection for internal agent")
             return
+        }
+
+        // [FIX #346] Attribute the limit to the session only for real session
+        // requests: internal agents (title/summary/compaction) may run on a
+        // different model and must not overwrite the session's limit.
+        // Persist on change so a freshly spawned process (headless
+        // spawn+resume) resumes with the limit already known — the system
+        // hook is the only writer and fires AFTER messages.transform within
+        // a request, so without this the limit is learned and lost every
+        // message and the safety net never engages.
+        if (input.model?.limit?.context) {
+            const limit = input.model.limit.context
+            const providerID = input.model?.providerID
+            const modelID = input.model?.id
+            // Identity fields are only written when present: a limit without
+            // identity must not clobber the pair the messages hook relies on
+            // for staleness detection (#312).
+            const changed =
+                state.modelContextLimit !== limit ||
+                (providerID !== undefined && state.modelProviderID !== providerID) ||
+                (modelID !== undefined && state.modelID !== modelID)
+            state.modelContextLimit = limit
+            // [FIX #312 follow-up] Record WHICH model the limit belongs to so
+            // the messages hook can detect staleness on a catalog miss.
+            if (providerID !== undefined) {
+                state.modelProviderID = providerID
+            }
+            if (modelID !== undefined) {
+                state.modelID = modelID
+            }
+            if (changed) {
+                saveSessionState(state, logger).catch(() => {})
+            }
         }
 
         const effectivePermission = compressPermission(state, config)
@@ -190,10 +221,26 @@ export function createChatMessageTransformHandler(
             const requestModel = (
                 lastUserMessage.info as { model?: { providerID?: string; modelID?: string } }
             ).model
-            const requestModelLimit = registry.resolveModelLimit(
+            let requestModelLimit = registry.resolveModelLimit(
                 requestModel?.providerID,
                 requestModel?.modelID,
             )
+            // [FIX #346] Catalog miss: the init-time seed is fire-and-forget and
+            // races server readiness, so in headless spawn+resume mode the
+            // catalog can stay empty for the whole process lifetime. During a
+            // request the server is guaranteed up (we are inside its pipeline),
+            // so retry hydration once per process before any threshold math.
+            if (
+                requestModelLimit === undefined &&
+                requestModel?.providerID &&
+                requestModel?.modelID
+            ) {
+                requestModelLimit = await registry.hydrateAndResolve(
+                    client,
+                    requestModel.providerID,
+                    requestModel.modelID,
+                )
+            }
             const prevModelID = state.modelID
             if (requestModelLimit !== undefined) {
                 state.modelContextLimit = requestModelLimit
@@ -227,6 +274,24 @@ export function createChatMessageTransformHandler(
                 })
             }
             await updatePerTurnState(state, logger, messages)
+
+            if (
+                state.modelContextLimit === undefined &&
+                !state.noContextLimitWarned &&
+                requestModel?.providerID &&
+                requestModel?.modelID &&
+                registry.resolveModelLimit(requestModel.providerID, requestModel.modelID) ===
+                    undefined
+            ) {
+                state.noContextLimitWarned = true
+                logger.warn(
+                    'Model reports no context window and the catalog has no entry for it; all percentage thresholds (min/max/emergency, GC) and the context-budget guard are disabled. Set the model limit in opencode.json (e.g. "limit": {"context": 262144, "output": 16384}) to enable them (also fixes the 32000 max_tokens fallback); an absolute compress.maxContextLimit in acp.jsonc only enables proactive nudges, not the guard.',
+                    {
+                        session: state.sessionId,
+                        model: `${requestModel.providerID}/${requestModel.modelID}`,
+                    },
+                )
+            }
         }
 
         syncCompressPermissionState(state, config, hostPermissions, output.messages)
@@ -236,11 +301,43 @@ export function createChatMessageTransformHandler(
         }
 
         stripHallucinations(output.messages)
+
+        // [#368] Drop oversized reasoning from closed-turn compress tool calls.
+        // compress calls are hard-exempt from compression (Bug 39), so their
+        // thinking otherwise rides along every request as an unreclaimable
+        // floor. Gated by the nested `compress.reasoning` config, resolved
+        // through the #344 cascade (model > provider > global) using THIS
+        // request's model identity (request metadata first, session state as
+        // fallback). Runs BEFORE token accounting / pruning so every later
+        // stage sees the post-drop array.
+        const dropReasoningModel = (
+            lastUserMessage?.info as
+                { model?: { providerID?: string; modelID?: string } } | undefined
+        )?.model
+        const reasoningConfig = applyCompressOverrides(
+            config,
+            dropReasoningModel?.providerID ?? state.modelProviderID,
+            dropReasoningModel?.modelID ?? state.modelID,
+        ).compress.reasoning
+        if (reasoningConfig?.drop !== false) {
+            const droppedReasoning = dropCompressReasoning(
+                output.messages,
+                reasoningConfig?.threshold ?? DEFAULT_COMPRESS_REASONING.threshold,
+            )
+            if (droppedReasoning > 0) {
+                logger.debug("compress.reasoning: dropped oversized reasoning parts", {
+                    dropped: droppedReasoning,
+                    threshold: reasoningConfig?.threshold ?? DEFAULT_COMPRESS_REASONING.threshold,
+                })
+            }
+        }
+
         ensureBuiltinFiltersRegistered()
+        const effectiveLimit = resolveEffectiveContextLimit(state, config)
         applyMessageFilters(output.messages, config.messageFilters, logger, {
             sessionId: state.sessionId ?? "",
             isSubAgent: state.isSubAgent,
-            modelContextLimit: state.modelContextLimit,
+            modelContextLimit: effectiveLimit?.limit,
         })
         cacheSystemPromptTokens(state, output.messages)
         assignMessageRefs(state, output.messages)
@@ -306,21 +403,49 @@ export function createChatMessageTransformHandler(
             logger,
             output.messages.filter((message) => !isSyntheticMessage(message)),
         )
+        // Keep candidate planning independent from the final budget guard:
+        // candidates are computed from the pre-truncation snapshot so their
+        // ranges remain valid when the compress executor fetches fresh history.
+        enforceContextBudget(state, config, logger, output.messages)
         injectMessageIds(state, config, output.messages, compressionPriorities)
         hideFailedCompressCalls(output.messages)
         stripStaleMetadata(output.messages)
         dropEmptyMessages(output.messages)
         const postTokens = getCurrentTokenUsage(state, output.messages)
+        // [FIX #346] Hard guard: if the post-transform context still exceeds
+        // the model's real request budget (window minus system prompt + tool
+        // schemas + output-token reserve), the backend will reject the
+        // request. opencode exits 0 with zero output in that case (upstream
+        // behavior the plugin cannot change), so this ERROR is the only
+        // signal that the session has hit the length-rejection wall.
+        if (postTokens !== undefined && effectiveLimit) {
+            const budget =
+                effectiveLimit.limit - (state.systemPromptTokens ?? 0) - OUTPUT_RESERVE_TOKENS
+            if (postTokens > budget) {
+                logger.error(
+                    "ACP hard guard: context exceeds model budget after in-flight reduction",
+                    {
+                        session: state.sessionId,
+                        postTokens,
+                        budget,
+                        contextLimit: effectiveLimit.limit,
+                        contextLimitSource: effectiveLimit.source,
+                        hint: "request will likely be rejected; run /compact or start a new session",
+                    },
+                )
+            }
+        }
         logger.info("Chat transform complete", {
             session: state.sessionId,
             model: state.modelID,
             messages: output.messages.length,
             prePruneTokens,
             postTokens,
-            contextLimit: state.modelContextLimit,
+            contextLimit: effectiveLimit?.limit,
+            contextLimitSource: effectiveLimit?.source,
             usagePct:
-                postTokens !== undefined && state.modelContextLimit
-                    ? `${((postTokens / state.modelContextLimit) * 100).toFixed(1)}%`
+                postTokens !== undefined && effectiveLimit
+                    ? `${((postTokens / effectiveLimit.limit) * 100).toFixed(1)}%`
                     : undefined,
             nudged: state.nudges.shouldInjectThisTurn,
         })
@@ -385,7 +510,7 @@ export function createCommandExecuteHandler(
             const sub = input.arguments?.trim().toLowerCase()
             if (sub === "stats" || sub === "status" || sub === "") {
                 await handleStatsCommand(commandCtx)
-                throw new Error("__DCP_CONTEXT_HANDLED__")
+                return
             }
 
             if (sub === "export" || sub.startsWith("export ")) {
@@ -400,7 +525,6 @@ export function createCommandExecuteHandler(
             }
 
             await handleContextCommand(commandCtx)
-            throw new Error("__DCP_CONTEXT_HANDLED__")
         }
     }
 }
