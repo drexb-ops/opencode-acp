@@ -29,10 +29,8 @@ import { filterMessages, filterMessagesInPlace } from "./messages/shape"
 import { getLastUserMessage } from "./messages/query"
 import { OUTPUT_RESERVE_TOKENS, truncateLargeToolOutputs } from "./messages/truncate-tools"
 import { resolveEffectiveContextLimit } from "./state/utils"
-import {
-    handleContextCommand,
-    handleStatsCommand,
-} from "./commands"
+import { enforceContextBudget } from "./messages/enforce-budget"
+import { handleContextCommand, handleStatsCommand } from "./commands"
 import { handleExportCommand } from "./commands/export"
 import { sendIgnoredMessage } from "./ui/notification"
 import { type HostPermissionSnapshot } from "./host-permissions"
@@ -41,7 +39,13 @@ import { hideConsumedCompressCalls } from "./compress/hide-consumed"
 import { hideFailedCompressCalls } from "./compress/hide-failed"
 import { applyMessageFilters } from "./messages/filter/apply"
 import { ensureBuiltinFiltersRegistered } from "./messages/filter/builtin"
-import { createSessionState, saveSessionState, syncToolCache, updatePerTurnState, type SessionStateRegistry } from "./state"
+import {
+    createSessionState,
+    saveSessionState,
+    syncToolCache,
+    updatePerTurnState,
+    type SessionStateRegistry,
+} from "./state"
 import { cacheSystemPromptTokens } from "./ui/utils"
 import { runBatchCleanup } from "./gc/merge"
 import { getCurrentTokenUsage } from "./token-utils"
@@ -270,6 +274,24 @@ export function createChatMessageTransformHandler(
                 })
             }
             await updatePerTurnState(state, logger, messages)
+
+            if (
+                state.modelContextLimit === undefined &&
+                !state.noContextLimitWarned &&
+                requestModel?.providerID &&
+                requestModel?.modelID &&
+                registry.resolveModelLimit(requestModel.providerID, requestModel.modelID) ===
+                    undefined
+            ) {
+                state.noContextLimitWarned = true
+                logger.warn(
+                    'Model reports no context window and the catalog has no entry for it; all percentage thresholds (min/max/emergency, GC) and the context-budget guard are disabled. Set the model limit in opencode.json (e.g. "limit": {"context": 262144, "output": 16384}) to enable them (also fixes the 32000 max_tokens fallback); an absolute compress.maxContextLimit in acp.jsonc only enables proactive nudges, not the guard.',
+                    {
+                        session: state.sessionId,
+                        model: `${requestModel.providerID}/${requestModel.modelID}`,
+                    },
+                )
+            }
         }
 
         syncCompressPermissionState(state, config, hostPermissions, output.messages)
@@ -289,7 +311,8 @@ export function createChatMessageTransformHandler(
         // fallback). Runs BEFORE token accounting / pruning so every later
         // stage sees the post-drop array.
         const dropReasoningModel = (
-            lastUserMessage?.info as { model?: { providerID?: string; modelID?: string } } | undefined
+            lastUserMessage?.info as
+                { model?: { providerID?: string; modelID?: string } } | undefined
         )?.model
         const reasoningConfig = applyCompressOverrides(
             config,
@@ -320,7 +343,8 @@ export function createChatMessageTransformHandler(
         assignMessageRefs(state, output.messages)
         const activeBlockCountBefore = state.prune.messages.activeBlockIds.size // [FIX Bug 4]
         syncCompressionBlocks(state, logger, output.messages)
-        if (state.prune.messages.activeBlockIds.size !== activeBlockCountBefore) { // [FIX Bug 4]
+        if (state.prune.messages.activeBlockIds.size !== activeBlockCountBefore) {
+            // [FIX Bug 4]
             saveSessionState(state, logger).catch(() => {}) // [FIX Bug 4] persist deactivations
         }
         syncToolCache(state, config, logger, output.messages)
@@ -332,6 +356,7 @@ export function createChatMessageTransformHandler(
         const prePruneTokens = getCurrentTokenUsage(state, output.messages)
         prune(state, logger, config, output.messages)
         truncateLargeToolOutputs(state, config, logger, output.messages)
+        enforceContextBudget(state, config, logger, output.messages)
         hideConsumedCompressCalls(state, output.messages)
         assignMessageRefs(state, output.messages)
         const compressionPriorities = buildPriorityMap(config, state, output.messages)
@@ -450,12 +475,7 @@ export function createCommandExecuteHandler(
             })
             const messages = filterMessages(messagesResponse.data || messagesResponse)
 
-            const state = await registry.getOrCreate(
-                client,
-                input.sessionID,
-                messages,
-                config,
-            )
+            const state = await registry.getOrCreate(client, input.sessionID, messages, config)
 
             syncCompressPermissionState(state, config, hostPermissions, messages)
 
@@ -482,13 +502,7 @@ export function createCommandExecuteHandler(
             }
 
             if (sub === "help") {
-                await sendIgnoredMessage(
-                    client,
-                    input.sessionID,
-                    buildHelpText(),
-                    {},
-                    logger,
-                )
+                await sendIgnoredMessage(client, input.sessionID, buildHelpText(), {}, logger)
                 throw new Error("__DCP_CONTEXT_HANDLED__")
             }
 
@@ -590,9 +604,7 @@ export function createEventHandler(registry: SessionStateRegistry, logger: Logge
         }
 
         if (typeof part.callID === "string" && typeof part.messageID === "string") {
-            timing.startsByCallId.delete(
-                buildCompressionTimingKey(part.messageID, part.callID),
-            )
+            timing.startsByCallId.delete(buildCompressionTimingKey(part.messageID, part.callID))
         }
     }
 }
