@@ -285,7 +285,10 @@ test("acp_status: scope=uncompressed defaults to ranges view", async () => {
 
 test("acp_status: scope=uncompressed view=messages shows per-message listing", async () => {
     const mockMsgs = [
-        { info: { id: "raw-1", role: "assistant" }, parts: [{ type: "text", text: "hello world" }] },
+        {
+            info: { id: "raw-1", role: "assistant", sessionID: SID, time: { created: 1 } },
+            parts: [{ type: "text", text: "hello world" }],
+        },
     ]
     const mockClient = makeMockClient(mockMsgs)
     const state = makeState([], new Map())
@@ -302,12 +305,13 @@ test("acp_status: scope=uncompressed view=messages shows per-message listing", a
 
     assert.match(result, /UNCOMPRESSED/)
     assert.match(result, /Sorted by/)
+    assert.match(result, /m00001 \(\d+\) text/, "per-message listing must include the visible message")
 })
 
 test("acp_status: scope=uncompressed view=messages with tool filter shows filter in header", async () => {
     const mockMsgs = [
         {
-            info: { id: "raw-1", role: "assistant" },
+            info: { id: "raw-1", role: "assistant", sessionID: SID, time: { created: 1 } },
             parts: [{ type: "tool", tool: "bash", state: { input: { command: "ls" } } }],
         },
     ]
@@ -325,6 +329,7 @@ test("acp_status: scope=uncompressed view=messages with tool filter shows filter
     const result = await statusTool.execute({ scope: "uncompressed", view: "messages", tool: "bash" } as any, { sessionID: SID } as any)
 
     assert.match(result, /UNCOMPRESSED — bash:/)
+    assert.match(result, /m00001 \(\d+\) bash/, "filtered listing must include the bash message")
 })
 
 test("acp_status: invalid scope falls back to overview", async () => {
@@ -437,4 +442,92 @@ test("acp_status: overview prefers cached systemPromptTokens over degraded visib
     assert.match(result, /CONTEXT BREAKDOWN/)
     assert.match(result, /10\.0K system/)
     assert.doesNotMatch(result, /200\.0K system/)
+})
+
+test("acp_status: overview counts reasoning as its own category (#371)", async () => {
+    const mockMsgs = [
+        {
+            info: { id: "raw-1", role: "assistant", sessionID: SID, time: { created: 1 } },
+            parts: [
+                { type: "text", text: "x".repeat(400) },
+                { type: "reasoning", text: "y".repeat(800) },
+            ],
+        },
+    ]
+    const mockClient = makeMockClient(mockMsgs)
+    const state = makeState([], new Map())
+    state.messageIds.byRawId.set("raw-1", "m00001")
+    const ctx: ToolFactoryContext = {
+        client: mockClient,
+        registry: singletonRegistry(state),
+        logger: { enabled: false } as any,
+        config: {} as any,
+        prompts: { reload: () => {} } as any,
+    }
+    const statusTool = createAcpStatusTool(ctx)
+    const result = await statusTool.execute({} as any, { sessionID: SID } as any)
+
+    // text=100, reasoning=200, system=0, tool=0, summaries=0 → total=300
+    assert.match(result, /CONTEXT BREAKDOWN/)
+    assert.match(result, /100 text \(33%\)/)
+    assert.match(result, /200 reasoning \(67%\)/)
+})
+
+test("acp_status: reasoning-only message appears in visible listing (#371)", async () => {
+    const mockMsgs = [
+        {
+            info: { id: "raw-1", role: "assistant", sessionID: SID, time: { created: 1 } },
+            parts: [{ type: "reasoning", text: "y".repeat(800) }],
+        },
+    ]
+    const mockClient = makeMockClient(mockMsgs)
+    const state = makeState([], new Map())
+    state.messageIds.byRawId.set("raw-1", "m00001")
+    const ctx: ToolFactoryContext = {
+        client: mockClient,
+        registry: singletonRegistry(state),
+        logger: { enabled: false } as any,
+        config: {} as any,
+        prompts: { reload: () => {} } as any,
+    }
+    const statusTool = createAcpStatusTool(ctx)
+    const overview = await statusTool.execute({} as any, { sessionID: SID } as any)
+    assert.match(overview, /200 reasoning \(100%\)/)
+
+    const drilldown = await statusTool.execute(
+        { scope: "uncompressed", view: "messages" } as any,
+        { sessionID: SID } as any,
+    )
+    assert.match(drilldown, /m00001 \(200\) text/)
+})
+
+test("acp_status: per-message drilldown includes reasoning tokens (#371)", async () => {
+    const mockMsgs = [
+        {
+            info: { id: "raw-1", role: "assistant", sessionID: SID, time: { created: 1 } },
+            parts: [
+                { type: "text", text: "x".repeat(400) },
+                { type: "reasoning", text: "y".repeat(800) },
+            ],
+        },
+    ]
+    const mockClient = makeMockClient(mockMsgs)
+    const state = makeState([], new Map())
+    state.messageIds.byRawId.set("raw-1", "m00001")
+    const ctx: ToolFactoryContext = {
+        client: mockClient,
+        registry: singletonRegistry(state),
+        logger: { enabled: false } as any,
+        config: {} as any,
+        prompts: { reload: () => {} } as any,
+    }
+    const statusTool = createAcpStatusTool(ctx)
+    const result = await statusTool.execute(
+        { scope: "uncompressed", view: "messages" } as any,
+        { sessionID: SID } as any,
+    )
+
+    // text=100 + reasoning=200 → per-message footprint 300
+    assert.match(result, /m00001 \(300\) text/)
+    assert.match(result, /UNCOMPRESSED — 300/)
 })

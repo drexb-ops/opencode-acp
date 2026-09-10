@@ -594,6 +594,7 @@ export interface ContextComposition {
     textTokens: number
     systemTokens: number
     protectedTokens: number
+    reasoningTokens: number
     total: number
     largestRanges: { ref: string; tokens: number }[]
     largestToolRanges: { ref: string; tokens: number; tool?: string }[]
@@ -627,6 +628,7 @@ export function estimateContextComposition(
     let summaryTokens = 0
     let messageTokens = 0
     let protectedTokens = 0
+    let reasoningTokens = 0
     const perMessage: { ref: string; tokens: number }[] = []
     const perTool: { ref: string; tokens: number; tool?: string }[] = []
     const perCode: { ref: string; tokens: number }[] = []
@@ -695,6 +697,12 @@ export function estimateContextComposition(
                 summaryTokens += summaryPartTokens
                 toolTypeMap.set(toolName, (toolTypeMap.get(toolName) || 0) + toolPartTokens)
                 if (!msgToolName) msgToolName = toolName
+            } else if (part.type === "reasoning" && typeof (part as any).text === "string") {
+                // Real usage includes reasoning (token-utils.ts) — track as its own
+                // category so display totals align with the usage formula (#371).
+                const tokens = Math.round(((part as any).text as string).length / 4)
+                msgTotal += tokens
+                reasoningTokens += tokens
             }
         }
 
@@ -733,7 +741,8 @@ export function estimateContextComposition(
         textTokens: Math.max(0, messageTokens - codeTokens),
         systemTokens,
         protectedTokens,
-        total: systemTokens + toolTokens + summaryTokens + messageTokens,
+        reasoningTokens,
+        total: systemTokens + toolTokens + summaryTokens + messageTokens + reasoningTokens,
         largestRanges: perMessage.slice(0, 15),
         largestToolRanges: perTool.slice(0, 15),
         largestCodeRanges: perCode.slice(0, 5),
