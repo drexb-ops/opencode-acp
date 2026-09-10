@@ -30,6 +30,7 @@ export const VALID_CONFIG_KEYS = new Set([
     "compress.modelMaxLimits",
     "compress.modelMinLimits",
     "compress.providers",
+    "compress.contextLimitFallback",
     "compress.nudgeFrequency",
     "compress.minNudgeContextPercent",
     "compress.nudgeGrowthTokens",
@@ -53,6 +54,7 @@ export const VALID_CONFIG_KEYS = new Set([
     "compress.reasoning",
     "compress.reasoning.drop",
     "compress.reasoning.threshold",
+    "compress.completionReserveTokens",
     "gc",
     "gc.algorithm",
     "gc.promotionThreshold",
@@ -125,7 +127,11 @@ export function validateConfigTypes(config: Record<string, any>): ValidationErro
     }
 
     if (config.allowSubAgents !== undefined && typeof config.allowSubAgents !== "boolean") {
-        errors.push({ key: "allowSubAgents", expected: "boolean", actual: typeof config.allowSubAgents })
+        errors.push({
+            key: "allowSubAgents",
+            expected: "boolean",
+            actual: typeof config.allowSubAgents,
+        })
     }
 
     if (config.pruneNotification !== undefined) {
@@ -351,10 +357,7 @@ export function validateConfigTypes(config: Record<string, any>): ValidationErro
                 })
             }
 
-            if (
-                typeof compress.minCompressRange === "number" &&
-                compress.minCompressRange < 0
-            ) {
+            if (typeof compress.minCompressRange === "number" && compress.minCompressRange < 0) {
                 errors.push({
                     key: "compress.minCompressRange",
                     expected: "non-negative number (>= 0)",
@@ -412,7 +415,7 @@ export function validateConfigTypes(config: Record<string, any>): ValidationErro
                     if (emergencyThreshold < 0) {
                         errors.push({
                             key: "compress.emergencyThresholdPercent",
-                            expected: "non-negative number or \"${number}%\" (0–100)",
+                            expected: 'non-negative number or "${number}%" (0–100)',
                             actual: `${emergencyThreshold}`,
                         })
                     }
@@ -587,6 +590,28 @@ export function validateConfigTypes(config: Record<string, any>): ValidationErro
             }
 
             if (
+                compress.completionReserveTokens !== undefined &&
+                typeof compress.completionReserveTokens !== "number"
+            ) {
+                errors.push({
+                    key: "compress.completionReserveTokens",
+                    expected: "number",
+                    actual: typeof compress.completionReserveTokens,
+                })
+            }
+
+            if (
+                typeof compress.completionReserveTokens === "number" &&
+                compress.completionReserveTokens < 0
+            ) {
+                errors.push({
+                    key: "compress.completionReserveTokens",
+                    expected: "non-negative number (>= 0)",
+                    actual: `${compress.completionReserveTokens}`,
+                })
+            }
+
+            if (
                 typeof compress.iterationNudgeThreshold === "number" &&
                 compress.iterationNudgeThreshold < 1
             ) {
@@ -716,7 +741,11 @@ export function validateConfigTypes(config: Record<string, any>): ValidationErro
                 reasoning: "reasoningConfig",
             }
 
-            const validateOverrideField = (key: string, type: OverrideFieldType, value: unknown): void => {
+            const validateOverrideField = (
+                key: string,
+                type: OverrideFieldType,
+                value: unknown,
+            ): void => {
                 if (value === undefined) {
                     return
                 }
@@ -729,14 +758,11 @@ export function validateConfigTypes(config: Record<string, any>): ValidationErro
                     case "nonNegativeNumber":
                     case "positiveNumber": {
                         const min = type === "positiveNumber" ? 1 : 0
-                        if (
-                            typeof value !== "number" ||
-                            !Number.isFinite(value) ||
-                            value < min
-                        ) {
+                        if (typeof value !== "number" || !Number.isFinite(value) || value < min) {
                             errors.push({
                                 key,
-                                expected: type === "positiveNumber" ? "number (>= 1)" : "number (>= 0)",
+                                expected:
+                                    type === "positiveNumber" ? "number (>= 1)" : "number (>= 0)",
                                 actual: JSON.stringify(value),
                             })
                         }
@@ -750,7 +776,11 @@ export function validateConfigTypes(config: Record<string, any>): ValidationErro
                         break
                     case "nudgeForce":
                         if (value !== "strong" && value !== "soft") {
-                            errors.push({ key, expected: "'strong' | 'soft'", actual: JSON.stringify(value) })
+                            errors.push({
+                                key,
+                                expected: "'strong' | 'soft'",
+                                actual: JSON.stringify(value),
+                            })
                         }
                         break
                     case "stringArray":
@@ -758,7 +788,11 @@ export function validateConfigTypes(config: Record<string, any>): ValidationErro
                             !Array.isArray(value) ||
                             !value.every((entry) => typeof entry === "string")
                         ) {
-                            errors.push({ key, expected: "string[]", actual: JSON.stringify(value) })
+                            errors.push({
+                                key,
+                                expected: "string[]",
+                                actual: JSON.stringify(value),
+                            })
                         }
                         break
                     case "reasoningConfig":
@@ -800,8 +834,16 @@ export function validateConfigTypes(config: Record<string, any>): ValidationErro
                 if (overrides === undefined) {
                     return
                 }
-                if (typeof overrides !== "object" || overrides === null || Array.isArray(overrides)) {
-                    errors.push({ key: prefix, expected: "CompressModelOverrides", actual: typeof overrides })
+                if (
+                    typeof overrides !== "object" ||
+                    overrides === null ||
+                    Array.isArray(overrides)
+                ) {
+                    errors.push({
+                        key: prefix,
+                        expected: "CompressModelOverrides",
+                        actual: typeof overrides,
+                    })
                     return
                 }
                 const model = overrides as Record<string, unknown>
@@ -828,7 +870,11 @@ export function validateConfigTypes(config: Record<string, any>): ValidationErro
                 if (providers === undefined) {
                     return
                 }
-                if (typeof providers !== "object" || providers === null || Array.isArray(providers)) {
+                if (
+                    typeof providers !== "object" ||
+                    providers === null ||
+                    Array.isArray(providers)
+                ) {
                     errors.push({
                         key: "compress.providers",
                         expected: "Record<string, ProviderOverrides>",
@@ -838,8 +884,16 @@ export function validateConfigTypes(config: Record<string, any>): ValidationErro
                 }
                 for (const [providerId, providerValue] of Object.entries(providers)) {
                     const prefix = `compress.providers.${providerId}`
-                    if (typeof providerValue !== "object" || providerValue === null || Array.isArray(providerValue)) {
-                        errors.push({ key: prefix, expected: "ProviderOverrides", actual: typeof providerValue })
+                    if (
+                        typeof providerValue !== "object" ||
+                        providerValue === null ||
+                        Array.isArray(providerValue)
+                    ) {
+                        errors.push({
+                            key: prefix,
+                            expected: "ProviderOverrides",
+                            actual: typeof providerValue,
+                        })
                         continue
                     }
                     const provider = providerValue as Record<string, unknown>
@@ -877,6 +931,28 @@ export function validateConfigTypes(config: Record<string, any>): ValidationErro
             }
 
             validateProviderOverrides(compress.providers)
+
+            if (
+                compress.contextLimitFallback !== undefined &&
+                typeof compress.contextLimitFallback !== "number"
+            ) {
+                errors.push({
+                    key: "compress.contextLimitFallback",
+                    expected: "number",
+                    actual: typeof compress.contextLimitFallback,
+                })
+            }
+
+            if (
+                typeof compress.contextLimitFallback === "number" &&
+                compress.contextLimitFallback < 0
+            ) {
+                errors.push({
+                    key: "compress.contextLimitFallback",
+                    expected: "non-negative number (0 disables the fallback)",
+                    actual: `${compress.contextLimitFallback}`,
+                })
+            }
 
             const validValues = ["ask", "allow", "deny"]
             if (compress.permission !== undefined && !validValues.includes(compress.permission)) {
@@ -940,9 +1016,7 @@ export function validateConfigTypes(config: Record<string, any>): ValidationErro
                     actual: typeof gc.maxOldGenSummaryLength,
                 })
             }
-            if (
-                gc.majorGcThresholdPercent !== undefined
-            ) {
+            if (gc.majorGcThresholdPercent !== undefined) {
                 const isValidNumber = typeof gc.majorGcThresholdPercent === "number"
                 const isPercentString =
                     typeof gc.majorGcThresholdPercent === "string" &&
@@ -957,7 +1031,10 @@ export function validateConfigTypes(config: Record<string, any>): ValidationErro
             }
 
             const validateBatchThreshold = (
-                key: "gc.batchCleanup.lowThreshold" | "gc.batchCleanup.highThreshold" | "gc.batchCleanup.forceThreshold",
+                key:
+                    | "gc.batchCleanup.lowThreshold"
+                    | "gc.batchCleanup.highThreshold"
+                    | "gc.batchCleanup.forceThreshold",
                 value: unknown,
             ): void => {
                 const isValidNumber = typeof value === "number"
@@ -984,13 +1061,22 @@ export function validateConfigTypes(config: Record<string, any>): ValidationErro
                     })
                 } else {
                     if (gc.batchCleanup.lowThreshold !== undefined) {
-                        validateBatchThreshold("gc.batchCleanup.lowThreshold", gc.batchCleanup.lowThreshold)
+                        validateBatchThreshold(
+                            "gc.batchCleanup.lowThreshold",
+                            gc.batchCleanup.lowThreshold,
+                        )
                     }
                     if (gc.batchCleanup.highThreshold !== undefined) {
-                        validateBatchThreshold("gc.batchCleanup.highThreshold", gc.batchCleanup.highThreshold)
+                        validateBatchThreshold(
+                            "gc.batchCleanup.highThreshold",
+                            gc.batchCleanup.highThreshold,
+                        )
                     }
                     if (gc.batchCleanup.forceThreshold !== undefined) {
-                        validateBatchThreshold("gc.batchCleanup.forceThreshold", gc.batchCleanup.forceThreshold)
+                        validateBatchThreshold(
+                            "gc.batchCleanup.forceThreshold",
+                            gc.batchCleanup.forceThreshold,
+                        )
                     }
                 }
             }
