@@ -37,20 +37,13 @@
         },
         "pruneNotification": {
             "type": "string",
-            "enum": [
-                "off",
-                "minimal",
-                "detailed"
-            ],
+            "enum": ["off", "minimal", "detailed"],
             "default": "off",
             "description": "Level of notification shown when context management occurs"
         },
         "pruneNotificationType": {
             "type": "string",
-            "enum": [
-                "chat",
-                "toast"
-            ],
+            "enum": ["chat", "toast"],
             "default": "toast",
             "description": "Where to display notifications (chat deprecated, falls back to toast)"
         },
@@ -118,11 +111,7 @@
             "properties": {
                 "permission": {
                     "type": "string",
-                    "enum": [
-                        "ask",
-                        "allow",
-                        "deny"
-                    ],
+                    "enum": ["ask", "allow", "deny"],
                     "default": "allow",
                     "description": "Permission mode (deny disables the tool)"
                 },
@@ -192,6 +181,12 @@
                         ]
                     }
                 },
+                "contextLimitFallback": {
+                    "description": "Fallback context window (absolute tokens) used when the model's limit is unknown (e.g. custom providers with no declared limit, or the brief window after a model switch invalidates a stale limit). Drives nudge thresholds, emergency override, GC, and in-flight truncation. Per-model limits (modelMaxLimits/modelMinLimits) take precedence. Set to 0 to disable the fallback (legacy behavior: no safety net until the limit is learned).",
+                    "type": "number",
+                    "default": 128000,
+                    "minimum": 0
+                },
                 "nudgeFrequency": {
                     "type": "number",
                     "default": 5,
@@ -206,10 +201,7 @@
                 },
                 "nudgeForce": {
                     "type": "string",
-                    "enum": [
-                        "strong",
-                        "soft"
-                    ],
+                    "enum": ["strong", "soft"],
                     "default": "soft",
                     "description": "Controls how likely compression is after user messages. 'strong' is more likely, 'soft' is less likely."
                 },
@@ -257,10 +249,7 @@
                                 "description": "Override for the soft upper threshold. Precedence when set here: nested override > modelMaxLimits flat map > global value."
                             },
                             "emergencyThresholdPercent": {
-                                "type": [
-                                    "number",
-                                    "string"
-                                ],
+                                "type": ["number", "string"],
                                 "description": "Override for the emergency threshold (absolute tokens or percentage string)."
                             },
                             "minNudgeContextPercent": {
@@ -302,10 +291,7 @@
                             },
                             "nudgeForce": {
                                 "type": "string",
-                                "enum": [
-                                    "strong",
-                                    "soft"
-                                ],
+                                "enum": ["strong", "soft"],
                                 "description": "Override for the nudge force mode."
                             },
                             "protectedTools": {
@@ -404,10 +390,7 @@
                                             "description": "Override for the soft upper threshold. Precedence when set here: nested override > modelMaxLimits flat map > global value."
                                         },
                                         "emergencyThresholdPercent": {
-                                            "type": [
-                                                "number",
-                                                "string"
-                                            ],
+                                            "type": ["number", "string"],
                                             "description": "Override for the emergency threshold (absolute tokens or percentage string)."
                                         },
                                         "minNudgeContextPercent": {
@@ -449,10 +432,7 @@
                                         },
                                         "nudgeForce": {
                                             "type": "string",
-                                            "enum": [
-                                                "strong",
-                                                "soft"
-                                            ],
+                                            "enum": ["strong", "soft"],
                                             "description": "Override for the nudge force mode."
                                         },
                                         "protectedTools": {
@@ -619,6 +599,12 @@
                             "description": "Single-thinking size gate (chars): a closed-turn compress message's total reasoning length must exceed this to be dropped. Small thinkings are kept (not accumulated across messages). 0 drops any non-empty reasoning."
                         }
                     }
+                },
+                "completionReserveTokens": {
+                    "type": "number",
+                    "default": 32768,
+                    "minimum": 0,
+                    "description": "Tokens reserved for the model's completion when the context-budget guard prunes tool outputs so the request fits the window. Default 32768 covers opencode's 32000 max_tokens fallback for models with no declared limit.output. The guard is a no-op unless the model's context window is known (declared limit or catalog entry); an absolute maxContextLimit is a soft nudge threshold and does not enable the guard."
                 }
             },
             "default": {
@@ -647,7 +633,8 @@
                 "reasoning": {
                     "drop": true,
                     "threshold": 2048
-                }
+                },
+                "completionReserveTokens": 32768
             }
         },
         "gc": {
@@ -657,9 +644,7 @@
             "properties": {
                 "algorithm": {
                     "type": "string",
-                    "enum": [
-                        "truncate"
-                    ],
+                    "enum": ["truncate"],
                     "default": "truncate"
                 },
                 "promotionThreshold": {
@@ -779,7 +764,7 @@
                                 },
                                 "layer2MaxTop20Recall": {
                                     "type": "number",
-                                    "default": 0.20,
+                                    "default": 0.2,
                                     "minimum": 0,
                                     "description": "L2 fails (combined with rougeF1 via AND) when top-20 keyword recall is below this threshold."
                                 }
@@ -796,7 +781,7 @@
                         "layer1MinChars": 200,
                         "layer1MinRetentionPct": 1.0,
                         "layer2MaxRougeF1": 0.05,
-                        "layer2MaxTop20Recall": 0.20
+                        "layer2MaxTop20Recall": 0.2
                     }
                 }
             }
