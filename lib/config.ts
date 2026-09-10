@@ -63,6 +63,15 @@ export interface CompressConfig {
     modelMinLimits?: Record<string, number | `${number}%`>
     /** Nested per-provider / per-model overrides (billion-context-pi style). Resolved field-by-field: model > provider > global. */
     providers?: Record<string, CompressProviderOverrides>
+    /**
+     * Fallback context window (absolute tokens) used when the model's limit is
+     * unknown (e.g. custom providers with no declared limit, or the brief
+     * window after a model switch invalidates a stale limit). Default: 128000.
+     * Per-model limits (modelMaxLimits/modelMinLimits) take precedence. Set to
+     * 0 to disable the fallback (legacy behavior: no safety net until the
+     * limit is learned).
+     */
+    contextLimitFallback?: number
     nudgeFrequency: number
     minNudgeContextPercent: number
     nudgeGrowthTokens?: number
@@ -291,6 +300,7 @@ const defaultConfig: PluginConfig = {
         summaryBuffer: true,
         maxContextLimit: "80%",
         minContextLimit: "80%",
+        contextLimitFallback: 128000,
         nudgeFrequency: 5,
         minNudgeContextPercent: 5,
         iterationNudgeThreshold: 15,
@@ -520,6 +530,7 @@ export function mergeCompress(
         modelMaxLimits: override.modelMaxLimits ?? base.modelMaxLimits,
         modelMinLimits: override.modelMinLimits ?? base.modelMinLimits,
         providers: mergeProviderOverrides(base.providers, override.providers),
+        contextLimitFallback: override.contextLimitFallback ?? base.contextLimitFallback,
         nudgeFrequency: override.nudgeFrequency ?? base.nudgeFrequency,
         minNudgeContextPercent: override.minNudgeContextPercent ?? base.minNudgeContextPercent,
         nudgeGrowthTokens: override.nudgeGrowthTokens,
