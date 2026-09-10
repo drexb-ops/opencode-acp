@@ -464,6 +464,51 @@ Post-compression quality evaluation. Runs after each compression to verify summa
 
 ---
 
+### `messageFilters`
+
+Message filters strip or deduplicate third-party plugin injections (e.g. oh-my-opencode system reminders, context dumps, task directives) from the visible context **before** ACP processes them. Filtered content never gets a message ref and is never counted toward context usage or compression triggers.
+
+Since v1.14.8, ACP ships five built-in oh-my-opencode (OMO) filters, all enabled by default:
+
+| Filter | Version | Behavior |
+|--------|---------|----------|
+| `omo-system-reminder` | 1.3.0 | Keeps the last 2 OMO `<system-reminder>` messages; for older ones, strips the `<system-reminder>` blocks and `<!-- OMO_INTERNAL_INITIATOR -->` markers but preserves your actual user content |
+| `omo-context` | 1.0.0 | Keeps only the latest OMO `[CONTEXT]` injection; drops earlier duplicates |
+| `omo-task-directive` | 1.0.0 | Keeps only the latest OMO `TASK:` / `## TASK` directive; drops earlier ones |
+| `omo-todo-continuation` | 1.0.0 | Keeps only the latest OMO TODO CONTINUATION directive; drops earlier ones |
+| `omo-mode-injection` | 1.1.0 | Strips leading mode blocks (`<ultrawork-mode>`, `[search-mode]`, …) and preserves user content |
+
+#### `messageFilters.enabled`
+- **Type:** `boolean`
+- **Default:** `true`
+- **Status:** ACTIVE
+- **Description:** Master switch. When `false`, no filters run.
+
+#### `messageFilters.filters`
+- **Type:** `object` — `Record<filterName, { enabled: boolean; keepLast?: number }>`
+- **Default:** all built-in filters enabled
+- **Status:** ACTIVE
+- **Description:** Per-filter configuration. `enabled` toggles a single filter on/off. `keepLast` (dedup filters only) sets how many of the most recent matching messages to keep — default `1`, except `omo-system-reminder` which defaults to `2`.
+
+Example:
+
+```jsonc
+{
+    "messageFilters": {
+        "enabled": true,
+        "filters": {
+            "omo-system-reminder": { "enabled": true, "keepLast": 2 },
+            "omo-context": { "enabled": true },
+            "omo-task-directive": { "enabled": true },
+            "omo-todo-continuation": { "enabled": true },
+            "omo-mode-injection": { "enabled": true }
+        }
+    }
+}
+```
+
+---
+
 ## Common Config Recipes
 
 ### Aggressive compression (maximize context savings)
@@ -565,6 +610,28 @@ See the [`compress.providers`](#compressproviders) reference for the full overri
         "**/credentials.json",
         "**/secrets.*"
     ]
+}
+```
+
+### Tune or disable oh-my-opencode (OMO) injection filters
+The five built-in OMO filters are on by default (see [`messageFilters`](#messagefilters)). Keep more recent system-reminders, disable a single filter, or turn the whole subsystem off:
+```jsonc
+{
+    "messageFilters": {
+        "enabled": true,
+        "filters": {
+            // keep the last 3 OMO system-reminders instead of 2
+            "omo-system-reminder": { "enabled": true, "keepLast": 3 },
+            // disable one filter, keep the rest
+            "omo-task-directive": { "enabled": false }
+        }
+    }
+}
+```
+```jsonc
+{
+    // turn all message filters off
+    "messageFilters": { "enabled": false }
 }
 ```
 

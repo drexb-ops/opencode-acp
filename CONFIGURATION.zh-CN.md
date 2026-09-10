@@ -464,6 +464,51 @@ ACP 从最多三层配置文件中读取（后加载的覆盖先加载的）：
 
 ---
 
+### `messageFilters`
+
+消息过滤器在 ACP 处理之前，从可见上下文中**剥离或去重**第三方插件注入的内容（例如 oh-my-opencode 的 system reminder、上下文转储、任务指令）。被过滤的内容不会获得消息引用（message ref），也不会计入上下文使用量或压缩触发阈值。
+
+自 v1.14.8 起，ACP 内置了 5 个 oh-my-opencode（OMO）过滤器，全部默认启用：
+
+| 过滤器 | 版本 | 行为 |
+|--------|------|------|
+| `omo-system-reminder` | 1.3.0 | 保留最近 2 条 OMO `<system-reminder>` 消息；更早的会剥离 `<system-reminder>` 块和 `<!-- OMO_INTERNAL_INITIATOR -->` 标记，但**保留你的实际用户内容** |
+| `omo-context` | 1.0.0 | 只保留最新的 OMO `[CONTEXT]` 注入；丢弃更早的重复项 |
+| `omo-task-directive` | 1.0.0 | 只保留最新的 OMO `TASK:` / `## TASK` 指令；丢弃更早的 |
+| `omo-todo-continuation` | 1.0.0 | 只保留最新的 OMO TODO CONTINUATION 指令；丢弃更早的 |
+| `omo-mode-injection` | 1.1.0 | 剥离开头的模式块（`<ultrawork-mode>`、`[search-mode]` 等），保留用户内容 |
+
+#### `messageFilters.enabled`
+- **类型：** `boolean`
+- **默认值：** `true`
+- **状态：** ACTIVE
+- **说明：** 主开关。设为 `false` 时不运行任何过滤器。
+
+#### `messageFilters.filters`
+- **类型：** `object` — `Record<filterName, { enabled: boolean; keepLast?: number }>`
+- **默认值：** 所有内置过滤器启用
+- **状态：** ACTIVE
+- **说明：** 按过滤器配置。`enabled` 单独开关某个过滤器；`keepLast`（仅去重类过滤器）设置保留最近多少条匹配消息——默认 `1`，`omo-system-reminder` 除外（默认 `2`）。
+
+示例：
+
+```jsonc
+{
+    "messageFilters": {
+        "enabled": true,
+        "filters": {
+            "omo-system-reminder": { "enabled": true, "keepLast": 2 },
+            "omo-context": { "enabled": true },
+            "omo-task-directive": { "enabled": true },
+            "omo-todo-continuation": { "enabled": true },
+            "omo-mode-injection": { "enabled": true }
+        }
+    }
+}
+```
+
+---
+
 ## 常用配置模板
 
 ### 激进压缩（最大化上下文节省）
@@ -565,6 +610,28 @@ ACP 从最多三层配置文件中读取（后加载的覆盖先加载的）：
         "**/credentials.json",
         "**/secrets.*"
     ]
+}
+```
+
+### 调整或禁用 oh-my-opencode（OMO）注入过滤器
+5 个内置 OMO 过滤器默认开启（见 [`messageFilters`](#messagefilters)）。可以保留更多最近的 system-reminder、单独禁用某个过滤器，或整体关闭：
+```jsonc
+{
+    "messageFilters": {
+        "enabled": true,
+        "filters": {
+            // 保留最近 3 条 OMO system-reminder（默认 2 条）
+            "omo-system-reminder": { "enabled": true, "keepLast": 3 },
+            // 只禁用一个过滤器，其余保持
+            "omo-task-directive": { "enabled": false }
+        }
+    }
+}
+```
+```jsonc
+{
+    // 关闭所有消息过滤器
+    "messageFilters": { "enabled": false }
 }
 ```
 
