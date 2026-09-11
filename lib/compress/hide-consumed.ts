@@ -90,8 +90,14 @@ export function hideConsumedCompressCalls(state: SessionState, messages: WithPar
     const allBlockCallIds = getHistoricalCallIds(state)
     const liveRangeKeysByCallId = new Map<string, Set<string>>()
     const activeCallIds = new Set<string>()
-    for (const block of state.prune.messages.blocksById.values()) {
-        if (!block.compressCallId) continue
+    const liveBlocks = state.prune.messages.membershipsVerified
+        ? [...state.prune.messages.activeBlockIds]
+              .map((blockId) => state.prune.messages.blocksById.get(blockId))
+              .filter((block): block is CompressionBlock => block !== undefined)
+        : state.prune.messages.blocksById.values()
+
+    for (const block of liveBlocks) {
+        if (!block?.compressCallId) continue
         if (!isLiveBlock(block)) continue
         activeCallIds.add(block.compressCallId)
         let keys = liveRangeKeysByCallId.get(block.compressCallId)

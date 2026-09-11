@@ -88,9 +88,9 @@ export interface SearchContext {
     rawIndexById: Map<string, number>
     summaryByBlockId: Map<number, CompressionBlock>
     /** Request-scoped boundary references for visible messages and active blocks. */
-    boundaryLookup: Map<string, BoundaryReference>
+    boundaryLookup?: Map<string, BoundaryReference>
     /** Active blocks grouped by their raw anchor message for range selection. */
-    summariesByAnchorMessageId: Map<string, CompressionBlock[]>
+    summariesByAnchorMessageId?: Map<string, CompressionBlock[]>
 }
 
 export interface SelectionResolution {
