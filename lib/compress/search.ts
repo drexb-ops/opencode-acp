@@ -1,5 +1,5 @@
 import { tool } from "@opencode-ai/plugin"
-import type { SessionState, WithParts } from "../state"
+import type { CompressionBlock, SessionState, WithParts } from "../state"
 import { formatBlockRef, formatMessageRef, parseBoundaryId, parseMessageRef } from "../message-ids"
 import { isIgnoredUserMessage } from "../messages/query"
 import { filterMessages } from "../messages/shape"
@@ -34,7 +34,7 @@ export function buildSearchContext(state: SessionState, rawMessages: WithParts[]
         rawIndexById.set(message.info.id, index)
     }
 
-    const summaryByBlockId = new Map()
+    const summaryByBlockId = new Map<number, CompressionBlock>()
     for (const [blockId, block] of state.prune.messages.blocksById) {
         if (!block.active) {
             continue
@@ -42,12 +42,21 @@ export function buildSearchContext(state: SessionState, rawMessages: WithParts[]
         summaryByBlockId.set(blockId, block)
     }
 
-    return {
+    const summariesByAnchorMessageId = buildSummaryAnchorIndex(summaryByBlockId)
+    const context: SearchContext = {
         rawMessages,
         rawMessagesById,
         rawIndexById,
         summaryByBlockId,
+        boundaryLookup: new Map(),
+        summariesByAnchorMessageId,
     }
+
+    // Boundary resolution and selection are both performed repeatedly while
+    // validating a batch. Build their request-local indexes once instead of
+    // replaying active state for every entry.
+    context.boundaryLookup = buildBoundaryLookup(context, state)
+    return context
 }
 
 export function resolveBoundaryIds(
@@ -57,7 +66,10 @@ export function resolveBoundaryIds(
     endId: string,
     logger?: { warn(message: string, data?: any): void },
 ): { startReference: BoundaryReference; endReference: BoundaryReference } {
-    const lookup = buildBoundaryLookup(context, state)
+    // The normal path uses the request-scoped index built by
+    // buildSearchContext. Keep the fallback for callers that construct a
+    // SearchContext directly (including older integrations and unit tests).
+    const lookup = context.boundaryLookup ?? buildBoundaryLookup(context, state)
     const issues: string[] = []
     const parsedStartId = parseBoundaryId(startId)
     const parsedEndId = parseBoundaryId(endId)
@@ -342,22 +354,21 @@ export function resolveSelection(
         }
     }
 
-    const selectedMessageIds = new Set(messageIds)
     const summariesInSelection: Array<{ blockId: number; rawIndex: number }> = []
-    for (const summary of context.summaryByBlockId.values()) {
-        if (!selectedMessageIds.has(summary.anchorMessageId)) {
-            continue
-        }
-
-        const anchorIndex = context.rawIndexById.get(summary.anchorMessageId)
+    const summariesByAnchorMessageId =
+        context.summariesByAnchorMessageId ?? buildSummaryAnchorIndex(context.summaryByBlockId)
+    for (const messageId of messageIds) {
+        const anchorIndex = context.rawIndexById.get(messageId)
         if (anchorIndex === undefined) {
             continue
         }
 
-        summariesInSelection.push({
-            blockId: summary.blockId,
-            rawIndex: anchorIndex,
-        })
+        for (const summary of summariesByAnchorMessageId.get(messageId) ?? []) {
+            summariesInSelection.push({
+                blockId: summary.blockId,
+                rawIndex: anchorIndex,
+            })
+        }
     }
 
     summariesInSelection.sort((a, b) => a.rawIndex - b.rawIndex || a.blockId - b.blockId)
@@ -453,6 +464,27 @@ function buildBoundaryLookup(
     }
 
     return lookup
+}
+
+function buildSummaryAnchorIndex(
+    summaryByBlockId: Map<number, CompressionBlock>,
+): Map<string, CompressionBlock[]> {
+    const summariesByAnchorMessageId = new Map<string, CompressionBlock[]>()
+
+    for (const summary of summaryByBlockId.values()) {
+        const summaries = summariesByAnchorMessageId.get(summary.anchorMessageId)
+        if (summaries) {
+            summaries.push(summary)
+        } else {
+            summariesByAnchorMessageId.set(summary.anchorMessageId, [summary])
+        }
+    }
+
+    for (const summaries of summariesByAnchorMessageId.values()) {
+        summaries.sort((left, right) => left.blockId - right.blockId)
+    }
+
+    return summariesByAnchorMessageId
 }
 
 const SEARCH_CONTEXT_TOOL_DESCRIPTION = `Search through active compressed block summaries to find relevant content. Use this BEFORE decompressing to find the right block. Returns a hit list with block IDs, relevance scores, and previews.

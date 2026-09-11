@@ -222,6 +222,100 @@ test("buildSearchContext with multiple active blocks includes all", () => {
     assert.equal(ctx.summaryByBlockId.size, 2)
 })
 
+test("buildSearchContext builds boundary and anchor indexes once", () => {
+    const msg1 = makeAssistantMessage("raw-a", "first")
+    const msg2 = makeAssistantMessage("raw-b", "second")
+    const block1 = makeBlock({ blockId: 1, anchorMessageId: "raw-a" })
+    const block2 = makeBlock({ blockId: 2, anchorMessageId: "raw-a" })
+    const inactive = makeBlock({ blockId: 3, anchorMessageId: "raw-b", active: false })
+    const state = makeState()
+    state.messageIds.byRef.set("m00001", "raw-a")
+    state.messageIds.byRef.set("m00002", "raw-b")
+    state.prune.messages.blocksById.set(1, block1)
+    state.prune.messages.blocksById.set(2, block2)
+    state.prune.messages.blocksById.set(3, inactive)
+
+    const ctx = buildSearchContext(state, [msg1, msg2])
+
+    assert.deepEqual([...ctx.boundaryLookup.keys()], ["m00001", "m00002", "b1", "b2"])
+    assert.equal(ctx.boundaryLookup.get("m00001")?.messageId, "raw-a")
+    assert.equal(ctx.boundaryLookup.get("b1")?.anchorMessageId, "raw-a")
+    assert.deepEqual(
+        ctx.summariesByAnchorMessageId.get("raw-a")?.map((summary) => summary.blockId),
+        [1, 2],
+    )
+    assert.ok(!ctx.summariesByAnchorMessageId.has("raw-b"))
+})
+
+test("request-scoped boundary index is reused across batch resolutions", () => {
+    const messages = [
+        makeAssistantMessage("raw-a", "first"),
+        makeAssistantMessage("raw-b", "second"),
+        makeAssistantMessage("raw-c", "third"),
+    ]
+    const state = makeState()
+    const entries = new Map([
+        ["m00001", "raw-a"],
+        ["m00002", "raw-b"],
+        ["m00003", "raw-c"],
+    ])
+    let iterations = 0
+    state.messageIds.byRef = {
+        [Symbol.iterator]() {
+            iterations++
+            return entries[Symbol.iterator]()
+        },
+        get: entries.get.bind(entries),
+        has: entries.has.bind(entries),
+    } as unknown as Map<string, string>
+
+    const ctx = buildSearchContext(state, messages)
+    assert.equal(iterations, 1)
+
+    resolveBoundaryIds(ctx, state, "m00001", "m00001")
+    resolveBoundaryIds(ctx, state, "m00002", "m00003")
+    resolveBoundaryIds(ctx, state, "m00003", "m00001")
+
+    assert.equal(iterations, 1)
+})
+
+test("resolveSelection preserves anchor ordering from the grouped index", () => {
+    const msg1 = makeAssistantMessage("raw-a", "first")
+    const msg2 = makeAssistantMessage("raw-b", "second")
+    const blocks = new Map([
+        [3, makeBlock({ blockId: 3, anchorMessageId: "raw-b" })],
+        [2, makeBlock({ blockId: 2, anchorMessageId: "raw-a" })],
+        [1, makeBlock({ blockId: 1, anchorMessageId: "raw-a" })],
+    ])
+    const state = makeState({
+        messageIds: {
+            byRawId: new Map([
+                ["raw-a", "m00001"],
+                ["raw-b", "m00002"],
+            ]),
+            byRef: new Map([
+                ["m00001", "raw-a"],
+                ["m00002", "raw-b"],
+            ]),
+            nextRef: 3,
+        },
+    })
+    for (const [blockId, block] of blocks) {
+        state.prune.messages.blocksById.set(blockId, block)
+    }
+    const ctx = buildSearchContext(state, [msg1, msg2])
+
+    const result = resolveSelection(
+        ctx,
+        { kind: "message", rawIndex: 0, messageId: "raw-a" },
+        { kind: "message", rawIndex: 1, messageId: "raw-b" },
+        { includeTokenAccounting: false },
+    )
+
+    assert.deepEqual(result.requiredBlockIds, [1, 2, 3])
+    assert.equal(result.messageTokenById.size, 0)
+})
+
 // --- Tests for resolveBoundaryIds ---
 
 test("resolveBoundaryIds resolves message IDs correctly", () => {

@@ -320,6 +320,33 @@ test("candidate output is deterministic, non-overlapping, and capped at twelve",
     assert.match(formatCompressionCandidates(first), /additional candidates omitted/)
 })
 
+test("batch candidate validation builds the boundary index once", () => {
+    const messages = [
+        textMessage("u1", "user", "a".repeat(40)),
+        textMessage("a1", "assistant", "b".repeat(40)),
+        textMessage("a2", "assistant", "c".repeat(140)),
+        textMessage("a3", "assistant", "d".repeat(40)),
+        textMessage("a4", "assistant", "e".repeat(40)),
+        textMessage("a5", "assistant", "f".repeat(40)),
+    ]
+    const state = setup(messages)
+    const entries = state.messageIds.byRef
+    let iterations = 0
+    state.messageIds.byRef = {
+        [Symbol.iterator]() {
+            iterations++
+            return entries[Symbol.iterator]()
+        },
+        get: entries.get.bind(entries),
+        has: entries.has.bind(entries),
+    } as unknown as Map<string, string>
+
+    const result = planCompressionCandidates(messages, state, config())
+
+    assert.equal(result.candidates.length, 2)
+    assert.equal(iterations, 1)
+})
+
 test("planner uses executor character admission at the exact minimum", () => {
     const messages = [textMessage("a1", "assistant", "x".repeat(100))]
     const state = setup(messages)
