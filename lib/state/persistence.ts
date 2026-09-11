@@ -106,26 +106,135 @@ function getSessionFilePath(sessionId: string, storageDir?: string): string {
     return join(getStorageDir(storageDir), `${sessionId}.json`)
 }
 
-async function writePersistedSessionState(
+interface PendingPersistedState {
+    sessionId: string
+    filePath: string
+    dir: string
+    content: string
+    totalTokensSaved: number
+    logger: Logger
+    sequence: number
+}
+
+interface PersistedSaveWaiter {
+    sequence: number
+    resolve: () => void
+    reject: (reason?: unknown) => void
+}
+
+interface PersistedSaveQueue {
+    nextSequence: number
+    pending: PendingPersistedState | undefined
+    waiters: PersistedSaveWaiter[]
+    draining: boolean
+}
+
+/**
+ * Serialize state saves per file so a slow write cannot be overwritten by an
+ * older snapshot completing after a newer one. A pending item is replaced by
+ * the newest snapshot; callers waiting on replaced items settle when that
+ * newer snapshot is durable.
+ */
+const pendingPersistedStates = new Map<string, PersistedSaveQueue>()
+
+async function writePersistedSessionState(pending: PendingPersistedState): Promise<void> {
+    if (!existsSync(pending.dir)) {
+        await fs.mkdir(pending.dir, { recursive: true })
+    }
+
+    await fs.writeFile(pending.filePath, pending.content, "utf-8")
+
+    pending.logger.info("Saved session state to disk", {
+        sessionId: pending.sessionId,
+        totalTokensSaved: pending.totalTokensSaved,
+    })
+}
+
+function settlePersistedSaveWaiters(
+    queue: PersistedSaveQueue,
+    throughSequence: number,
+    error: unknown,
+    succeeded: boolean,
+): void {
+    const remaining: PersistedSaveWaiter[] = []
+    for (const waiter of queue.waiters) {
+        if (waiter.sequence <= throughSequence) {
+            if (succeeded) {
+                waiter.resolve()
+            } else {
+                waiter.reject(error)
+            }
+        } else {
+            remaining.push(waiter)
+        }
+    }
+    queue.waiters = remaining
+}
+
+async function drainPersistedStateQueue(
+    filePath: string,
+    queue: PersistedSaveQueue,
+): Promise<void> {
+    while (queue.pending) {
+        const pending = queue.pending
+        queue.pending = undefined
+
+        try {
+            await writePersistedSessionState(pending)
+            settlePersistedSaveWaiters(queue, pending.sequence, undefined, true)
+        } catch (error) {
+            // Reject callers whose snapshots could not be written, but keep
+            // newer pending work available so a later save can still retry.
+            settlePersistedSaveWaiters(queue, pending.sequence, error, false)
+        }
+    }
+
+    queue.draining = false
+    if (!queue.pending && pendingPersistedStates.get(filePath) === queue) {
+        pendingPersistedStates.delete(filePath)
+    }
+}
+
+function enqueuePersistedSessionState(
     sessionId: string,
     state: PersistedSessionState,
     logger: Logger,
     storageDir?: string,
 ): Promise<void> {
-    // Capture file path synchronously before any await — prevents race condition
-    // when fire-and-forget saves execute after XDG_DATA_HOME has changed (tests).
+    // Capture the path and JSON before yielding so later environment/state
+    // mutations cannot redirect or alter this save's snapshot.
     const filePath = getSessionFilePath(sessionId, storageDir)
     const dir = getStorageDir(storageDir)
-    if (!existsSync(dir)) {
-        await fs.mkdir(dir, { recursive: true })
+    const content = JSON.stringify(state, null, 2)
+    let queue = pendingPersistedStates.get(filePath)
+    if (!queue) {
+        queue = {
+            nextSequence: 0,
+            pending: undefined,
+            waiters: [],
+            draining: false,
+        }
+        pendingPersistedStates.set(filePath, queue)
     }
 
-    const content = JSON.stringify(state, null, 2)
-    await fs.writeFile(filePath, content, "utf-8")
-
-    logger.info("Saved session state to disk", {
+    const sequence = ++queue.nextSequence
+    const pending: PendingPersistedState = {
         sessionId,
+        filePath,
+        dir,
+        content,
         totalTokensSaved: state.stats.totalPruneTokens,
+        logger,
+        sequence,
+    }
+
+    return new Promise<void>((resolve, reject) => {
+        queue.waiters.push({ sequence, resolve, reject })
+        queue.pending = pending
+        if (!queue.draining) {
+            queue.draining = true
+            void drainPersistedStateQueue(filePath, queue)
+        }
     })
 }
 
@@ -169,7 +278,12 @@ export async function saveSessionState(
         modelID: sessionState.modelID,
     }
 
-    await writePersistedSessionState(sessionState.sessionId, state, logger, sessionState.storageDir)
+    await enqueuePersistedSessionState(
+        sessionState.sessionId,
+        state,
+        logger,
+        sessionState.storageDir,
+    )
 }
 
 export async function loadSessionState(

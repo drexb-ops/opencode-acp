@@ -4,7 +4,7 @@ import test from "node:test"
 import * as fs from "fs/promises"
 import { existsSync } from "fs"
 import { join } from "path"
-import { homedir } from "os"
+import { homedir, tmpdir } from "os"
 import { Logger } from "../lib/logger"
 import { saveSessionState, loadSessionState } from "../lib/state/persistence"
 import { createSessionState } from "../lib/state"
@@ -163,4 +163,70 @@ test("loadSessionState tolerates legacy prune.tools field (Bug 38 backward-compa
         "prune.messages round-trips intact",
     )
     await cleanup()
+})
+
+test("concurrent saves persist the newest pending snapshot", async () => {
+    const storageDir = await fs.mkdtemp(join(tmpdir(), "acp-persistence-"))
+    const sessionId = "test-persistence-concurrent"
+
+    try {
+        const firstState = createSessionState()
+        firstState.sessionId = sessionId
+        firstState.storageDir = storageDir
+        firstState.stats.totalPruneTokens = 100
+
+        const secondState = createSessionState()
+        secondState.sessionId = sessionId
+        secondState.storageDir = storageDir
+        secondState.stats.totalPruneTokens = 200
+
+        const thirdState = createSessionState()
+        thirdState.sessionId = sessionId
+        thirdState.storageDir = storageDir
+        thirdState.stats.totalPruneTokens = 300
+
+        const firstSave = saveSessionState(firstState, logger)
+        const secondSave = saveSessionState(secondState, logger)
+        const thirdSave = saveSessionState(thirdState, logger)
+
+        await Promise.all([firstSave, secondSave, thirdSave])
+
+        const loaded = await loadSessionState(sessionId, logger, storageDir)
+        assert.ok(loaded)
+        assert.equal(loaded!.stats.totalPruneTokens, 300)
+    } finally {
+        await fs.rm(storageDir, { recursive: true, force: true })
+    }
+})
+
+test("a failed save does not prevent a later save from retrying", async () => {
+    const storageRoot = await fs.mkdtemp(join(tmpdir(), "acp-persistence-retry-"))
+    const blockedStorageDir = join(storageRoot, "not-a-directory")
+    const sessionId = "test-persistence-retry"
+
+    try {
+        await fs.writeFile(blockedStorageDir, "block directory creation", "utf-8")
+
+        const failedState = createSessionState()
+        failedState.sessionId = sessionId
+        failedState.storageDir = blockedStorageDir
+
+        await assert.rejects(saveSessionState(failedState, logger))
+
+        await fs.unlink(blockedStorageDir)
+        await fs.mkdir(blockedStorageDir)
+
+        const retryState = createSessionState()
+        retryState.sessionId = sessionId
+        retryState.storageDir = blockedStorageDir
+        retryState.stats.totalPruneTokens = 400
+
+        await saveSessionState(retryState, logger)
+
+        const loaded = await loadSessionState(sessionId, logger, blockedStorageDir)
+        assert.ok(loaded)
+        assert.equal(loaded!.stats.totalPruneTokens, 400)
+    } finally {
+        await fs.rm(storageRoot, { recursive: true, force: true })
+    }
 })
