@@ -10,7 +10,12 @@ Configuring per-algorithm quality-gate parameters triggers a false startup warni
     "enabled": true,
     "algorithm": "rouge-recall-v1",
     "algorithms": {
-      "rouge-recall-v1": { "minSummaryLength": 200, "rougeF1Threshold": 0.3 }
+      "rouge-recall-v1": {
+        "layer1MinChars": 200,
+        "layer1MinRetentionPct": 2.5,
+        "layer2MaxRougeF1": 0.05,
+        "layer2MaxTop20Recall": 0.20
+      }
     }
   }
 }
@@ -22,7 +27,7 @@ The config is legal and consumed at runtime (`lib/compress/quality-gate/evaluate
 
 ## Root cause
 
-`getConfigKeyPaths()` in `lib/config-validation.ts` recurses into `qualityGate.algorithms` because it isn't in the dynamic-key skip list (unlike `compress.providers`, `messageFilters.filters`, `compress.modelMaxLimits`). Every nested key it emits (`qualityGate.algorithms.rouge-recall-v1`, `...minSummaryLength`) fails the static allow-list lookup.
+`getConfigKeyPaths()` in `lib/config-validation.ts` recurses into `qualityGate.algorithms` because it isn't in the dynamic-key skip list (unlike `compress.providers`, `messageFilters.filters`, `compress.modelMaxLimits`). Every nested key it emits (`qualityGate.algorithms.rouge-recall-v1`, `...layer1MinChars`) fails the static allow-list lookup.
 
 ## Fix
 

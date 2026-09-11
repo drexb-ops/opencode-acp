@@ -61,7 +61,7 @@ test("getInvalidConfigKeys does not recurse into qualityGate.algorithms dynamic 
             enabled: true,
             algorithm: "rouge-recall-v1",
             algorithms: {
-                "rouge-recall-v1": { minSummaryLength: 200, rougeF1Threshold: 0.3 },
+                "rouge-recall-v1": { layer1MinChars: 200, layer2MaxRougeF1: 0.3 },
             },
         },
     })
@@ -71,7 +71,7 @@ test("getInvalidConfigKeys does not recurse into qualityGate.algorithms dynamic 
 test("getInvalidConfigKeys still flags unknown qualityGate keys while allowing algorithm params (#329)", () => {
     const result = getInvalidConfigKeys({
         qualityGate: {
-            algorithms: { "rouge-recall-v1": { anything: 1 } },
+            algorithms: { "rouge-recall-v1": { layer1MinChars: 200 } },
             notARealKey: true,
         },
     })
