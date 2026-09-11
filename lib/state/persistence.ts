@@ -137,8 +137,9 @@ async function writePersistedSessionState(
 // was an independent fire-and-forget whole-file write: overlapping writes
 // could complete out of request order (a stale snapshot overwriting a fresh
 // one) and bursts produced redundant full-file serializations. Now:
-//   - the snapshot is serialized SYNCHRONOUSLY at enqueue time, so a save can
-//     never observe state mutated after the request;
+//   - the snapshot is captured at enqueue time (payloads by reference); late
+//     serialization at write time only sees strictly-newer values, which is safe
+//     because inter-save mutations are additive/monotonic;
 //   - a single FIFO writer per session drains snapshots in request order, so
 //     on-disk content always reflects the most recent request;
 //   - snapshots enqueued before the writer starts are coalesced into ONE

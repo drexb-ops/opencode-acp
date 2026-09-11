@@ -76,7 +76,7 @@
     composition/protected/range computation when no T1/T2/T3 nudge can fire.
   - `lib/state/types.ts`, `lib/state/utils.ts`, `lib/messages/sync.ts`,
     `lib/compress/hide-consumed.ts`, `lib/compress/state.ts`,
-    `lib/gc/merge.ts`, `lib/compress/decompress-logic.ts`, `lib/state/rebuild.ts`
+    `lib/gc/merge.ts`, `lib/compress/decompress-logic.ts`
     — verified-state synchronization + transient derived indexes (RC3):
     transient `structureVersion` counter bumped at block-mutation sites; sync
     and hide-consumed skip full replay / reuse cached index when unchanged.

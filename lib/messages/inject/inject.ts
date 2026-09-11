@@ -382,6 +382,7 @@ export const injectCompressNudges = (
         !!suffixMessage &&
         (tierUsageEarly.tier1Tokens >= nudgeGrowthTokens ||
             tierUsageEarly.tier2Tokens >= nudgeGrowthTokens)
+    // emergencyOverride is subsumed by nudgeAllowed but kept explicit so the gate stays correct if nudgeAllowed's definition ever changes
     const needsNudgeAnalysis = nudgeAllowed || emergencyOverride || tierTriggerPossible
 
     const composition: ContextComposition | null = needsNudgeAnalysis
