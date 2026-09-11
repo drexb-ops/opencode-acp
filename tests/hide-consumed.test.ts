@@ -2,6 +2,7 @@ import { describe, it } from "node:test"
 import assert from "node:assert/strict"
 import type { WithParts, SessionState } from "../lib/state"
 import { hideConsumedCompressCalls } from "../lib/compress/hide-consumed"
+import { bumpPruneStructureVersion } from "../lib/state/utils"
 import type { CompressionBlock } from "../lib/state/types"
 
 function makeBlock(overrides: Partial<CompressionBlock> & { blockId: number }): CompressionBlock {
@@ -664,6 +665,114 @@ describe("hideConsumedCompressCalls", () => {
             batchMsg.parts.filter((p: any) => p.type === "tool" && p.tool === "compress").length,
             0,
             "no compress part remains",
+        )
+    })
+})
+
+describe("hideConsumedCompressCalls [Issue #384] derived-index cache", () => {
+    function consumedAndLive() {
+        const b1 = makeBlock({
+            blockId: 1,
+            active: false,
+            deactivatedByBlockId: 2,
+            compressMessageId: "msg-c1",
+            compressCallId: "call-c1",
+            tier: 1,
+        })
+        const b2 = makeBlock({
+            blockId: 2,
+            active: true,
+            compressMessageId: "msg-c2",
+            compressCallId: "call-c2",
+            tier: 2,
+        })
+        return [b1, b2] as CompressionBlock[]
+    }
+
+    function baseMessages(): WithParts[] {
+        return [
+            { info: { id: "msg-user-1", role: "user" } as any, parts: [{ type: "text", text: "Hi" }] },
+            {
+                info: { id: "msg-c1", role: "assistant" } as any,
+                parts: [
+                    { type: "text", text: "Compressing" },
+                    { type: "tool", tool: "compress", callID: "call-c1", state: { status: "completed" } },
+                ],
+            },
+            {
+                info: { id: "msg-c2", role: "assistant" } as any,
+                parts: [{ type: "tool", tool: "compress", callID: "call-c2", state: { status: "completed" } }],
+            },
+        ]
+    }
+
+    it("builds the block index once and reuses it while the structure version is unchanged", () => {
+        const state = makeState(consumedAndLive()) as SessionState
+        const hidden = hideConsumedCompressCalls(state, baseMessages())
+        assert.equal(hidden, 1)
+
+        const cached = state.prune.messages.hideConsumedIndex
+        assert.ok(cached, "cache must be recorded on the session state")
+
+        hideConsumedCompressCalls(state, baseMessages().map((m) => ({ ...m, parts: [...m.parts] })))
+        assert.equal(
+            state.prune.messages.hideConsumedIndex,
+            cached,
+            "index must be reused while the version is unchanged",
+        )
+    })
+
+    it("rebuilds the index after a structure version bump", () => {
+        const state = makeState(consumedAndLive()) as SessionState
+        hideConsumedCompressCalls(state, baseMessages())
+        const before = state.prune.messages.hideConsumedIndex!
+
+        bumpPruneStructureVersion(state.prune.messages)
+        state.prune.messages.blocksById.set(
+            3,
+            makeBlock({
+                blockId: 3,
+                active: true,
+                compressMessageId: "msg-c3",
+                compressCallId: "call-c3",
+                tier: 2,
+            }),
+        )
+
+        const messages = [
+            ...baseMessages().map((m) => ({ ...m, parts: [...m.parts] })),
+            {
+                info: { id: "msg-c3", role: "assistant" } as any,
+                parts: [{ type: "tool", tool: "compress", callID: "call-c3", state: { status: "completed" } }],
+            },
+        ]
+        const hidden = hideConsumedCompressCalls(state, messages)
+
+        const after = state.prune.messages.hideConsumedIndex!
+        assert.notEqual(after, before, "bumped version must force a rebuild")
+        assert.equal(after.version, 1)
+        assert.equal(hidden, 1, "only the consumed call is hidden; new live call stays visible")
+    })
+
+    it("reused index still filters correctly when the message list grows", () => {
+        const state = makeState(consumedAndLive()) as SessionState
+        hideConsumedCompressCalls(state, baseMessages())
+
+        const grown = [
+            ...baseMessages().map((m) => ({ ...m, parts: [...m.parts] })),
+            {
+                info: { id: "msg-orphan", role: "assistant" } as any,
+                parts: [{ type: "tool", tool: "compress", callID: "call-orphan", state: { status: "completed" } }],
+            },
+        ]
+        const hidden = hideConsumedCompressCalls(state, grown)
+
+        assert.equal(hidden, 1)
+        const orphan = grown.find((m) => m.info.id === "msg-orphan")!
+        assert.equal(
+            orphan.parts.filter((p: any) => p.type === "tool" && p.tool === "compress").length,
+            1,
+            "orphan call within KEEP_LAST_ORPHANED stays visible",
         )
     })
 })

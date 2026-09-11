@@ -2730,7 +2730,6 @@ test("issue #364 cycle: baseline held through capture → T2 fires on first grow
     const state = createSessionState()
     state.sessionId = "test-364-cycle"
     state.modelContextLimit = 1_000_000
-
     const config = buildConfig()
     config.compress.maxContextLimit = 500_000
     config.compress.minContextLimit = 200_000
@@ -2802,5 +2801,111 @@ test("issue #364 cycle: baseline held through capture → T2 fires on first grow
         state.nudges.lastPerMessageNudgeTokens,
         136_000,
         "T1 baseline corrected downward to currentTokens (pre-existing correction path, inject.ts:294-302)"
+    )
+})
+
+test("issue #384: gated analysis — production-config growth cycle keeps baseline across gated-off turns", () => {
+    // The #384 gate skips range/composition analysis when no nudge can fire
+    // (growth below floor AND not emergency). Behavior on gated-off turns must
+    // be byte-identical to before: shouldInject=false and baseline untouched.
+    const config = buildConfig()
+    config.compress.preserveRecentMessages = 2 // production-like protection
+    config.compress.maxContextLimit = 500_000
+    config.compress.minContextLimit = 200_000
+    const state = createSessionState()
+    state.modelContextLimit = 1_000_000
+
+    let seq = 0
+    const pair = (inputTokens: number, bigToolOutput = false): WithParts[] => {
+        seq += 1
+        const uId = `u${seq}`
+        const aId = `a${seq}`
+        state.messageIds.byRawId.set(uId, formatMessageIdTag(seq * 2 - 1))
+        state.messageIds.byRawId.set(aId, formatMessageIdTag(seq * 2))
+        const toolParts = bigToolOutput ? [toolPart(`c${seq}`, "x".repeat(60_000))] : []
+        return [
+            userMsg(uId, `question ${seq}`),
+            assistantMsgWithTokens(aId, `answer ${seq}`, { input: inputTokens, output: 1_000 }, toolParts),
+        ]
+    }
+
+    // Turn 1: baseline established at exactly 100K (input 99K + output 1K).
+    let messages: WithParts[] = pair(99_000, true)
+    injectCompressNudges(state, config, logger, messages, {} as any)
+    assert.equal(state.nudges.shouldInjectThisTurn, false, "turn 1: no growth yet → silent")
+    assert.equal(state.nudges.lastPerMessageNudgeTokens, 100_000, "turn 1: baseline initialized to current tokens")
+
+    // Turn 2 (gated OFF): +6K growth < 22.5K floor → heavy analysis skipped.
+    messages = [...messages, ...pair(105_000)]
+    injectCompressNudges(state, config, logger, messages, {} as any)
+    assert.equal(state.nudges.shouldInjectThisTurn, false, "turn 2: 6K growth < floor → silent")
+    assert.equal(
+        state.nudges.lastPerMessageNudgeTokens,
+        100_000,
+        "turn 2: baseline preserved across a gated-off turn",
+    )
+
+    // Turn 3 (gated ON): 216K ≥ 150K context floor, growth 116K ≥ 50K threshold.
+    // Head messages (older than preserve-recent-2) include a1's 15K-token tool
+    // output → compressible range exists → nudge fires; the shown-reference
+    // advances while the baseline stays put (no compression happened yet).
+    messages = [...messages, ...pair(215_000)]
+    injectCompressNudges(state, config, logger, messages, {} as any)
+    assert.equal(state.nudges.shouldInjectThisTurn, true, "turn 3: 116K growth past floor → fires")
+    assert.equal(state.nudges.lastNudgeShownTokens, 216_000, "turn 3: shown-reference advanced to current")
+    assert.equal(
+        state.nudges.lastPerMessageNudgeTokens,
+        100_000,
+        "turn 3: baseline untouched by a plain nudge (only compression re-baselines)",
+    )
+
+    // Turn 4 (gated OFF again): +5K growth from the shown reference < floor.
+    messages = [...messages, ...pair(220_000)]
+    injectCompressNudges(state, config, logger, messages, {} as any)
+    assert.equal(state.nudges.shouldInjectThisTurn, false, "turn 4: 5K growth < floor → silent")
+    assert.equal(
+        state.nudges.lastNudgeShownTokens,
+        216_000,
+        "turn 4: shown-reference preserved across a gated-off turn",
+    )
+    assert.equal(state.nudges.lastPerMessageNudgeTokens, 100_000, "turn 4: baseline still untouched")
+
+    // Turn 5 (gated ON): 316K, growth 100K ≥ threshold → fires again.
+    messages = [...messages, ...pair(315_000)]
+    injectCompressNudges(state, config, logger, messages, {} as any)
+    assert.equal(state.nudges.shouldInjectThisTurn, true, "turn 5: 100K growth past floor → fires again")
+    assert.equal(state.nudges.lastNudgeShownTokens, 316_000, "turn 5: shown-reference advanced to current")
+    assert.equal(state.nudges.lastPerMessageNudgeTokens, 100_000, "turn 5: baseline still untouched")
+})
+
+test("issue #384: emergency override still computes ranges when the growth gate is off", () => {
+    // Context at 98%+ with ZERO growth: the growth gate blocks a normal nudge,
+    // so the only way this turn can inject is via the emergency branch of the
+    // #384 gate condition (nudgeAllowed || emergencyOverride). If that branch
+    // regressed, the ranges would never be computed and this assertion fails.
+    const state = createSessionState()
+    state.modelContextLimit = 1_000_000
+    state.nudges.lastPerMessageNudgeTokens = 980_000
+    state.nudges.lastNudgeShownTokens = 980_000
+    state.messageIds.byRawId.set("u1", "m00001")
+    state.messageIds.byRawId.set("a1", "m00002")
+    const config = buildConfig()
+    config.compress.maxContextLimit = 500_000
+    config.compress.minContextLimit = 200_000
+
+    const messages: WithParts[] = [
+        userMsg("u1", "hello"),
+        assistantMsgWithTokens("a1", "done", { input: 970_000, output: 10_000 }, [
+            toolPart("c1", "x".repeat(40_000)),
+        ]),
+    ]
+    injectCompressNudges(state, config, logger, messages, {} as any)
+
+    assert.equal(state.nudges.shouldInjectThisTurn, true, "98% context with zero growth → emergency override fires")
+    const injected = suffixText(messages)
+    assert.ok(injected.includes("Breakdown:"), "breakdown shown at emergency")
+    assert.ok(
+        injected.includes("Context limit reached — compress now"),
+        "strong maxLimit alert at emergency",
     )
 })

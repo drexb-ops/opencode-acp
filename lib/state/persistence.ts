@@ -130,13 +130,48 @@ async function writePersistedSessionState(
 }
 
 // [FIX Bug 6] Removed try/catch — errors now propagate to callers so they know save failed
-export async function saveSessionState(
+//
+// [Issue #384] Ordered, coalescing per-session save queue.
+// Long sessions trigger several saves per transform (sync deactivation, batch
+// cleanup, nudge anchors, compaction reset, tool finalize). Previously each
+// was an independent fire-and-forget whole-file write: overlapping writes
+// could complete out of request order (a stale snapshot overwriting a fresh
+// one) and bursts produced redundant full-file serializations. Now:
+//   - the snapshot is serialized SYNCHRONOUSLY at enqueue time, so a save can
+//     never observe state mutated after the request;
+//   - a single FIFO writer per session drains snapshots in request order, so
+//     on-disk content always reflects the most recent request;
+//   - snapshots enqueued before the writer starts are coalesced into ONE
+//     write of the latest snapshot — it was serialized after every other in
+//     the batch from the same live state, so it is strictly newer;
+//   - every caller resolves once its snapshot (or a newer one superseding it)
+//     is durable; a failed write rejects that batch's callers (Bug 6 kept).
+interface PendingSave {
+    sessionId: string
+    state: PersistedSessionState
+    storageDir?: string
+    logger: Logger
+}
+
+interface SaveQueue {
+    pending: PendingSave[]
+    waiters: Array<{ resolve: () => void; reject: (err: unknown) => void }>
+    draining: boolean
+}
+
+const saveQueues = new Map<string, SaveQueue>()
+
+function saveQueueKey(sessionId: string, storageDir?: string): string {
+    return `${sessionId}\u0000${storageDir ?? ""}`
+}
+
+export function saveSessionState(
     sessionState: SessionState,
     logger: Logger,
     sessionName?: string,
 ): Promise<void> {
     if (!sessionState.sessionId) {
-        return
+        return Promise.resolve()
     }
 
     const state: PersistedSessionState = {
@@ -169,7 +204,65 @@ export async function saveSessionState(
         modelID: sessionState.modelID,
     }
 
-    await writePersistedSessionState(sessionState.sessionId, state, logger, sessionState.storageDir)
+    const key = saveQueueKey(sessionState.sessionId, sessionState.storageDir)
+    let queue = saveQueues.get(key)
+    if (!queue) {
+        queue = { pending: [], waiters: [], draining: false }
+        saveQueues.set(key, queue)
+    }
+
+    const promise = new Promise<void>((resolve, reject) => {
+        queue!.waiters.push({ resolve, reject })
+    })
+    queue.pending.push({
+        sessionId: sessionState.sessionId,
+        state,
+        storageDir: sessionState.storageDir,
+        logger,
+    })
+
+    // Macrotask boundary: synchronous bursts pile onto one batch before I/O.
+    if (!queue.draining) {
+        queue.draining = true
+        setImmediate(() => drainSaveQueue(key))
+    }
+
+    return promise
+}
+
+function drainSaveQueue(key: string): void {
+    const queue = saveQueues.get(key)
+    if (!queue || queue.pending.length === 0) {
+        if (queue) {
+            queue.draining = false
+            if (queue.waiters.length === 0) saveQueues.delete(key)
+        }
+        return
+    }
+
+    // Take the current batch; entries arriving during the write below become
+    // the next batch, preserving request order across drains.
+    const batch = queue.pending.splice(0, queue.pending.length)
+    const waiters = queue.waiters.splice(0, batch.length)
+    const latest = batch[batch.length - 1]
+
+    writePersistedSessionState(latest.sessionId, latest.state, latest.logger, latest.storageDir)
+        .then(() => {
+            for (const waiter of waiters) waiter.resolve()
+        })
+        .catch((err: unknown) => {
+            for (const waiter of waiters) waiter.reject(err)
+        })
+        .finally(() => {
+            const q = saveQueues.get(key)
+            if (!q) return
+            if (q.pending.length > 0) {
+                drainSaveQueue(key)
+            } else {
+                q.draining = false
+                if (q.waiters.length === 0) saveQueues.delete(key)
+            }
+        })
 }
 
 export async function loadSessionState(
