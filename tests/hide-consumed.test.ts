@@ -313,6 +313,38 @@ describe("hideConsumedCompressCalls", () => {
         assert.equal(messages.length, 0, "new historical call should not be treated as an orphan")
     })
 
+    it("refreshes the historical call index when a block is replaced", () => {
+        const state = makeState([
+            makeBlock({ blockId: 1, active: true, compressCallId: "call-existing" }),
+        ]) as SessionState
+        state.prune.messages.blockStructureVersion = 0
+        hideConsumedCompressCalls(state, [])
+
+        state.prune.messages.blocksById.set(
+            1,
+            makeBlock({ blockId: 1, active: false, compressCallId: "call-replaced" }),
+        )
+        state.prune.messages.blockStructureVersion =
+            (state.prune.messages.blockStructureVersion ?? 0) + 1
+        const messages: WithParts[] = [
+            {
+                info: { id: "msg-replaced", role: "assistant" } as any,
+                parts: [
+                    {
+                        type: "tool",
+                        tool: "compress",
+                        callID: "call-replaced",
+                        state: { status: "completed" },
+                    },
+                ],
+            },
+        ]
+
+        hideConsumedCompressCalls(state, messages)
+
+        assert.equal(messages.length, 0, "replaced historical call should not be treated as an orphan")
+    })
+
     it("preserves non-compress parts when hiding consumed compress call", () => {
         const b1 = makeBlock({
             blockId: 1,

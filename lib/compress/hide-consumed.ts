@@ -5,19 +5,20 @@ import { hasMeaningfulContent } from "./parts"
 const KEEP_LAST_ORPHANED = 2
 
 interface HistoricalCallIdIndex {
-    blockCount: number
+    blockStructureVersion: number
     callIds: ReadonlySet<string>
 }
 
 // Block call IDs are immutable historical data. Keep this derived index out of
-// persisted session state; a new block count naturally gets a fresh index.
+// persisted session state; block-graph mutations advance a transient version.
 const historicalCallIdsByState = new WeakMap<object, HistoricalCallIdIndex>()
 
 function getHistoricalCallIds(state: SessionState): ReadonlySet<string> {
     const messagesState = state.prune.messages
-    const blockCount = messagesState.blocksById.size
+    const blockStructureVersion =
+        messagesState.blockStructureVersion ?? messagesState.blocksById.size
     const cached = historicalCallIdsByState.get(messagesState)
-    if (cached?.blockCount === blockCount) {
+    if (cached?.blockStructureVersion === blockStructureVersion) {
         return cached.callIds
     }
 
@@ -27,7 +28,7 @@ function getHistoricalCallIds(state: SessionState): ReadonlySet<string> {
             callIds.add(block.compressCallId)
         }
     }
-    historicalCallIdsByState.set(messagesState, { blockCount, callIds })
+    historicalCallIdsByState.set(messagesState, { blockStructureVersion, callIds })
     return callIds
 }
 
@@ -109,6 +110,7 @@ export function hideConsumedCompressCalls(state: SessionState, messages: WithPar
     }
 
     const lastOrphanedCallIds: string[] = []
+    const orphanedCallIds = new Set<string>()
     for (
         let i = messages.length - 1;
         i >= 0 && lastOrphanedCallIds.length < KEEP_LAST_ORPHANED;
@@ -125,8 +127,10 @@ export function hideConsumedCompressCalls(state: SessionState, messages: WithPar
                 p.type === "tool" &&
                 p.tool === "compress" &&
                 p.callID &&
-                !allBlockCallIds.has(p.callID)
+                !allBlockCallIds.has(p.callID) &&
+                !orphanedCallIds.has(p.callID)
             ) {
+                orphanedCallIds.add(p.callID)
                 lastOrphanedCallIds.push(p.callID)
             }
         }

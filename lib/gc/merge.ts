@@ -158,6 +158,7 @@ export function mergeMarkedBlocks(
     }
 
     messagesState.blocksById.set(newBlockId, mergedBlock)
+    messagesState.blockStructureVersion++
     messagesState.activeBlockIds.add(newBlockId)
     messagesState.activeByAnchorMessageId.set(mergedBlock.anchorMessageId, newBlockId)
 
@@ -176,6 +177,10 @@ export function mergeMarkedBlocks(
     for (const id of sourceIds) {
         messagesState.markedForCleanup.delete(id)
     }
+
+    // The merge updates block and membership indexes directly. Force the next
+    // sync to verify the graph before the stable fast path resumes.
+    messagesState.membershipsVerified = false
 
     const sourceTokens = sourceBlocks.reduce(
         (sum, block) => sum + (block.summaryTokens || Math.round(block.summary.length / 4)),

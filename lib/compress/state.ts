@@ -191,6 +191,7 @@ export function applyCompressionState(
     }
 
     messagesState.blocksById.set(blockId, block)
+    messagesState.blockStructureVersion++
     messagesState.activeBlockIds.add(blockId)
     messagesState.activeByAnchorMessageId.set(anchorMessageId, blockId)
 

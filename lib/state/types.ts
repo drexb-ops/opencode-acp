@@ -84,6 +84,8 @@ export interface PruneMessagesState {
     markedForCleanup: Set<number>
     /** Transient: persisted memberships need one repair sync before fast-path reuse. */
     membershipsVerified: boolean
+    /** Transient: increments whenever the historical block index changes. */
+    blockStructureVersion: number
 }
 
 export interface Prune {
