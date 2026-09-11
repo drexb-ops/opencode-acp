@@ -677,6 +677,98 @@ test("E2E: nudge breakdown line shows reasoning category with token count (#371)
     assert.match(injected, /2\.0K reasoning \(\d+%\)/, "breakdown must show reasoning category with its token count")
 })
 
+test("lazy T1 analysis skips stable turns and preserves the growth cycle", () => {
+    const state = createSessionState()
+    state.modelContextLimit = 1_000_000
+
+    const config = buildConfig()
+    config.compress.maxContextLimit = 800_000
+    config.compress.minContextLimit = 200_000
+    config.compress.preserveRecentMessages = 2
+
+    const candidateAccesses = { count: 0 }
+    const candidateMessages = new Proxy([] as WithParts[], {
+        get(target, property, receiver) {
+            candidateAccesses.count++
+            return Reflect.get(target, property, receiver)
+        },
+    })
+
+    const register = (id: string, ref: number) =>
+        state.messageIds.byRawId.set(id, `m${String(ref).padStart(5, "0")}`)
+    register("u1", 1)
+    register("a1", 2)
+    register("u2", 3)
+    register("a2", 4)
+
+    // Baseline turn: no T1 nudge is eligible, so candidate planning must not
+    // even inspect the request-scoped candidate message array.
+    const baseline = [
+        userMsg("u1", "start"),
+        assistantMsgWithTokens("a1", "work", { input: 80_000, output: 20_000 }),
+    ]
+    injectCompressNudges(state, config, logger, baseline, {} as any, undefined, undefined, undefined, candidateMessages)
+    assert.equal(state.nudges.shouldInjectThisTurn, false, "baseline turn must not inject")
+    assert.equal(state.nudges.lastPerMessageNudgeTokens, 100_000, "baseline established")
+    assert.equal(state.nudges.lastNudgeShownTokens, undefined, "baseline turn must not mark a shown nudge")
+    assert.equal(candidateAccesses.count, 0, "stable baseline must skip candidate planning")
+
+    // Small growth remains below the T1 threshold. preserveRecentMessages is
+    // non-zero to exercise the production protection configuration.
+    const stable = [
+        userMsg("u1", "start"),
+        assistantMsgWithTokens("a1", "work", { input: 80_000, output: 20_000 }),
+        userMsg("u2", "small update"),
+        assistantMsgWithTokens("a2", "work", { input: 90_000, output: 15_000 }),
+    ]
+    injectCompressNudges(state, config, logger, stable, {} as any, undefined, undefined, undefined, candidateMessages)
+    assert.equal(state.nudges.shouldInjectThisTurn, false, "sub-threshold growth must remain silent")
+    assert.equal(state.nudges.lastPerMessageNudgeTokens, 100_000, "sub-threshold growth preserves baseline")
+    assert.equal(state.nudges.lastNudgeShownTokens, undefined, "sub-threshold growth shows no nudge")
+    assert.equal(candidateAccesses.count, 0, "stable turn must skip candidate planning")
+
+    // Growth beyond the threshold has compressible history before the recent
+    // two-message protection window, so the normal T1 output remains eligible.
+    const growth = [
+        userMsg("u1", "start"),
+        assistantMsgWithTokens("a1", "work", { input: 80_000, output: 20_000 }, [
+            toolPart("t1", "x".repeat(40_000)),
+        ]),
+        userMsg("u2", "next"),
+        assistantMsgWithTokens("a2", "work", { input: 140_000, output: 20_000 }),
+    ]
+    injectCompressNudges(state, config, logger, growth, {} as any)
+    assert.equal(state.nudges.shouldInjectThisTurn, true, "growth past threshold must inject T1")
+    assert.equal(state.nudges.lastPerMessageNudgeTokens, 100_000, "T1 leaves the growth baseline unchanged")
+    assert.equal(state.nudges.lastNudgeShownTokens, 160_000, "T1 records the shown-token cadence baseline")
+
+    // A completed compression establishes a new baseline and clears the
+    // pending T1 cadence marker.
+    const compressed = [
+        userMsg("u2", "compress"),
+        assistantMsgWithTokens("a2", "compressed", { input: 100_000, output: 20_000 }, [
+            compressToolPart("compress-cycle", "compressed"),
+        ]),
+    ]
+    injectCompressNudges(state, config, logger, compressed, {} as any)
+    assert.equal(state.nudges.shouldInjectThisTurn, false, "compression turn must not inject")
+    assert.equal(state.nudges.lastPerMessageNudgeTokens, 120_000, "compression establishes a new baseline")
+    assert.equal(state.nudges.lastNudgeShownTokens, undefined, "compression clears the pending nudge marker")
+
+    const growthAgain = [
+        userMsg("u1", "start"),
+        assistantMsgWithTokens("a1", "work", { input: 80_000, output: 20_000 }, [
+            toolPart("t2", "x".repeat(40_000)),
+        ]),
+        userMsg("u2", "again"),
+        assistantMsgWithTokens("a2", "work", { input: 160_000, output: 20_000 }),
+    ]
+    injectCompressNudges(state, config, logger, growthAgain, {} as any)
+    assert.equal(state.nudges.shouldInjectThisTurn, true, "growth after compression must inject T1 again")
+    assert.equal(state.nudges.lastPerMessageNudgeTokens, 120_000, "second T1 leaves the new baseline unchanged")
+    assert.equal(state.nudges.lastNudgeShownTokens, 180_000, "second T1 records its shown-token cadence baseline")
+})
+
 test("growth floor: nudge suppressed when growth below floor (issue #27 anti-thrashing)", () => {
     // 1M model: growthFloor = max(5000, 0.45×50000) = 22500
     // Growth of 5K < 22500 → no nudge output at all
