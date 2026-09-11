@@ -73,6 +73,10 @@ export function applyCompressionState(
     gcConfig?: GCConfig,
 ): AppliedCompressionResult {
     const messagesState = state.prune.messages
+    // Compression adds a block and changes consumed-block lineage. The
+    // mutator maintains indexes for immediate callers, but the next transform
+    // should verify the complete graph before taking the fast path.
+    messagesState.membershipsVerified = false
     const consumed = [...new Set(consumedBlockIds.filter((id) => Number.isInteger(id) && id > 0))]
 
     const createdAt = Date.now()

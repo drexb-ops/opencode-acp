@@ -3,6 +3,7 @@ import assert from "node:assert/strict"
 import test from "node:test"
 import { Logger } from "../lib/logger"
 import { syncCompressionBlocks } from "../lib/messages/sync"
+import { deactivateCompressionTarget } from "../lib/compress/decompress-logic"
 import { createSessionState, type WithParts, type CompressionBlock } from "../lib/state"
 import { loadPruneMessagesState, serializePruneMessagesState } from "../lib/state/utils"
 
@@ -162,6 +163,80 @@ test("syncCompressionBlocks preserves message memberships when active blocks are
         activeBlockIds,
         "unchanged active membership must not be rebuilt on every transform",
     )
+})
+
+test("syncCompressionBlocks does not replay historical blocks after verification", () => {
+    const state = createSessionState()
+    state.prune.messages.blocksById.set(1, makeBlock({ blockId: 1, anchorMessageId: "m1" }))
+    const messages = [userMsg("m1")]
+
+    syncCompressionBlocks(state, logger, messages)
+    assert.equal(state.prune.messages.membershipsVerified, true)
+
+    const blocksById = state.prune.messages.blocksById
+    const values = blocksById.values
+    blocksById.values = (() => {
+        throw new Error("verified sync must not replay historical blocks")
+    }) as typeof values
+    try {
+        assert.equal(syncCompressionBlocks(state, logger, messages), false)
+    } finally {
+        blocksById.values = values
+    }
+})
+
+test("syncCompressionBlocks rebuilds after decompression and restores consumed memberships", () => {
+    const state = createSessionState()
+    const consumed = makeBlock({
+        blockId: 1,
+        anchorMessageId: "m1",
+        compressCallId: "call-t1",
+        active: false,
+        deactivatedByBlockId: 2,
+        effectiveMessageIds: ["m1"],
+    })
+    const parent = makeBlock({
+        blockId: 2,
+        anchorMessageId: "m2",
+        compressCallId: "call-t2",
+        consumedBlockIds: [1],
+        active: true,
+        effectiveMessageIds: ["m1", "m2"],
+        createdAt: 2,
+    })
+    state.prune.messages.blocksById.set(1, consumed)
+    state.prune.messages.blocksById.set(2, parent)
+    state.prune.messages.activeBlockIds.add(2)
+    state.prune.messages.byMessageId.set("m1", {
+        tokenCount: 10,
+        allBlockIds: [1, 2],
+        activeBlockIds: [2],
+    })
+    state.prune.messages.byMessageId.set("m2", {
+        tokenCount: 10,
+        allBlockIds: [2],
+        activeBlockIds: [2],
+    })
+    state.prune.messages.membershipsVerified = true
+
+    deactivateCompressionTarget(state.prune.messages, {
+        displayId: 2,
+        runId: 1,
+        topic: "test",
+        compressedTokens: 100,
+        durationMs: 0,
+        grouped: false,
+        blocks: [parent],
+    })
+    assert.equal(state.prune.messages.membershipsVerified, false)
+
+    syncCompressionBlocks(state, logger, [userMsg("m1"), userMsg("m2")])
+
+    assert.equal(consumed.active, true)
+    assert.equal(parent.active, false)
+    assert.deepEqual(state.prune.messages.byMessageId.get("m1")?.activeBlockIds, [1])
+    assert.deepEqual(state.prune.messages.byMessageId.get("m2")?.activeBlockIds, [])
+    assert.equal(state.prune.messages.membershipsVerified, true)
 })
 
 test("syncCompressionBlocks repairs persisted memberships before using the fast path", () => {

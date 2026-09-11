@@ -19,15 +19,18 @@ export function parseBlockIdArg(arg: string): number | null {
 
 export type DecompressMode = "block" | "range"
 
-export function resolveDecompressMode(args: Record<string, unknown>):
-    | { ok: true; mode: DecompressMode }
-    | { ok: false; error: string } {
+export function resolveDecompressMode(
+    args: Record<string, unknown>,
+): { ok: true; mode: DecompressMode } | { ok: false; error: string } {
     const hasBlockId = typeof args.blockId === "string" && args.blockId.trim() !== ""
     const hasStartId = typeof args.startId === "string" && args.startId.trim() !== ""
     const hasEndId = typeof args.endId === "string" && args.endId.trim() !== ""
 
     if (hasBlockId && (hasStartId || hasEndId)) {
-        return { ok: false, error: "Cannot specify both blockId and startId/endId. Choose one mode." }
+        return {
+            ok: false,
+            error: "Cannot specify both blockId and startId/endId. Choose one mode.",
+        }
     }
     if (!hasBlockId && !(hasStartId && hasEndId)) {
         return { ok: false, error: "Must specify either blockId, or both startId and endId." }
@@ -122,6 +125,9 @@ export function deactivateCompressionTarget(
     target: CompressionTarget,
     options?: { full?: boolean },
 ): void {
+    // Decompression changes block activity without rebuilding message
+    // memberships. Force the next message transform through the full sync.
+    messagesState.membershipsVerified = false
     const deactivatedAt = Date.now()
 
     for (const block of target.blocks) {
@@ -234,13 +240,12 @@ function extractTextContent(msg: WithParts): string {
             if ("text" in part && typeof part.text === "string") {
                 textParts.push(part.text)
             } else if ("type" in part && part.type === "tool") {
-                const toolName = "tool" in part && typeof part.tool === "string" ? part.tool : "tool"
+                const toolName =
+                    "tool" in part && typeof part.tool === "string" ? part.tool : "tool"
                 const state = part.state as Record<string, unknown> | undefined
                 if (state && typeof state.output === "string") {
                     const output =
-                        state.output.length > 80
-                            ? state.output.slice(0, 80) + "..."
-                            : state.output
+                        state.output.length > 80 ? state.output.slice(0, 80) + "..." : state.output
                     textParts.push(`[${toolName}] ${output}`)
                 }
             }

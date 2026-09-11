@@ -4,6 +4,33 @@ import { hasMeaningfulContent } from "./parts"
 
 const KEEP_LAST_ORPHANED = 2
 
+interface HistoricalCallIdIndex {
+    blockCount: number
+    callIds: ReadonlySet<string>
+}
+
+// Block call IDs are immutable historical data. Keep this derived index out of
+// persisted session state; a new block count naturally gets a fresh index.
+const historicalCallIdsByState = new WeakMap<object, HistoricalCallIdIndex>()
+
+function getHistoricalCallIds(state: SessionState): ReadonlySet<string> {
+    const messagesState = state.prune.messages
+    const blockCount = messagesState.blocksById.size
+    const cached = historicalCallIdsByState.get(messagesState)
+    if (cached?.blockCount === blockCount) {
+        return cached.callIds
+    }
+
+    const callIds = new Set<string>()
+    for (const block of messagesState.blocksById.values()) {
+        if (block.compressCallId) {
+            callIds.add(block.compressCallId)
+        }
+    }
+    historicalCallIdsByState.set(messagesState, { blockCount, callIds })
+    return callIds
+}
+
 function isLiveBlock(block: CompressionBlock): boolean {
     return block.active && !block.deactivatedByUser && !block.deactivatedByUserDeep
 }
@@ -60,12 +87,11 @@ function rewriteCompressInput(part: Part, liveKeys: Set<string>): Part | null {
  * in the default protected-tools list. See upstream issue #288.
  */
 export function hideConsumedCompressCalls(state: SessionState, messages: WithParts[]): number {
-    const allBlockCallIds = new Set<string>()
+    const allBlockCallIds = getHistoricalCallIds(state)
     const liveRangeKeysByCallId = new Map<string, Set<string>>()
     const activeCallIds = new Set<string>()
     for (const block of state.prune.messages.blocksById.values()) {
         if (!block.compressCallId) continue
-        allBlockCallIds.add(block.compressCallId)
         if (!isLiveBlock(block)) continue
         activeCallIds.add(block.compressCallId)
         let keys = liveRangeKeysByCallId.get(block.compressCallId)
@@ -77,11 +103,24 @@ export function hideConsumedCompressCalls(state: SessionState, messages: WithPar
     }
 
     const lastOrphanedCallIds: string[] = []
-    for (let i = messages.length - 1; i >= 0 && lastOrphanedCallIds.length < KEEP_LAST_ORPHANED; i--) {
+    for (
+        let i = messages.length - 1;
+        i >= 0 && lastOrphanedCallIds.length < KEEP_LAST_ORPHANED;
+        i--
+    ) {
         const parts = Array.isArray(messages[i]?.parts) ? messages[i]!.parts : []
-        for (let j = parts.length - 1; j >= 0 && lastOrphanedCallIds.length < KEEP_LAST_ORPHANED; j--) {
+        for (
+            let j = parts.length - 1;
+            j >= 0 && lastOrphanedCallIds.length < KEEP_LAST_ORPHANED;
+            j--
+        ) {
             const p = parts[j]!
-            if (p.type === "tool" && p.tool === "compress" && p.callID && !allBlockCallIds.has(p.callID)) {
+            if (
+                p.type === "tool" &&
+                p.tool === "compress" &&
+                p.callID &&
+                !allBlockCallIds.has(p.callID)
+            ) {
                 lastOrphanedCallIds.push(p.callID)
             }
         }

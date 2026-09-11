@@ -64,19 +64,37 @@ describe("hideConsumedCompressCalls", () => {
 
         const state = makeState([b1, b4])
         const messages: WithParts[] = [
-            { info: { id: "msg-user-1", role: "user" } as any, parts: [{ type: "text", text: "Hi" }] },
+            {
+                info: { id: "msg-user-1", role: "user" } as any,
+                parts: [{ type: "text", text: "Hi" }],
+            },
             {
                 info: { id: "msg-t1-compress", role: "assistant" } as any,
                 parts: [
                     { type: "text", text: "Compressing" },
-                    { type: "tool", tool: "compress", callID: "call-t1", state: { status: "completed" } },
+                    {
+                        type: "tool",
+                        tool: "compress",
+                        callID: "call-t1",
+                        state: { status: "completed" },
+                    },
                 ],
             },
             {
                 info: { id: "msg-t2-compress", role: "assistant" } as any,
-                parts: [{ type: "tool", tool: "compress", callID: "call-t4", state: { status: "completed" } }],
+                parts: [
+                    {
+                        type: "tool",
+                        tool: "compress",
+                        callID: "call-t4",
+                        state: { status: "completed" },
+                    },
+                ],
             },
-            { info: { id: "msg-user-2", role: "user" } as any, parts: [{ type: "text", text: "Next" }] },
+            {
+                info: { id: "msg-user-2", role: "user" } as any,
+                parts: [{ type: "text", text: "Next" }],
+            },
         ]
 
         const hidden = hideConsumedCompressCalls(state as SessionState, messages)
@@ -108,14 +126,31 @@ describe("hideConsumedCompressCalls", () => {
 
         const state = makeState([b1, b4])
         const messages: WithParts[] = [
-            { info: { id: "msg-user-1", role: "user" } as any, parts: [{ type: "text", text: "Hi" }] },
+            {
+                info: { id: "msg-user-1", role: "user" } as any,
+                parts: [{ type: "text", text: "Hi" }],
+            },
             {
                 info: { id: "msg-t1-compress", role: "assistant" } as any,
-                parts: [{ type: "tool", tool: "compress", callID: "call-t1", state: { status: "completed" } }],
+                parts: [
+                    {
+                        type: "tool",
+                        tool: "compress",
+                        callID: "call-t1",
+                        state: { status: "completed" },
+                    },
+                ],
             },
             {
                 info: { id: "msg-t2-compress", role: "assistant" } as any,
-                parts: [{ type: "tool", tool: "compress", callID: "call-t4", state: { status: "completed" } }],
+                parts: [
+                    {
+                        type: "tool",
+                        tool: "compress",
+                        callID: "call-t4",
+                        state: { status: "completed" },
+                    },
+                ],
             },
         ]
 
@@ -144,18 +179,138 @@ describe("hideConsumedCompressCalls", () => {
 
         const state = makeState([b1])
         const messages: WithParts[] = [
-            { info: { id: "msg-user-1", role: "user" } as any, parts: [{ type: "text", text: "Hi" }] },
+            {
+                info: { id: "msg-user-1", role: "user" } as any,
+                parts: [{ type: "text", text: "Hi" }],
+            },
             {
                 info: { id: "msg-t1-compress", role: "assistant" } as any,
-                parts: [{ type: "tool", tool: "compress", callID: "call-t1", state: { status: "completed" } }],
+                parts: [
+                    {
+                        type: "tool",
+                        tool: "compress",
+                        callID: "call-t1",
+                        state: { status: "completed" },
+                    },
+                ],
             },
-            { info: { id: "msg-user-2", role: "user" } as any, parts: [{ type: "text", text: "Next" }] },
+            {
+                info: { id: "msg-user-2", role: "user" } as any,
+                parts: [{ type: "text", text: "Next" }],
+            },
         ]
 
         const hidden = hideConsumedCompressCalls(state as SessionState, messages)
 
         assert.equal(hidden, 0)
         assert.ok(messages.find((m) => m.info.id === "msg-t1-compress"))
+    })
+
+    it("recomputes active calls while reusing historical call IDs", () => {
+        const b1 = makeBlock({
+            blockId: 1,
+            active: false,
+            compressCallId: "call-old",
+            tier: 1,
+        })
+        const b2 = makeBlock({
+            blockId: 2,
+            active: true,
+            compressCallId: "call-live",
+            tier: 1,
+        })
+        const state = makeState([b1, b2])
+        const firstMessages: WithParts[] = [
+            {
+                info: { id: "msg-old", role: "assistant" } as any,
+                parts: [
+                    {
+                        type: "tool",
+                        tool: "compress",
+                        callID: "call-old",
+                        state: { status: "completed" },
+                    },
+                ],
+            },
+            {
+                info: { id: "msg-live", role: "assistant" } as any,
+                parts: [
+                    {
+                        type: "tool",
+                        tool: "compress",
+                        callID: "call-live",
+                        state: { status: "completed" },
+                    },
+                ],
+            },
+        ]
+
+        hideConsumedCompressCalls(state as SessionState, firstMessages)
+
+        // A decompression changes only activity. The historical index must not
+        // keep the old active call alive, or hide the newly active one.
+        b1.active = true
+        b2.active = false
+        const afterDecompress: WithParts[] = [
+            {
+                info: { id: "msg-old", role: "assistant" } as any,
+                parts: [
+                    {
+                        type: "tool",
+                        tool: "compress",
+                        callID: "call-old",
+                        state: { status: "completed" },
+                    },
+                ],
+            },
+            {
+                info: { id: "msg-live", role: "assistant" } as any,
+                parts: [
+                    {
+                        type: "tool",
+                        tool: "compress",
+                        callID: "call-live",
+                        state: { status: "completed" },
+                    },
+                ],
+            },
+        ]
+        hideConsumedCompressCalls(state as SessionState, afterDecompress)
+
+        assert.ok(afterDecompress.some((message) => message.info.id === "msg-old"))
+        assert.equal(
+            afterDecompress.some((message) => message.info.id === "msg-live"),
+            false,
+        )
+    })
+
+    it("refreshes the historical call index when a block is added", () => {
+        const state = makeState([
+            makeBlock({ blockId: 1, active: true, compressCallId: "call-existing" }),
+        ])
+        hideConsumedCompressCalls(state as SessionState, [])
+
+        state.prune.messages.blocksById.set(
+            2,
+            makeBlock({ blockId: 2, active: false, compressCallId: "call-new" }),
+        )
+        const messages: WithParts[] = [
+            {
+                info: { id: "msg-new", role: "assistant" } as any,
+                parts: [
+                    {
+                        type: "tool",
+                        tool: "compress",
+                        callID: "call-new",
+                        state: { status: "completed" },
+                    },
+                ],
+            },
+        ]
+
+        hideConsumedCompressCalls(state as SessionState, messages)
+
+        assert.equal(messages.length, 0, "new historical call should not be treated as an orphan")
     })
 
     it("preserves non-compress parts when hiding consumed compress call", () => {
@@ -177,16 +332,27 @@ describe("hideConsumedCompressCalls", () => {
 
         const state = makeState([b1, b4])
         const messages: WithParts[] = [
-            { info: { id: "msg-user-1", role: "user" } as any, parts: [{ type: "text", text: "Hi" }] },
+            {
+                info: { id: "msg-user-1", role: "user" } as any,
+                parts: [{ type: "text", text: "Hi" }],
+            },
             {
                 info: { id: "msg-t1-compress", role: "assistant" } as any,
                 parts: [
                     { type: "text", text: "Let me compress" },
-                    { type: "tool", tool: "compress", callID: "call-t1", state: { status: "completed" } },
+                    {
+                        type: "tool",
+                        tool: "compress",
+                        callID: "call-t1",
+                        state: { status: "completed" },
+                    },
                     { type: "tool", tool: "bash", state: { status: "completed" } },
                 ],
             },
-            { info: { id: "msg-user-2", role: "user" } as any, parts: [{ type: "text", text: "Next" }] },
+            {
+                info: { id: "msg-user-2", role: "user" } as any,
+                parts: [{ type: "text", text: "Next" }],
+            },
         ]
 
         const hidden = hideConsumedCompressCalls(state as SessionState, messages)
@@ -219,16 +385,27 @@ describe("hideConsumedCompressCalls", () => {
 
         const state = makeState([b1, b4])
         const messages: WithParts[] = [
-            { info: { id: "msg-user-1", role: "user" } as any, parts: [{ type: "text", text: "Hi" }] },
+            {
+                info: { id: "msg-user-1", role: "user" } as any,
+                parts: [{ type: "text", text: "Hi" }],
+            },
             {
                 info: { id: "msg-t1-compress", role: "assistant" } as any,
                 parts: [
                     { type: "reasoning", text: "I need to compress the early messages..." },
-                    { type: "tool", tool: "compress", callID: "call-t1", state: { status: "completed" } },
+                    {
+                        type: "tool",
+                        tool: "compress",
+                        callID: "call-t1",
+                        state: { status: "completed" },
+                    },
                     { type: "step-finish", reason: "stop" },
                 ],
             },
-            { info: { id: "msg-user-2", role: "user" } as any, parts: [{ type: "text", text: "Next" }] },
+            {
+                info: { id: "msg-user-2", role: "user" } as any,
+                parts: [{ type: "text", text: "Next" }],
+            },
         ]
 
         const hidden = hideConsumedCompressCalls(state as SessionState, messages)
@@ -260,15 +437,26 @@ describe("hideConsumedCompressCalls", () => {
 
         const state = makeState([b1, b4])
         const messages: WithParts[] = [
-            { info: { id: "msg-user-1", role: "user" } as any, parts: [{ type: "text", text: "Hi" }] },
+            {
+                info: { id: "msg-user-1", role: "user" } as any,
+                parts: [{ type: "text", text: "Hi" }],
+            },
             {
                 info: { id: "msg-t1-compress", role: "assistant" } as any,
                 parts: [
                     { type: "reasoning", text: "Analyzing context usage..." },
-                    { type: "tool", tool: "compress", callID: "call-t1", state: { status: "completed" } },
+                    {
+                        type: "tool",
+                        tool: "compress",
+                        callID: "call-t1",
+                        state: { status: "completed" },
+                    },
                 ],
             },
-            { info: { id: "msg-user-2", role: "user" } as any, parts: [{ type: "text", text: "Next" }] },
+            {
+                info: { id: "msg-user-2", role: "user" } as any,
+                parts: [{ type: "text", text: "Next" }],
+            },
         ]
 
         const hidden = hideConsumedCompressCalls(state as SessionState, messages)
@@ -300,17 +488,28 @@ describe("hideConsumedCompressCalls", () => {
 
         const state = makeState([b1, b4])
         const messages: WithParts[] = [
-            { info: { id: "msg-user-1", role: "user" } as any, parts: [{ type: "text", text: "Hi" }] },
+            {
+                info: { id: "msg-user-1", role: "user" } as any,
+                parts: [{ type: "text", text: "Hi" }],
+            },
             {
                 info: { id: "msg-t1-compress", role: "assistant" } as any,
                 parts: [
                     { type: "reasoning", text: "I need to compress..." },
                     { type: "text", text: "Compressing early messages" },
-                    { type: "tool", tool: "compress", callID: "call-t1", state: { status: "completed" } },
+                    {
+                        type: "tool",
+                        tool: "compress",
+                        callID: "call-t1",
+                        state: { status: "completed" },
+                    },
                     { type: "step-finish", reason: "stop" },
                 ],
             },
-            { info: { id: "msg-user-2", role: "user" } as any, parts: [{ type: "text", text: "Next" }] },
+            {
+                info: { id: "msg-user-2", role: "user" } as any,
+                parts: [{ type: "text", text: "Next" }],
+            },
         ]
 
         const hidden = hideConsumedCompressCalls(state as SessionState, messages)
@@ -344,17 +543,28 @@ describe("hideConsumedCompressCalls", () => {
 
         const state = makeState([b1, b4])
         const messages: WithParts[] = [
-            { info: { id: "msg-user-1", role: "user" } as any, parts: [{ type: "text", text: "Hi" }] },
+            {
+                info: { id: "msg-user-1", role: "user" } as any,
+                parts: [{ type: "text", text: "Hi" }],
+            },
             {
                 info: { id: "msg-t1-compress", role: "assistant" } as any,
                 parts: [
                     { type: "reasoning", text: "I need to compress..." },
-                    { type: "tool", tool: "compress", callID: "call-t1", state: { status: "completed" } },
+                    {
+                        type: "tool",
+                        tool: "compress",
+                        callID: "call-t1",
+                        state: { status: "completed" },
+                    },
                     { type: "tool", tool: "bash", state: { status: "completed" } },
                     { type: "step-finish", reason: "stop" },
                 ],
             },
-            { info: { id: "msg-user-2", role: "user" } as any, parts: [{ type: "text", text: "Next" }] },
+            {
+                info: { id: "msg-user-2", role: "user" } as any,
+                parts: [{ type: "text", text: "Next" }],
+            },
         ]
 
         const hidden = hideConsumedCompressCalls(state as SessionState, messages)
@@ -387,16 +597,27 @@ describe("hideConsumedCompressCalls", () => {
 
         const state = makeState([b1, b4])
         const messages: WithParts[] = [
-            { info: { id: "msg-user-1", role: "user" } as any, parts: [{ type: "text", text: "Hi" }] },
+            {
+                info: { id: "msg-user-1", role: "user" } as any,
+                parts: [{ type: "text", text: "Hi" }],
+            },
             {
                 info: { id: "msg-t1-compress", role: "assistant" } as any,
                 parts: [
                     { type: "step-start" },
-                    { type: "tool", tool: "compress", callID: "call-t1", state: { status: "completed" } },
+                    {
+                        type: "tool",
+                        tool: "compress",
+                        callID: "call-t1",
+                        state: { status: "completed" },
+                    },
                     { type: "step-finish", reason: "stop" },
                 ],
             },
-            { info: { id: "msg-user-2", role: "user" } as any, parts: [{ type: "text", text: "Next" }] },
+            {
+                info: { id: "msg-user-2", role: "user" } as any,
+                parts: [{ type: "text", text: "Next" }],
+            },
         ]
 
         const hidden = hideConsumedCompressCalls(state as SessionState, messages)
@@ -420,33 +641,61 @@ describe("hideConsumedCompressCalls", () => {
 
         const state = makeState([b1])
         const messages: WithParts[] = [
-            { info: { id: "msg-user-1", role: "user" } as any, parts: [{ type: "text", text: "Hi" }] },
+            {
+                info: { id: "msg-user-1", role: "user" } as any,
+                parts: [{ type: "text", text: "Hi" }],
+            },
             {
                 info: { id: "msg-fail-1", role: "assistant" } as any,
                 parts: [
                     { type: "text", text: "Trying compress..." },
-                    { type: "tool", tool: "compress", callID: "call-fail-1", state: { status: "error" } },
+                    {
+                        type: "tool",
+                        tool: "compress",
+                        callID: "call-fail-1",
+                        state: { status: "error" },
+                    },
                 ],
             },
             {
                 info: { id: "msg-fail-2", role: "assistant" } as any,
                 parts: [
                     { type: "text", text: "Retry..." },
-                    { type: "tool", tool: "compress", callID: "call-fail-2", state: { status: "error" } },
+                    {
+                        type: "tool",
+                        tool: "compress",
+                        callID: "call-fail-2",
+                        state: { status: "error" },
+                    },
                 ],
             },
             {
                 info: { id: "msg-fail-3", role: "assistant" } as any,
                 parts: [
                     { type: "text", text: "Retry..." },
-                    { type: "tool", tool: "compress", callID: "call-fail-3", state: { status: "error" } },
+                    {
+                        type: "tool",
+                        tool: "compress",
+                        callID: "call-fail-3",
+                        state: { status: "error" },
+                    },
                 ],
             },
             {
                 info: { id: "msg-good-compress", role: "assistant" } as any,
-                parts: [{ type: "tool", tool: "compress", callID: "call-good", state: { status: "completed" } }],
+                parts: [
+                    {
+                        type: "tool",
+                        tool: "compress",
+                        callID: "call-good",
+                        state: { status: "completed" },
+                    },
+                ],
             },
-            { info: { id: "msg-user-2", role: "user" } as any, parts: [{ type: "text", text: "Next" }] },
+            {
+                info: { id: "msg-user-2", role: "user" } as any,
+                parts: [{ type: "text", text: "Next" }],
+            },
         ]
 
         const hidden = hideConsumedCompressCalls(state as SessionState, messages)
@@ -459,22 +708,42 @@ describe("hideConsumedCompressCalls", () => {
             0,
             "oldest orphaned compress part removed",
         )
-        assert.ok(messages.find((m) => m.info.id === "msg-fail-2"), "2nd-last orphaned kept")
-        assert.ok(messages.find((m) => m.info.id === "msg-fail-3"), "last orphaned kept")
-        assert.ok(messages.find((m) => m.info.id === "msg-good-compress"), "active block kept")
+        assert.ok(
+            messages.find((m) => m.info.id === "msg-fail-2"),
+            "2nd-last orphaned kept",
+        )
+        assert.ok(
+            messages.find((m) => m.info.id === "msg-fail-3"),
+            "last orphaned kept",
+        )
+        assert.ok(
+            messages.find((m) => m.info.id === "msg-good-compress"),
+            "active block kept",
+        )
     })
 
     it("hides all orphaned compress calls beyond the last 2", () => {
         const state = makeState([])
         const messages: WithParts[] = [
-            { info: { id: "msg-user-1", role: "user" } as any, parts: [{ type: "text", text: "Hi" }] },
+            {
+                info: { id: "msg-user-1", role: "user" } as any,
+                parts: [{ type: "text", text: "Hi" }],
+            },
             ...Array.from({ length: 5 }, (_, i) => ({
                 info: { id: `msg-fail-${i}`, role: "assistant" } as any,
                 parts: [
-                    { type: "tool", tool: "compress", callID: `call-fail-${i}`, state: { status: "error" } },
+                    {
+                        type: "tool",
+                        tool: "compress",
+                        callID: `call-fail-${i}`,
+                        state: { status: "error" },
+                    },
                 ],
             })),
-            { info: { id: "msg-user-2", role: "user" } as any, parts: [{ type: "text", text: "Next" }] },
+            {
+                info: { id: "msg-user-2", role: "user" } as any,
+                parts: [{ type: "text", text: "Next" }],
+            },
         ]
 
         const hidden = hideConsumedCompressCalls(state as SessionState, messages)
@@ -513,7 +782,10 @@ describe("hideConsumedCompressCalls", () => {
 
         const state = makeState([b5, b8, b9])
         const messages: WithParts[] = [
-            { info: { id: "msg-user-1", role: "user" } as any, parts: [{ type: "text", text: "Hi" }] },
+            {
+                info: { id: "msg-user-1", role: "user" } as any,
+                parts: [{ type: "text", text: "Hi" }],
+            },
             {
                 info: { id: "msg-batch", role: "assistant" } as any,
                 parts: [
@@ -526,7 +798,11 @@ describe("hideConsumedCompressCalls", () => {
                             input: {
                                 content: [
                                     { startId: "m5", endId: "m6", summary: "live entry summary" },
-                                    { startId: "m8", endId: "m9", summary: "consumed entry summary" },
+                                    {
+                                        startId: "m8",
+                                        endId: "m9",
+                                        summary: "consumed entry summary",
+                                    },
                                 ],
                             },
                         },
@@ -535,7 +811,14 @@ describe("hideConsumedCompressCalls", () => {
             },
             {
                 info: { id: "msg-t2", role: "assistant" } as any,
-                parts: [{ type: "tool", tool: "compress", callID: "call-t2", state: { status: "completed" } }],
+                parts: [
+                    {
+                        type: "tool",
+                        tool: "compress",
+                        callID: "call-t2",
+                        state: { status: "completed" },
+                    },
+                ],
             },
         ]
 
@@ -544,7 +827,9 @@ describe("hideConsumedCompressCalls", () => {
         assert.equal(hidden, 0, "kept batch is not fully removed")
         const batchMsg = messages.find((m) => m.info.id === "msg-batch")!
         assert.ok(batchMsg, "batch tool-call message survives (one live sibling)")
-        const part = batchMsg.parts.find((p: any) => p.type === "tool" && p.tool === "compress") as any
+        const part = batchMsg.parts.find(
+            (p: any) => p.type === "tool" && p.tool === "compress",
+        ) as any
         assert.ok(part, "compress part kept")
         const content = part.state.input.content
         assert.equal(content.length, 1, "consumed entry dropped, live entry retained")
@@ -572,7 +857,10 @@ describe("hideConsumedCompressCalls", () => {
 
         const state = makeState([b5, b8])
         const messages: WithParts[] = [
-            { info: { id: "msg-user-1", role: "user" } as any, parts: [{ type: "text", text: "Hi" }] },
+            {
+                info: { id: "msg-user-1", role: "user" } as any,
+                parts: [{ type: "text", text: "Hi" }],
+            },
             {
                 info: { id: "msg-batch", role: "assistant" } as any,
                 parts: [
@@ -632,7 +920,10 @@ describe("hideConsumedCompressCalls", () => {
 
         const state = makeState([b5, b8, b9])
         const messages: WithParts[] = [
-            { info: { id: "msg-user-1", role: "user" } as any, parts: [{ type: "text", text: "Hi" }] },
+            {
+                info: { id: "msg-user-1", role: "user" } as any,
+                parts: [{ type: "text", text: "Hi" }],
+            },
             {
                 info: { id: "msg-batch", role: "assistant" } as any,
                 parts: [
