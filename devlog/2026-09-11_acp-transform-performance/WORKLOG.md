@@ -2,7 +2,7 @@
 
 - Task ID: `2026-09-11_acp-transform-performance`
 - Home Repo: `opencode-acp`
-- Status: InProgress
+- Status: Complete
 - Updated: 2026-09-11
 
 ## 1. Summary
@@ -62,6 +62,7 @@ npm run build
 - `npm run typecheck`: passed after all source changes.
 - `npm run build`: passed after the final derived-index follow-up.
 - `npm run format:check`: repository baseline remains non-zero with 434 files reported; no broad formatting rewrite was applied.
+- `./scripts/dev-deploy.sh --check`: passed; deployed optimized bundle `v1.17.1` to both local `@latest` and `@stable` caches.
 
 ## 5. Risk Assessment & Rollback
 
@@ -73,4 +74,4 @@ npm run build
 
 - [x] File official issue: `https://github.com/ranxianglei/opencode-acp/issues/384`.
 - [x] Implement and measure each phase before proceeding to the next.
-- [ ] Obtain two independent source and test reviews before PR creation.
+- [x] Obtain two independent source/test reviews; identified invalidation and cold-state issues were fixed in `7d46424` and `02e4102`.
