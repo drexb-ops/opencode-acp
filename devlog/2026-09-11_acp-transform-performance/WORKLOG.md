@@ -63,6 +63,7 @@ npm run build
 - `npm run build`: passed after the final derived-index follow-up.
 - `npm run format:check`: repository baseline remains non-zero with 434 files reported; no broad formatting rewrite was applied.
 - `./scripts/dev-deploy.sh --check`: passed; deployed optimized bundle `v1.17.1` to both local `@latest` and `@stable` caches.
+- `./scripts/e2e/run-e2e.sh`: passed all 13/13 isolated scenarios, including nudge-triggered compression, autonomous nudge refire, consumed-call hiding, and adaptive candidate selection.
 
 ## 5. Risk Assessment & Rollback
 
