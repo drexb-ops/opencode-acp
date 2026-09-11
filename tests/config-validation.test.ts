@@ -55,6 +55,29 @@ test("getInvalidConfigKeys does not recurse into messageFilters.filters dynamic 
     assert.deepEqual(result, [])
 })
 
+test("getInvalidConfigKeys does not recurse into qualityGate.algorithms dynamic keys (#329)", () => {
+    const result = getInvalidConfigKeys({
+        qualityGate: {
+            enabled: true,
+            algorithm: "rouge-recall-v1",
+            algorithms: {
+                "rouge-recall-v1": { minSummaryLength: 200, rougeF1Threshold: 0.3 },
+            },
+        },
+    })
+    assert.deepEqual(result, [])
+})
+
+test("getInvalidConfigKeys still flags unknown qualityGate keys while allowing algorithm params (#329)", () => {
+    const result = getInvalidConfigKeys({
+        qualityGate: {
+            algorithms: { "rouge-recall-v1": { anything: 1 } },
+            notARealKey: true,
+        },
+    })
+    assert.deepEqual(result, ["qualityGate.notARealKey"])
+})
+
 test("validateConfigTypes returns empty array for valid config", () => {
     const result = validateConfigTypes({
         enabled: true,
