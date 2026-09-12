@@ -11,3 +11,7 @@
    - tests: 1229/1229 pass
    - build: OK
 7. Commit, push, PR #___ (human merges).
+
+## Hotfix (user-caught): tmp/ leaked into release commit
+
+`git add -A` picked up untracked debug notes `tmp/c348.fixed` / `tmp/c348.raw` (#348 investigation). Branch rewritten before merge: soft-reset to github/master, recommitted clean. Also: `tmp/` added to .gitignore (root cause — no ignore rule existed), `tmp/nested-fork-probe.mts` untracked (earlier master leak via bot's #350 commit), local copies preserved in `~/tmp/`.
