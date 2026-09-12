@@ -1,5 +1,26 @@
 # Changelog
 
+### v1.17.1 — transform no longer scales with compression history (13.6 s → 1.2 ms) + config/CI fixes
+
+Three fixes bundled — headliner is #385, which removes the long-session slowdown reported in #384:
+
+**1. Transform cost bounded to visible context + active blocks** (#385, fixes #384):
+Per-transform work scaled with the **total compression history** instead of the visible context. Candidate planning at 1,000 messages measured **13.6 s** on master; now **~1.2 ms** (acceptance target ≤20 ms met with ~17× headroom; same-harness before/after, `scripts/bench-candidate-planning.ts`).
+- **RC1** `resolveBoundaryIds()` rebuilt the global boundary lookup per candidate draft → request-scoped `SearchContext.boundaryLookup` memo, built once per compress call.
+- **RC1b** `resolveSelection()` ran the real Anthropic BPE tokenizer per message (~27 ms/KB) → new `estimateAllMessageTokensFast()` (chars/4, the existing estimation convention); exact BPE kept where correctness requires it.
+- **RC2** T1 nudge analysis (context composition / protected refs / compressible ranges) ran every transform even when no nudge could fire → gated on `nudgeAllowed || emergencyOverride || tierTriggerPossible`, all consumers null-guarded.
+- **RC3** `syncCompressionBlocks()` replayed ALL blocks (active + inactive) and `hideConsumedCompressCalls()` rebuilt immutable consumed-call indexes every transform → transient `structureVersion` bumped at the three block-mutation sites; sync skips full replay when unchanged; hide-consumed caches its derived index by version.
+- **RC4** fire-and-forget state saves raced (stale-overwrite possible) → ordered, coalescing per-session save queue (snapshot at enqueue, `setImmediate` drain, batch writes latest snapshot only, FIFO, failure isolation).
+- Persisted-state format **unchanged** — all new fields are transient; candidate executor validation, Bug 39 protection semantics, decompression, fork recovery untouched. +20 tests (sync equivalence, cache invalidation, memoization, save coalescing, §5.7 multi-turn growth-cycle).
+
+**2. `qualityGate.algorithms` false "Unknown keys" warning** (#389, fixes #329): per-algorithm params (`qualityGate.algorithms.rouge-recall-v1.*`) are a legal dynamic-key map but the key-allowlist recursed into it — every startup warned on a valid config. Added to the recursion skip list (same convention as `compress.providers` / `messageFilters.filters`). Note: real param names for `rouge-recall-v1` are `layer1MinChars`, `layer1MinRetentionPct`, `layer2MaxRougeF1`, `layer2MaxTop20Recall` — unknown inner keys are silently ignored, so check your params actually take effect.
+
+**3. Fork PR builds green again** (#390, fixes #366): `build-artifact` ran `npm publish` on every PR, but fork PRs can't access `NPM_TOKEN` → ENEEDAUTH killed the whole job. The publish step is now gated to same-repo heads; fork PRs still build, pack, and upload the artifact, and the install comment no longer advertises the npm tag or a base-repo ref that doesn't exist for forks. CI-only — no runtime code.
+
+Files: `lib/compress/search.ts`, `lib/messages/sync.ts`, `lib/messages/utils.ts`, `lib/token-utils.ts`, `lib/state/persistence.ts`, `lib/state/types.ts`, `lib/config-validation.ts`, `scripts/bench-candidate-planning.ts` (new), `.github/workflows/pr-artifact.yml`. Full suite 1209/1209 on the release branch; typecheck + build clean.
+
+**Install**: `opencode plugin opencode-acp@latest --global`
+
 ### v1.17.0 — context-limit safety net + budget guard: no more silent 400 death loops
 
 Six fixes bundled, two of them new protection subsystems for sessions whose context window was unknown or exceeded:
