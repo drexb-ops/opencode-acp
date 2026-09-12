@@ -46,6 +46,7 @@ import {
     resolveMinNudgeFloorTokens,
     applyCompressOverrides,
 } from "./utils"
+import type { ContextComposition, ContextRanges } from "./utils"
 import { buildCompressedBlockGuidance } from "../../prompts/extensions/nudge"
 import { COMPRESS_PHILOSOPHY, HOW_TO_COMPRESS_RULES, TIER2_DISTILL_RULES, TIER3_CONDENSE_RULES } from "context-compress-algorithms/prompts"
 import { getTierTokenUsage } from "../../state/utils"
@@ -368,26 +369,48 @@ export const injectCompressNudges = (
         baselineReEstablished = true
     }
 
-    const composition = estimateContextComposition(
-        messages,
-        state,
-        config.compress.protectedTools,
-        config.protectedFilePatterns,
-    )
+    // [Issue #384] Lazy nudge analysis: the passes below scan every message
+    // (JSON.stringify per tool part) but their results are only consumed when
+    // a nudge, emergency notice, or tier trigger can actually fire this turn.
+    // getTierTokenUsage is cheap (active blocks only), so use it to predict
+    // tier-trigger possibility before deciding whether the heavy work is
+    // needed. With the empty defaults below, every downstream flag evaluates
+    // exactly as before when no nudge could fire (nothingToCompress stays
+    // false, hasRecommendations false, suppressed-log counts zero).
+    const tierUsageEarly = getTierTokenUsage(state)
+    const tierTriggerPossible =
+        !!suffixMessage &&
+        (tierUsageEarly.tier1Tokens >= nudgeGrowthTokens ||
+            tierUsageEarly.tier2Tokens >= nudgeGrowthTokens)
+    // emergencyOverride is subsumed by nudgeAllowed but kept explicit so the gate stays correct if nudgeAllowed's definition ever changes
+    const needsNudgeAnalysis = nudgeAllowed || emergencyOverride || tierTriggerPossible
+
+    const composition: ContextComposition | null = needsNudgeAnalysis
+        ? estimateContextComposition(
+              messages,
+              state,
+              config.compress.protectedTools,
+              config.protectedFilePatterns,
+          )
+        : null
 
     // Compute protected zone first — buildCompressibleRanges uses it to split
     // groups at the boundary so the unprotected head survives as a range.
-    const protectedRefs = computeProtectedRefs(messages, state, config.compress)
+    const protectedRefs = needsNudgeAnalysis
+        ? computeProtectedRefs(messages, state, config.compress)
+        : new Set<string>()
 
     // Compute recommendation filter BEFORE applyAnchoredNudges — the result
     // gates whether the nudge text is injected at all (Issue #216 Defect 1).
-    const contextRanges = buildCompressibleRanges(
-        messages,
-        state,
-        config.compress.protectedTools,
-        config.protectedFilePatterns,
-        protectedRefs,
-    )
+    const contextRanges: ContextRanges = needsNudgeAnalysis
+        ? buildCompressibleRanges(
+              messages,
+              state,
+              config.compress.protectedTools,
+              config.protectedFilePatterns,
+              protectedRefs,
+          )
+        : { compressible: [], protected: [] }
 
     const unprotectedCompressible = excludeProtectedRanges(contextRanges.compressible, protectedRefs)
 
@@ -436,7 +459,9 @@ export const injectCompressNudges = (
     // Priority: T1 > T2 > T3. T1 compression reduces raw context first.
     // Each tier has independent cadence counters — T2 firing doesn't block T3.
     if (suffixMessage && !shouldInject) {
-        const tierUsage = getTierTokenUsage(state)
+        // [Issue #384] Reuse the early tier-usage snapshot: nothing between the
+        // computation above and here mutates compression blocks.
+        const tierUsage = tierUsageEarly
 
         const tierChecks = [
             { triggerTier: 2 as const, targetTier: 1 as const, tokens: tierUsage.tier1Tokens, lastNudge: state.nudges.lastTier2NudgeTokens },
@@ -589,7 +614,7 @@ export const injectCompressNudges = (
     let tipsText: string | null = null
 
     if (shouldInject) {
-        if (suffixMessage && composition.total > 0) {
+        if (suffixMessage && composition !== null && composition.total > 0) {
             const fmt = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}K` : String(n))
             const pct = (n: number) =>
                 n > 0 ? Math.max(1, Math.round((n / composition.total) * 100)) : 0

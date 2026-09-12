@@ -1,5 +1,6 @@
 import type { CompressionBlock, PruneMessagesState, WithParts } from "../state"
 import { parseBlockRef } from "../message-ids"
+import { bumpPruneStructureVersion } from "../state/utils"
 import type { CompressionTarget } from "../commands/compression-targets"
 
 export function parseBlockIdArg(arg: string): number | null {
@@ -144,6 +145,12 @@ export function deactivateCompressionTarget(
                 }
             }
         }
+    }
+
+    // [Issue #384] Block liveness changed — invalidate sync + hide-consumed
+    // caches derived from previous versions.
+    if (target.blocks.length > 0) {
+        bumpPruneStructureVersion(messagesState)
     }
 }
 

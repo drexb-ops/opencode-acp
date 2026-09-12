@@ -87,6 +87,12 @@ export interface SearchContext {
     rawMessagesById: Map<string, WithParts>
     rawIndexById: Map<string, number>
     summaryByBlockId: Map<number, CompressionBlock>
+    /**
+     * [Issue #384] Request-scoped boundary lookup (mNNNNN/bN → BoundaryReference),
+     * built once per SearchContext instead of once per boundary pair. Optional so
+     * hand-built contexts (tests) keep working; resolveBoundaryIds memoizes it lazily.
+     */
+    boundaryLookup?: Map<string, BoundaryReference>
 }
 
 export interface SelectionResolution {

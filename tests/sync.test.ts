@@ -4,6 +4,7 @@ import test from "node:test"
 import { Logger } from "../lib/logger"
 import { syncCompressionBlocks } from "../lib/messages/sync"
 import { createSessionState, type WithParts, type CompressionBlock } from "../lib/state"
+import { bumpPruneStructureVersion } from "../lib/state/utils"
 
 const SID = "ses-sync-test"
 const logger = new Logger(false)
@@ -190,4 +191,107 @@ test("issue #125: external anchor deletion keeps block active (anchor-survival f
         1,
         "surviving message still has block 1 active",
     )
+})
+
+// [Issue #384] Verified-state synchronization: when the block structure version
+// is unchanged, sync takes an incremental fast path instead of replaying every
+// historical block. These tests pin the equivalence contract.
+
+test("issue #384: incremental pass matches full replay when structure is unchanged", () => {
+    const state = createSessionState()
+    state.prune.messages.blocksById.set(
+        1,
+        makeBlock({ blockId: 1, anchorMessageId: "m1", createdAt: 100 }),
+    )
+    state.prune.messages.blocksById.set(
+        2,
+        makeBlock({ blockId: 2, anchorMessageId: "m2", createdAt: 200 }),
+    )
+    const messages = [userMsg("m1"), userMsg("m2")]
+
+    syncCompressionBlocks(state, logger, messages) // full replay (no prior version)
+    const activeAfterFull = [...state.prune.messages.activeBlockIds].sort((a, b) => a - b)
+    const anchorAfterFull = [...state.prune.messages.activeByAnchorMessageId.entries()].sort()
+    const version = state.prune.messages.lastSyncedStructureVersion
+    assert.notEqual(version, undefined, "full replay must record the structure version")
+
+    syncCompressionBlocks(state, logger, messages) // incremental fast path
+
+    assert.equal(state.prune.messages.lastSyncedStructureVersion, version)
+    assert.deepEqual([...state.prune.messages.activeBlockIds].sort((a, b) => a - b), activeAfterFull)
+    assert.deepEqual(
+        [...state.prune.messages.activeByAnchorMessageId.entries()].sort(),
+        anchorAfterFull,
+    )
+})
+
+test("issue #384: incremental pass drops anchors missing from the message set without touching liveness", () => {
+    const state = createSessionState()
+    state.prune.messages.blocksById.set(
+        1,
+        makeBlock({ blockId: 1, anchorMessageId: "m1", createdAt: 100 }),
+    )
+    state.prune.messages.blocksById.set(
+        2,
+        makeBlock({ blockId: 2, anchorMessageId: "m2", createdAt: 200 }),
+    )
+
+    syncCompressionBlocks(state, logger, [userMsg("m1"), userMsg("m2")])
+    assert.equal(state.prune.messages.activeByAnchorMessageId.get("m2"), 2)
+
+    // m2 disappears from the visible messages (e.g. external compaction);
+    // no block mutation happened, so the version is unchanged.
+    syncCompressionBlocks(state, logger, [userMsg("m1")])
+
+    assert.equal(state.prune.messages.activeByAnchorMessageId.get("m2"), undefined)
+    assert.equal(state.prune.messages.activeByAnchorMessageId.get("m1"), 1)
+    assert.ok(state.prune.messages.activeBlockIds.has(1))
+    assert.ok(state.prune.messages.activeBlockIds.has(2))
+})
+
+test("issue #384: structure version bump forces full replay that recomputes liveness", () => {
+    const state = createSessionState()
+    state.prune.messages.blocksById.set(
+        1,
+        makeBlock({ blockId: 1, anchorMessageId: "m1", createdAt: 100 }),
+    )
+    syncCompressionBlocks(state, logger, [userMsg("m1")])
+    assert.ok(state.prune.messages.activeBlockIds.has(1))
+
+    // Mimic applyCompressionState: bump once after mutating the structure.
+    bumpPruneStructureVersion(state.prune.messages)
+    state.prune.messages.blocksById.set(
+        2,
+        makeBlock({
+            blockId: 2,
+            anchorMessageId: "m3",
+            createdAt: 200,
+            consumedBlockIds: [1],
+        }),
+    )
+
+    syncCompressionBlocks(state, logger, [userMsg("m1"), userMsg("m3")])
+
+    assert.equal(state.prune.messages.lastSyncedStructureVersion, 1)
+    assert.ok(!state.prune.messages.activeBlockIds.has(1), "consumed block must be deactivated by full replay")
+    assert.ok(state.prune.messages.activeBlockIds.has(2))
+    assert.equal(state.prune.messages.blocksById.get(1)!.active, false)
+})
+
+test("issue #384: shared anchor keeps the later-created block id on both paths", () => {
+    const state = createSessionState()
+    state.prune.messages.blocksById.set(
+        1,
+        makeBlock({ blockId: 1, anchorMessageId: "m1", createdAt: 100 }),
+    )
+    state.prune.messages.blocksById.set(
+        2,
+        makeBlock({ blockId: 2, anchorMessageId: "m1", createdAt: 200 }),
+    )
+
+    syncCompressionBlocks(state, logger, [userMsg("m1")])
+    assert.equal(state.prune.messages.activeByAnchorMessageId.get("m1"), 2)
+
+    syncCompressionBlocks(state, logger, [userMsg("m1")])
+    assert.equal(state.prune.messages.activeByAnchorMessageId.get("m1"), 2)
 })
