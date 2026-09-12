@@ -3,7 +3,7 @@ import type { SessionState, WithParts } from "../state"
 import { formatBlockRef, formatMessageRef, parseBoundaryId, parseMessageRef } from "../message-ids"
 import { isIgnoredUserMessage } from "../messages/query"
 import { filterMessages } from "../messages/shape"
-import { countAllMessageTokens } from "../token-utils"
+import { estimateAllMessageTokensFast } from "../token-utils"
 import {
     type BoundaryReference,
     type SearchContext,
@@ -42,12 +42,18 @@ export function buildSearchContext(state: SessionState, rawMessages: WithParts[]
         summaryByBlockId.set(blockId, block)
     }
 
-    return {
+    const context: SearchContext = {
         rawMessages,
         rawMessagesById,
         rawIndexById,
         summaryByBlockId,
     }
+
+    // [Issue #384] Build the boundary lookup once per request context instead
+    // of once per boundary pair (resolveBoundaryIds memoizes onto this field).
+    context.boundaryLookup = buildBoundaryLookup(context, state)
+
+    return context
 }
 
 export function resolveBoundaryIds(
@@ -57,7 +63,7 @@ export function resolveBoundaryIds(
     endId: string,
     logger?: { warn(message: string, data?: any): void },
 ): { startReference: BoundaryReference; endReference: BoundaryReference } {
-    const lookup = buildBoundaryLookup(context, state)
+    const lookup = context.boundaryLookup ?? (context.boundaryLookup = buildBoundaryLookup(context, state))
     const issues: string[] = []
     const parsedStartId = parseBoundaryId(startId)
     const parsedEndId = parseBoundaryId(endId)
@@ -326,7 +332,7 @@ export function resolveSelection(
         }
 
         if (options?.includeTokenAccounting !== false && !messageTokenById.has(messageId)) {
-            messageTokenById.set(messageId, countAllMessageTokens(rawMessage))
+            messageTokenById.set(messageId, estimateAllMessageTokensFast(rawMessage))
         }
 
         const parts = Array.isArray(rawMessage.parts) ? rawMessage.parts : []

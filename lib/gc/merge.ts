@@ -3,6 +3,7 @@ import type { PluginConfig } from "../config"
 import type { Logger } from "../logger"
 import { countTokens, getCurrentTokenUsage } from "../token-utils"
 import { resolveEffectiveContextLimit } from "../state/utils"
+import { bumpPruneStructureVersion } from "../state/utils"
 import {
     COMPRESSED_BLOCK_HEADER,
     allocateBlockId,
@@ -182,6 +183,10 @@ export function mergeMarkedBlocks(
         0,
     )
     const savedTokens = Math.max(0, sourceTokens - newSummaryTokens)
+
+    // [Issue #384] Block structure/liveness changed — invalidate sync +
+    // hide-consumed caches derived from previous versions.
+    bumpPruneStructureVersion(messagesState)
 
     return { mergedCount: sourceBlocks.length, savedTokens }
 }

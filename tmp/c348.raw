@@ -1,0 +1,17 @@
+Closing in favor of #350 (same issue #347, competing designs).
+
+Compared both implementations side by side:
+
+| Aspect | #348 (this PR) | #350 (chosen) |
+|---|---|---|
+| Guard window | model limit → **absolute `maxContextLimit` fallback** | **model limit only** |
+| Action | clear only | truncate → clear (two-stage, gentler) |
+| Config | `overflowGuard` bool + `overflowGuardReserve` | `completionReserveTokens` only |
+
+Deciding factor: #350's authors tested the absolute--as-window approach and hit a real regression — pruning to a soft nudge threshold starves the nudge of compressible targets ( fails). `maxContextLimit` is documented as a nudge threshold, not the backend's real window; using it as a hard-prune boundary changes its user-facing semantics and over-prunes sessions whose real window is larger.
+
+#348's strengths worth porting into #350 (may do in a follow-up):
+- `overflowGuard` kill-switch boolean (explicit opt-out)
+- The 25-test suite is more thorough than #350's 19 — especially the O(1) estimation edge cases
+
+Both PRs are now rebased conflict-free (#349 → #350 stack). Thanks for the work!

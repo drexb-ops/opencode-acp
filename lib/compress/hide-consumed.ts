@@ -60,21 +60,33 @@ function rewriteCompressInput(part: Part, liveKeys: Set<string>): Part | null {
  * in the default protected-tools list. See upstream issue #288.
  */
 export function hideConsumedCompressCalls(state: SessionState, messages: WithParts[]): number {
-    const allBlockCallIds = new Set<string>()
-    const liveRangeKeysByCallId = new Map<string, Set<string>>()
-    const activeCallIds = new Set<string>()
-    for (const block of state.prune.messages.blocksById.values()) {
-        if (!block.compressCallId) continue
-        allBlockCallIds.add(block.compressCallId)
-        if (!isLiveBlock(block)) continue
-        activeCallIds.add(block.compressCallId)
-        let keys = liveRangeKeysByCallId.get(block.compressCallId)
-        if (!keys) {
-            keys = new Set<string>()
-            liveRangeKeysByCallId.set(block.compressCallId, keys)
+    // [Issue #384] Transient derived index: these structures depend only on
+    // block liveness (tracked by structureVersion), never on the message list.
+    // Rebuilding them over ALL historical blocks on every transform scaled with
+    // compression history; cache them per structureVersion instead.
+    const messagesState = state.prune.messages
+    const version = messagesState.structureVersion ?? 0
+    let cached = messagesState.hideConsumedIndex
+    if (!cached || cached.version !== version) {
+        const allBlockCallIds = new Set<string>()
+        const liveRangeKeysByCallId = new Map<string, Set<string>>()
+        const activeCallIds = new Set<string>()
+        for (const block of messagesState.blocksById.values()) {
+            if (!block.compressCallId) continue
+            allBlockCallIds.add(block.compressCallId)
+            if (!isLiveBlock(block)) continue
+            activeCallIds.add(block.compressCallId)
+            let keys = liveRangeKeysByCallId.get(block.compressCallId)
+            if (!keys) {
+                keys = new Set<string>()
+                liveRangeKeysByCallId.set(block.compressCallId, keys)
+            }
+            keys.add(rangeKey(block.startId, block.endId))
         }
-        keys.add(rangeKey(block.startId, block.endId))
+        cached = { version, allBlockCallIds, liveRangeKeysByCallId, activeCallIds }
+        messagesState.hideConsumedIndex = cached
     }
+    const { allBlockCallIds, liveRangeKeysByCallId, activeCallIds } = cached
 
     const lastOrphanedCallIds: string[] = []
     for (let i = messages.length - 1; i >= 0 && lastOrphanedCallIds.length < KEEP_LAST_ORPHANED; i--) {

@@ -1,4 +1,4 @@
-import type { SessionState, WithParts } from "../state"
+import type { CompressionBlock, SessionState, WithParts } from "../state"
 import type { Logger } from "../logger"
 
 function sortBlocksByCreation(
@@ -40,6 +40,38 @@ export const syncCompressionBlocks = (
     }
 
     const messageIds = new Set(messages.map((msg) => msg.info.id))
+
+    // [Issue #384] Verified-state synchronization: the full replay below walks
+    // EVERY historical block (unbounded growth with session length). Block
+    // liveness only changes through structureVersion-bumped mutations, so when
+    // the version matches the last sync, liveness is already at its fixed
+    // point. The only thing that can drift between transforms is the anchor
+    // map — opencode may have removed or added messages since — so rebuild it
+    // from ACTIVE blocks only (bounded) and skip the rest.
+    const structureVersion = messagesState.structureVersion ?? 0
+    if (messagesState.lastSyncedStructureVersion === structureVersion) {
+        const activeBlocks = [...messagesState.activeBlockIds]
+            .map((id) => messagesState.blocksById.get(id))
+            .filter((b): b is CompressionBlock => b !== undefined)
+            .sort(sortBlocksByCreation)
+        const nextAnchorMap = new Map<string, number>()
+        for (const block of activeBlocks) {
+            if (!messageIds.has(block.anchorMessageId)) continue
+            nextAnchorMap.set(block.anchorMessageId, block.blockId)
+        }
+        const previous = messagesState.activeByAnchorMessageId
+        if (
+            previous.size !== nextAnchorMap.size ||
+            ![...nextAnchorMap.entries()].every(([anchor, id]) => previous.get(anchor) === id)
+        ) {
+            previous.clear()
+            for (const [anchor, id] of nextAnchorMap) {
+                previous.set(anchor, id)
+            }
+        }
+        return false
+    }
+
     const previousActiveBlockIds = new Set<number>(
         Array.from(messagesState.blocksById.values())
             .filter((block) => block.active)
@@ -135,5 +167,6 @@ export const syncCompressionBlocks = (
         })
     }
 
+    messagesState.lastSyncedStructureVersion = structureVersion
     return membershipsRebuilt || deactivatedCount > 0 || reactivatedCount > 0
 }

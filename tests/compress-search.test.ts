@@ -555,3 +555,94 @@ test("resolveAnchorMessageId throws for message kind without messageId", () => {
     const ref: BoundaryReference = { kind: "message", rawIndex: 0 }
     assert.throws(() => resolveAnchorMessageId(ref), /Failed to map boundary matches/)
 })
+
+// --- Tests for [Issue #384] request-scoped boundary lookup + fast token estimates ---
+
+function makeRefState(): SessionState {
+    return makeState({
+        messageIds: {
+            byRawId: new Map([
+                ["raw-1", "m00001"],
+                ["raw-2", "m00002"],
+            ]),
+            byRef: new Map([
+                ["m00001", "raw-1"],
+                ["m00002", "raw-2"],
+            ]),
+            nextRef: 3,
+        },
+    })
+}
+
+test("buildSearchContext pre-populates boundaryLookup from refs and active block anchors (Issue #384)", () => {
+    const m1 = makeAssistantMessage("raw-1", "one")
+    const m2 = makeAssistantMessage("raw-2", "two")
+    const state = makeRefState()
+    state.prune.messages.blocksById.set(7, makeBlock({ blockId: 7, anchorMessageId: "raw-2" }))
+    state.prune.messages.activeBlockIds.add(7)
+
+    const ctx = buildSearchContext(state, [m1, m2])
+
+    assert.ok(ctx.boundaryLookup, "boundaryLookup must be pre-built with the context")
+    const msgRef = ctx.boundaryLookup!.get("m00001")!
+    assert.equal(msgRef.kind, "message")
+    assert.equal(msgRef.rawIndex, 0)
+    assert.equal(msgRef.messageId, "raw-1")
+    const blockRef = ctx.boundaryLookup!.get("b7")!
+    assert.equal(blockRef.kind, "compressed-block")
+    assert.equal(blockRef.rawIndex, 1)
+    assert.equal(blockRef.blockId, 7)
+    assert.equal(blockRef.anchorMessageId, "raw-2")
+})
+
+test("resolveBoundaryIds reuses the pre-built boundaryLookup across drafts (Issue #384)", () => {
+    const m1 = makeAssistantMessage("raw-1", "one")
+    const m2 = makeAssistantMessage("raw-2", "two")
+    const state = makeRefState()
+
+    const ctx = buildSearchContext(state, [m1, m2])
+    const first = ctx.boundaryLookup!
+
+    const r1 = resolveBoundaryIds(ctx, state, "m00001", "m00002")
+    assert.equal(r1.startReference.messageId, "raw-1")
+    assert.equal(r1.endReference.messageId, "raw-2")
+
+    // A second draft on the same request context must NOT rebuild the lookup.
+    const r2 = resolveBoundaryIds(ctx, state, "m00002", "m00002")
+    assert.equal(r2.startReference.messageId, "raw-2")
+    assert.equal(r2.endReference.messageId, "raw-2")
+    assert.equal(
+        ctx.boundaryLookup,
+        first,
+        "lookup object identity must be preserved across drafts within one request",
+    )
+})
+
+test("resolveBoundaryIds lazily builds boundaryLookup for hand-built contexts (backward compat)", () => {
+    const m1 = makeAssistantMessage("raw-1", "one")
+    const m2 = makeAssistantMessage("raw-2", "two")
+    const state = makeRefState()
+
+    // makeContext() builds a SearchContext without boundaryLookup, like
+    // pre-#384 callers did; resolution must still work via lazy memoization.
+    const ctx = makeContext([m1, m2])
+    assert.equal(ctx.boundaryLookup, undefined)
+
+    const { startReference, endReference } = resolveBoundaryIds(ctx, state, "m00001", "m00002")
+    assert.equal(startReference.messageId, "raw-1")
+    assert.equal(endReference.messageId, "raw-2")
+    assert.ok(ctx.boundaryLookup, "hand-built context gets the lookup attached on first resolve")
+})
+
+test("resolveSelection uses fast character-based token estimates (Issue #384)", () => {
+    const m1 = makeAssistantMessage("big", "a".repeat(1000))
+    const ctx = makeContext([m1])
+    const ref: BoundaryReference = { kind: "message", rawIndex: 0, messageId: "big" }
+
+    const result = resolveSelection(ctx, ref, ref)
+
+    // countMessageCharacters = 1000 text chars → Math.round(1000 / 4) = 250.
+    // The BPE-exact path would cost ~25ms here; the fast path must be exact
+    // against the chars/4 convention.
+    assert.equal(result.messageTokenById.get("big"), 250)
+})

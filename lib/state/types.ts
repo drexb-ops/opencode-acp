@@ -84,6 +84,30 @@ export interface PruneMessagesState {
     markedForCleanup: Set<number>
     /** Transient: persisted memberships need one repair sync before fast-path reuse. */
     membershipsVerified: boolean
+
+    /**
+     * [Issue #384] Transient fields below are NEVER persisted — serialization
+     * (serializePruneMessagesState / PersistedSessionState) lists fields
+     * explicitly, so they survive only within one process lifetime.
+     *
+     * structureVersion: monotonically increasing counter bumped by every
+     * block-structure/liveness mutation (applyCompressionState, merge, user
+     * decompress). syncCompressionBlocks uses it to skip the full replay over
+     * all historical blocks when nothing changed since the last sync.
+     */
+    structureVersion?: number
+    /** structureVersion at which the last sync (full or incremental) ran. */
+    lastSyncedStructureVersion?: number
+    /**
+     * Cached consumed-call indexes for hideConsumedCompressCalls. Depends only
+     * on block liveness, so it is keyed by structureVersion.
+     */
+    hideConsumedIndex?: {
+        version: number
+        allBlockCallIds: Set<string>
+        liveRangeKeysByCallId: Map<string, Set<string>>
+        activeCallIds: Set<string>
+    }
 }
 
 export interface Prune {

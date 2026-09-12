@@ -84,8 +84,14 @@ function getConfigKeyPaths(obj: Record<string, any>, prefix = ""): string[] {
             fullKey === "compress.modelMaxLimits" ||
             fullKey === "compress.modelMinLimits" ||
             fullKey === "compress.providers" ||
-            fullKey === "messageFilters.filters"
+            fullKey === "messageFilters.filters" ||
+            fullKey === "qualityGate.algorithms"
         ) {
+            // Dynamic-key maps: the next path segment is a user-chosen name
+            // (provider id, filter id, registered algorithm id) whose inner
+            // shape is validated by the owning subsystem, not by this static
+            // allow-list. Recursing would flag every legal entry as
+            // "Unknown keys" (#329).
             continue
         }
 

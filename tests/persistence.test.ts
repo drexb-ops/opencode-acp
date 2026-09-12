@@ -164,3 +164,106 @@ test("loadSessionState tolerates legacy prune.tools field (Bug 38 backward-compa
     )
     await cleanup()
 })
+
+// [Issue #384] Ordered, coalescing save queue — behavioral coverage through the
+// public saveSessionState API. The queue guarantees: (1) synchronous bursts are
+// coalesced into a single write of the LATEST snapshot, (2) sequential saves
+// settle in request order so a stale snapshot can never overwrite a fresh one,
+// (3) a failed write rejects its waiters without poisoning subsequent saves.
+
+test("saveSessionState: synchronous burst coalesces to a single latest-snapshot write", async () => {
+    await cleanup()
+    const state = createSessionState()
+    state.sessionId = TEST_SESSION
+
+    state.stats.totalPruneTokens = 1
+    const p1 = saveSessionState(state, logger)
+    state.stats.totalPruneTokens = 2
+    const p2 = saveSessionState(state, logger)
+    state.stats.totalPruneTokens = 3
+    const p3 = saveSessionState(state, logger)
+
+    await Promise.all([p1, p2, p3])
+
+    const content = JSON.parse(await fs.readFile(join(STORAGE_DIR, `${TEST_SESSION}.json`), "utf-8"))
+    assert.equal(
+        content.stats.totalPruneTokens,
+        3,
+        "only the latest snapshot of the burst may be persisted",
+    )
+    await cleanup()
+})
+
+test("saveSessionState: sequential saves never let a stale snapshot win", async () => {
+    await cleanup()
+    const state = createSessionState()
+    state.sessionId = TEST_SESSION
+
+    // Batch 1 settles first...
+    state.stats.totalPruneTokens = 1
+    await saveSessionState(state, logger)
+    const afterFirst = JSON.parse(await fs.readFile(join(STORAGE_DIR, `${TEST_SESSION}.json`), "utf-8"))
+    assert.equal(afterFirst.stats.totalPruneTokens, 1)
+
+    // ...then a burst for batches 2+3 must not be reordered behind batch 1's file.
+    state.stats.totalPruneTokens = 2
+    const p2 = saveSessionState(state, logger)
+    state.stats.totalPruneTokens = 3
+    const p3 = saveSessionState(state, logger)
+    await Promise.all([p2, p3])
+
+    const content = JSON.parse(await fs.readFile(join(STORAGE_DIR, `${TEST_SESSION}.json`), "utf-8"))
+    assert.equal(content.stats.totalPruneTokens, 3, "final file holds the newest snapshot")
+    await cleanup()
+})
+
+test("saveSessionState: a failed write rejects waiters but the queue keeps working", async () => {
+    await cleanup()
+    const filePath = join(STORAGE_DIR, `${TEST_SESSION}.json`)
+    await fs.mkdir(STORAGE_DIR, { recursive: true })
+    // Make the target path a DIRECTORY so writeFile fails with EISDIR.
+    await fs.mkdir(filePath, { recursive: true })
+
+    const state = createSessionState()
+    state.sessionId = TEST_SESSION
+    state.stats.totalPruneTokens = 1
+    const failing = saveSessionState(state, logger)
+    await assert.rejects(failing, /EISDIR|ENOTDIR/, "write to a directory path must reject")
+
+    // Recover and verify the next save still succeeds (chain not poisoned).
+    await fs.rm(filePath, { recursive: true })
+    state.stats.totalPruneTokens = 7
+    await saveSessionState(state, logger)
+    const content = JSON.parse(await fs.readFile(filePath, "utf-8"))
+    assert.equal(content.stats.totalPruneTokens, 7, "queue must continue after a failure")
+    await cleanup()
+})
+
+test("saveSessionState: storageDir override isolates files per directory", async () => {
+    const { tmpdir } = await import("os")
+    const dirA = await fs.mkdtemp(join(tmpdir(), "acp-persist-a-"))
+    const dirB = await fs.mkdtemp(join(tmpdir(), "acp-persist-b-"))
+    try {
+        const stateA = createSessionState()
+        stateA.sessionId = TEST_SESSION
+        stateA.storageDir = dirA
+        stateA.stats.totalPruneTokens = 10
+
+        const stateB = createSessionState()
+        stateB.sessionId = TEST_SESSION
+        stateB.storageDir = dirB
+        stateB.stats.totalPruneTokens = 20
+
+        await Promise.all([saveSessionState(stateA, logger), saveSessionState(stateB, logger)])
+
+        assert.ok(existsSync(join(dirA, `${TEST_SESSION}.json`)), "file under dirA")
+        assert.ok(existsSync(join(dirB, `${TEST_SESSION}.json`)), "file under dirB")
+        const contentA = JSON.parse(await fs.readFile(join(dirA, `${TEST_SESSION}.json`), "utf-8"))
+        const contentB = JSON.parse(await fs.readFile(join(dirB, `${TEST_SESSION}.json`), "utf-8"))
+        assert.equal(contentA.stats.totalPruneTokens, 10)
+        assert.equal(contentB.stats.totalPruneTokens, 20)
+    } finally {
+        await fs.rm(dirA, { recursive: true, force: true })
+        await fs.rm(dirB, { recursive: true, force: true })
+    }
+})
