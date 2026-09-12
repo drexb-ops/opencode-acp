@@ -3,6 +3,7 @@
     "description": "The fake model waits for a real ACP nudge, selects an advertised MICRO candidate instead of compressing the whole visible history, and verifies the resulting block and baseline.",
     "acpConfig": {
         "compress": {
+            "candidates": true,
             "minCompressRange": 500,
             "nudgeGrowthTokens": 1000,
             "minNudgeGrowthFloor": 1000,
