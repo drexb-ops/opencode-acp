@@ -36,3 +36,31 @@
   （shouldInjectThisTurn + lastPerMessageNudgeTokens 双断言，含 #207
   baseline 保留语义）、生产配置（preserveRecentMessages: 20）、完整
   growth cycle。
+
+## 评审修复（review follow-up, 2026-09-12）
+
+CI e2e 在 977643f 上失败：scenario 13 断言 `candidateSelected === true` 得 false。
+根因：`scripts/e2e/scenarios/13-adaptive-compression-candidates.json` 的 acpConfig
+未显式开启 `candidates`（开关默认 false）→ 无候选广播 → fake LLM 走 `resolveRange(refs,"all")`
+回退路径，candidateSelected 永不置位。scenarios 01–12 全绿（默认关行为端到端一致）。
+修复：该场景 JSON 增加 `"candidates": true`。
+
+系统提示泄漏候选文案：`lib/prompts/system.ts` / `lib/prompts/compress-range.ts`
+的模板此前无条件包含候选指导（acp_status 描述、COMPRESSION CANDIDATES 节、
+breakdown 段、compress 工具提示的 CANDIDATE GUIDANCE 段），与"默认 false =
+master 完全一致"的承诺不符（关闭时 acp_status 描述甚至与实际默认视图矛盾）。
+修复：两模板改为构建函数 `buildSystemPrompt(candidatesEnabled)` /
+`buildCompressRangePrompt(candidatesEnabled)`，OFF 分支使用 master 原文（程序化
+提取自 origin/master，非手抄），ON 分支与原 PR 输出字节一致（已验证）；
+`PromptStore` 构造器新增第 4 参 `candidatesEnabled`（默认 false），由 index.ts
+按 `config.compress.candidates === true` 传入；`SYSTEM` / `COMPRESS_RANGE`
+导出保留（= ON 变体），向后兼容。compress-range.ts 中 startId/endId 措辞改动
+（Bug 34 auto-swap 说明）保持无条件 —— 该能力不受开关控制。
+
+测试：`tests/prompts.test.ts` fixture 工厂加 `candidatesEnabled` 参数；既有
+range-mode compress prompt 测试显式开启；新增 2 测试（store 级开/关门控、
+`buildSystemPrompt(false)` master 文案回归）。
+
+验证：typecheck 0 错误；**1263/1263** 测试通过；build OK；prettier 通过；
+`buildSystemPrompt(true)` / `buildCompressRangePrompt(true)` 与开关提交前输出
+逐字节比对一致。

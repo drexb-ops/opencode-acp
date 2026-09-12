@@ -1,4 +1,16 @@
-export const COMPRESS_RANGE = `Collapse a range in the conversation into a detailed summary.
+const CANDIDATE_GUIDANCE_SECTION = `CANDIDATE GUIDANCE
+ACP may display a \`COMPRESSION CANDIDATES\` list in a nudge or \`acp_status\` report. A \`MICRO\` entry targets one large message or complete tool transaction; an \`EPISODE\` entry targets a contiguous historical segment. Displayed candidates are independent and non-overlapping, so they may be batched, but they are advisory: compress only entries whose content is no longer needed. When a nudge lists a clearly stale candidate, use its exact IDs and call \`compress\` before continuing. Keep current intent and active work visible, and use \`acp_status\` when the candidate list is stale.`
+
+/**
+ * Build the range-mode compress tool prompt.
+ *
+ * candidatesEnabled mirrors `compress.candidates`: false omits the CANDIDATE
+ * GUIDANCE section (behavior identical to pre-candidate master), true includes it.
+ */
+export function buildCompressRangePrompt(candidatesEnabled: boolean): string {
+    const candidateGuidanceBlock = candidatesEnabled ? `${CANDIDATE_GUIDANCE_SECTION}\n\n` : ""
+
+    return `Collapse a range in the conversation into a detailed summary.
 
 COMPRESSED BLOCK PLACEHOLDERS
 The system auto-detects any previously compressed blocks whose anchor messages fall inside your selected range. You do NOT need to manually list \`(bN)\` placeholders in your summary — every consumed block is tracked automatically.
@@ -45,10 +57,7 @@ compress({ content: [
 ]})
 \`\`\`
 
-CANDIDATE GUIDANCE
-ACP may display a \`COMPRESSION CANDIDATES\` list in a nudge or \`acp_status\` report. A \`MICRO\` entry targets one large message or complete tool transaction; an \`EPISODE\` entry targets a contiguous historical segment. Displayed candidates are independent and non-overlapping, so they may be batched, but they are advisory: compress only entries whose content is no longer needed. When a nudge lists a clearly stale candidate, use its exact IDs and call \`compress\` before continuing. Keep current intent and active work visible, and use \`acp_status\` when the candidate list is stale.
-
-KEEP AND REF MARKERS
+${candidateGuidanceBlock}KEEP AND REF MARKERS
 When writing a summary, you may embed markers that reference specific messages in the compressed range. The system resolves them automatically:
 
 - \`[[KEEP:mNNNNN]]\` — Expands to the original message content inline (truncated to a max length). Use for critical content you want preserved verbatim in the summary without re-typing it: key function definitions, important error messages, essential file contents.
@@ -65,3 +74,7 @@ The rest of the bash calls were repetitive export commands. See [[REF:m00078|tes
 
 Use KEEP sparingly — each expansion adds to the summary length. Prefer REF for content that is important but not immediately critical.
 `
+}
+
+/** Bundled range-mode compress prompt with candidate guidance enabled. */
+export const COMPRESS_RANGE = buildCompressRangePrompt(true)
