@@ -19,14 +19,14 @@ import { fetchSessionMessages } from "./search"
 import { hideConsumedCompressCalls } from "./hide-consumed"
 import { estimateSystemPromptTokens } from "../token-utils"
 
-const ACP_STATUS_TOOL_DESCRIPTION = `Show context status — overview includes compression candidates by default.
+const ACP_STATUS_TOOL_DESCRIPTION = `Show context status — overview includes compressible ranges (compression candidates when compress.candidates is enabled).
 
-No args: Overview with totals, compressed blocks, and compression candidates.
-scope:"uncompressed": Compression candidates only (default view:"candidates"). Use view:"ranges" for raw grouped ranges or view:"messages" for per-message listing.
+No args: Overview with totals, compressed blocks, and compressible ranges (or candidates when enabled).
+scope:"uncompressed": Compressible ranges by default (view:"candidates" when compress.candidates is enabled). Use view:"ranges" for raw grouped ranges or view:"messages" for per-message listing.
 scope:"compressed": Drill into compressed blocks — list each with full details (age, generation, consumed lineage).
 
 Use this tool to:
-- See what's consuming context + compression candidates in one call (no args)
+- See what's consuming context + compressible targets in one call (no args)
 - Focus on ranges only (scope:"uncompressed")
 - Find all messages of a specific tool type (scope:"uncompressed", view:"messages", tool:"bash")
 - Check block details before decompressing (scope:"compressed")`
@@ -350,7 +350,7 @@ function renderUncompressedRanges(rawMessages: WithParts[], ctx: StatusRenderCon
 
 function renderCompressionCandidates(rawMessages: WithParts[], ctx: StatusRenderContext): string[] {
     const lines: string[] = ["COMPRESSION CANDIDATES"]
-    if (!ctx.config?.compress) {
+    if (!ctx.config?.compress || ctx.config.compress.candidates !== true) {
         return renderUncompressedRanges(rawMessages, ctx)
     }
 
@@ -623,7 +623,7 @@ export function createAcpStatusTool(factoryCtx: ToolFactoryContext): ReturnType<
                 .string()
                 .optional()
                 .describe(
-                    'Display format for scope:"uncompressed": "candidates" (default, matches nudge output), "ranges" (raw grouped ranges), or "messages" (per-message listing with sort/filter)',
+                    'Display format for scope:"uncompressed": "candidates" (default when compress.candidates is enabled — otherwise "ranges"), "ranges" (raw grouped ranges), or "messages" (per-message listing with sort/filter)',
                 ),
             tool: tool.schema
                 .string()

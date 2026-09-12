@@ -1,6 +1,6 @@
 export const CONTEXT_LIMIT_NUDGE = `
 <system-reminder>
-⚠️ Context limit reached — time to compress completed work you no longer need. Prioritize stale tool outputs and resolved work. You can decompress specific blocks later if you need details. Keeping context lean helps you stay accurate.
+⚠️ Context limit reached — time to compress the largest ranges you no longer need. Prioritize completed tool outputs and resolved work. You can decompress specific blocks later if you need details. Keeping context lean helps you stay accurate.
 
 If mid-atomic-operation, finish that step first, then compress.
 
@@ -20,8 +20,21 @@ HOW TO CALL COMPRESS:
 - ONLY use IDs you can see in  tags in the messages ABOVE.
 - Do NOT copy IDs from this example. Do NOT invent IDs.
 - Do NOT use IDs from compressed block summaries — they are stale.
-- Prefer startId before endId in conversation order. ACP can normalize reversed boundaries, but do not rely on that behavior.
+- startId must appear BEFORE endId in the conversation.
 
+RANGE STRATEGY:
+- Prefer one large range over multiple small ones.
+- Compress OLDER resolved history first. Keep recent active work.
+</system-reminder>
+`
+
+/**
+ * Candidate-mode guidance appended to the context-limit nudge when
+ * `compress.candidates` is enabled. Describes the MICRO/EPISODE candidate
+ * list that replaces the raw range strategy above in that mode.
+ */
+export const CANDIDATE_GUIDANCE = `
+<system-reminder>
 COMPRESSION CANDIDATES:
 - MICRO identifies one large message or complete tool transaction.
 - EPISODE identifies a contiguous historical segment made from smaller units.

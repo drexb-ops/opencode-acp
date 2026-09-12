@@ -42,6 +42,7 @@ function buildConfig(overrides: Partial<PluginConfig> = {}): PluginConfig {
             permission: "allow",
             showCompression: false,
             summaryBuffer: true,
+            candidates: true,
             maxContextLimit: 150000,
             minContextLimit: 50000,
             nudgeFrequency: 5,

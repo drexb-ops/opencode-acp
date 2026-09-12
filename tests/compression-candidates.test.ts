@@ -33,6 +33,7 @@ function config(overrides: Partial<PluginConfig["compress"]> = {}): PluginConfig
             permission: "allow",
             showCompression: false,
             summaryBuffer: true,
+            candidates: true,
             maxContextLimit: 150000,
             minContextLimit: 50000,
             nudgeFrequency: 5,

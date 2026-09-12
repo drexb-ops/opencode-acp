@@ -48,6 +48,9 @@ import {
 } from "./utils"
 import type { ContextComposition, ContextRanges } from "./utils"
 import { buildCompressedBlockGuidance } from "../../prompts/extensions/nudge"
+import { CANDIDATE_GUIDANCE } from "../../prompts/context-limit-nudge"
+import { TURN_CANDIDATE_GUIDANCE } from "../../prompts/turn-nudge"
+import { ITERATION_CANDIDATE_GUIDANCE } from "../../prompts/iteration-nudge"
 import {
     COMPRESS_PHILOSOPHY,
     HOW_TO_COMPRESS_RULES,
@@ -328,7 +331,9 @@ export const injectCompressNudges = (
         overMinLimit,
         overMaxLimit,
         lastNudgeTokens: growthReference,
-        minNudgeContextPercent: resolveMinNudgeContextPercent(config, providerId, modelId) ?? DEFAULT_MIN_NUDGE_CONTEXT_PERCENT,
+        minNudgeContextPercent:
+            resolveMinNudgeContextPercent(config, providerId, modelId) ??
+            DEFAULT_MIN_NUDGE_CONTEXT_PERCENT,
         nudgeGrowthTokens: effectiveThreshold,
     })
 
@@ -360,7 +365,7 @@ export const injectCompressNudges = (
         config,
         modelContextLimit,
         providerId,
-        modelId
+        modelId,
     )
     const overMinNudgeFloor =
         minNudgeFloorTokens === undefined ||
@@ -440,9 +445,12 @@ export const injectCompressNudges = (
         omitted: [],
         truncatedCount: 0,
     }
+    // compress.candidates is opt-in (default off): when disabled the nudge
+    // pipeline behaves exactly like the pre-candidate range mode.
+    const candidatesEnabled = config.compress.candidates === true
     // Planning validates every candidate against range execution. Defer that
     // full-history work until this turn can actually emit a compression nudge.
-    if (nudgeAllowed) {
+    if (nudgeAllowed && candidatesEnabled) {
         try {
             candidatePlan = planCompressionCandidates(candidateMessages ?? messages, state, config)
         } catch (error) {
@@ -452,20 +460,26 @@ export const injectCompressNudges = (
             })
         }
     }
-    const candidateText =
-        formatCompressionCandidates(candidatePlan) ||
-        (candidateMessages === undefined && recommendedRanges.length > 0
-            ? formatCompressibleRanges(recommendedRanges, contextRanges.protected)
-            : "")
+    const candidateText = candidatesEnabled
+        ? formatCompressionCandidates(candidatePlan) ||
+          (candidateMessages === undefined && recommendedRanges.length > 0
+              ? formatCompressibleRanges(recommendedRanges, contextRanges.protected)
+              : "")
+        : recommendedRanges.length > 0
+          ? formatCompressibleRanges(recommendedRanges, contextRanges.protected)
+          : ""
 
     const allProtected =
         contextRanges.compressible.length === 0 && contextRanges.protected.length > 0
     const allInProtectedZone = protectedRefs.size > 0 && unprotectedCompressible.length === 0
     const allBelowMin = contextRanges.compressible.length > 0 && recommendedRanges.length === 0
     const noExecutableCandidates =
-        nudgeAllowed && candidateMessages !== undefined && candidatePlan.candidates.length === 0
+        candidatesEnabled &&
+        nudgeAllowed &&
+        candidateMessages !== undefined &&
+        candidatePlan.candidates.length === 0
     const nothingToCompress =
-        candidateMessages !== undefined
+        candidatesEnabled && candidateMessages !== undefined
             ? noExecutableCandidates
             : allProtected || allInProtectedZone || allBelowMin
     // Issue #216 residual: emergency + nothing-to-compress must not demand
@@ -488,18 +502,37 @@ export const injectCompressNudges = (
     // computed, injecting the full nudge text (with HOW_TO_COMPRESS rules) even
     // when the filter said "nothing to compress".
     if (shouldInjectNudge) {
+        const effectivePrompts: RuntimePrompts = candidatesEnabled
+            ? {
+                  ...prompts,
+                  contextLimitNudge: prompts.contextLimitNudge
+                      ? `${prompts.contextLimitNudge}\n\n${CANDIDATE_GUIDANCE}`
+                      : CANDIDATE_GUIDANCE,
+                  turnNudge: prompts.turnNudge
+                      ? `${prompts.turnNudge}\n\n${TURN_CANDIDATE_GUIDANCE}`
+                      : TURN_CANDIDATE_GUIDANCE,
+                  iterationNudge: prompts.iterationNudge
+                      ? `${prompts.iterationNudge}\n\n${ITERATION_CANDIDATE_GUIDANCE}`
+                      : ITERATION_CANDIDATE_GUIDANCE,
+              }
+            : prompts
         applyAnchoredNudges(
             state,
             config,
             messages,
-            prompts,
+            effectivePrompts,
             compressionPriorities,
             currentTokens,
             modelContextLimit,
             suffixMessage,
         )
 
-        if (suffixMessage && candidateText && effectiveTipsVariant !== "maxLimit") {
+        if (
+            candidatesEnabled &&
+            suffixMessage &&
+            candidateText &&
+            effectiveTipsVariant !== "maxLimit"
+        ) {
             const actionHint = hasPendingNudge
                 ? "\n\n⚠️ This compression nudge has already been shown without a compression. If candidates are clearly stale, call the `compress` tool for one clearly stale candidate before continuing. Do not compress active work or things needed to proceed well."
                 : "\n\n💡 If one listed candidate is clearly complete and no longer needed, call the `compress` tool in this reply before continuing. Do not compress active work or every candidate."
@@ -747,7 +780,9 @@ export const injectCompressNudges = (
 
             if (candidateText) {
                 breakdown += `\n\n${HOW_TO_COMPRESS_RULES}\n\n${candidateText}`
-                breakdown += `\n💡 You may batch selected independent candidates in one call (pass multiple content entries: \`content: [{...}, {...}]\`); omit any candidate whose content is still needed.`
+                breakdown += candidatesEnabled
+                    ? "\n💡 You may batch selected independent candidates in one call (pass multiple content entries: `content: [{...}, {...}]`); omit any candidate whose content is still needed."
+                    : "\n💡 Compress all ranges in one call (pass multiple content entries: `content: [{...}, {...}]`)."
             }
             breakdown += `\nUse \`acp_status({scope:"uncompressed"})\` to re-fetch compressible ranges after compressing, or \`acp_status\` for compressed block details.`
 
@@ -756,10 +791,13 @@ export const injectCompressNudges = (
 
         // maxLimit strong alert + lastNudgeShownTokens + block aging guidance
         if (effectiveTipsVariant === "maxLimit" && !emergencyNoTargets) {
-            tipsText =
-                "\n\n⚠️ Context limit reached — compress now. Select at least one listed candidate whose content is no longer needed and call the `compress` tool in your next reply. Do not merely recommend compression. Candidates are advisory about selection: preserve current intent and active work, and never compress content still needed for the current task.\n\n" +
-                HOW_TO_COMPRESS_RULES +
-                '\n\n{ "topic": "...", "content": [{ "startId": "<ID>", "endId": "<ID>", "summary": "..." }] }\n\nOnly use IDs from visible messages above. If several selected candidates are stale, older work may be preferable; never override semantic judgment or compress content still needed for the current task.'
+            tipsText = candidatesEnabled
+                ? "\n\n⚠️ Context limit reached — compress now. Select at least one listed candidate whose content is no longer needed and call the `compress` tool in your next reply. Do not merely recommend compression. Candidates are advisory about selection: preserve current intent and active work, and never compress content still needed for the current task.\n\n" +
+                  HOW_TO_COMPRESS_RULES +
+                  '\n\n{ "topic": "...", "content": [{ "startId": "<ID>", "endId": "<ID>", "summary": "..." }] }\n\nOnly use IDs from visible messages above. If several selected candidates are stale, older work may be preferable; never override semantic judgment or compress content still needed for the current task.'
+                : "\n\n⚠️ Context limit reached — compress now. Prioritize consumed tool outputs.\n\n" +
+                  HOW_TO_COMPRESS_RULES +
+                  '\n\n{ "topic": "...", "content": [{ "startId": "<ID>", "endId": "<ID>", "summary": "..." }] }\n\nOnly use IDs from visible messages above. Compress older work first.'
         } else if (shouldInjectNotice) {
             const emergencyPct =
                 currentTokens !== undefined &&
