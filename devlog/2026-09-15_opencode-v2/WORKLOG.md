@@ -3,14 +3,14 @@
 - Task ID: `2026-09-15_opencode-v2`
 - Home Repo: `opencode-acp`
 - Status: InProgress
-- Updated: 2026-09-15 21:47 UTC
+- Updated: 2026-09-15 22:32 UTC
 
 ## 1. Summary
 
 - **What was done**: Investigated the production plugin failure, mapped ACP's V1
   host dependencies, verified the exact published OpenCode 2.0.3 plugin API,
-  recorded the approved V1/V2 compatibility design, and implemented Phase 2's
-  host-neutral services and shared tool contracts.
+  recorded the approved V1/V2 compatibility design, and implemented the shared
+  host/tool contracts plus Phase 3 state serialization and transactions.
 - **Why**: ACP currently fails before initialization on OpenCode V2 because its
   default export and all host integrations use the V1 plugin API.
 - **Behavior / compatibility changes**: No intentional V1 behavior changes;
@@ -27,7 +27,8 @@
 | `3c00b9a`   | Refine concurrency boundaries and add the implementation plan |
 | `b42d827`   | Record the integrated pre-change verification baseline        |
 | `b569ccd`   | Add the dual V1/V2 entrypoint and dependency foundation       |
-| This commit | Add shared host services and host-neutral tool definitions    |
+| `5d21e10`   | Add shared host services and host-neutral tool definitions    |
+| This commit | Serialize session mutations and stage transform effects       |
 
 ### Phase 1
 
@@ -156,3 +157,23 @@
 - Follow `docs/superpowers/plans/2026-09-15-opencode-v2-implementation.md`.
 - Obtain at least two independent agent reviews for all changed source/tests.
 - Run packed-artifact V1 and V2 E2E verification before PR readiness.
+
+## 7. Phase 3 — Session serialization and transform transactions
+
+- Added per-session initialization coordination and FIFO guarded work. Registry
+  reads hide initializing entries, guarded work protects sessions from eviction,
+  and different session queues remain independent.
+- Added complete runtime clone/commit helpers for `SessionState`, preserving the
+  registry-wide `compressionTiming` object identity.
+- Extracted the state-explicit `runMessageTransform` pipeline. V1 now transforms
+  a cloned working state/message copy, commits only after success, and runs one
+  deferred persistence/effect phase afterward. Nudge and per-turn persistence
+  requests are staged during speculative work.
+- Routed all five shared ACP tools, system/message/command state work, and event
+  timing attachment through the same per-session guard where a session ID is
+  available.
+- **PASS**: `npm test` — 1,301/1,301; `npm run typecheck`; `npm run build`;
+  targeted transform, registry, rollback, nudge, and tool tests.
+- **DEFERRED to Phase 9**: Docker installed-artifact E2E coverage for the
+  nudge-triggered compression path, nudge-state verification, and multi-turn
+  growth accumulation. This follow-up is recorded, not claimed complete here.

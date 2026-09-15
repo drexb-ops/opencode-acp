@@ -33,6 +33,11 @@ export interface ToolFactoryContext {
 /** The only registry operation needed while resolving a tool call. */
 export interface ToolStateRegistry {
     get(sessionID: string): SessionState | undefined
+    /** Real registries serialize the complete tool execution per session. */
+    withSessionMutation?<T>(
+        sessionID: string,
+        operation: (state: SessionState) => Promise<T> | T,
+    ): Promise<T>
 }
 
 export interface ToolAskInput {
@@ -94,9 +99,13 @@ export function resolveToolHost(ctx: ToolContext): HostServices {
 // [FIX #33] Resolve the caller's per-session state at tool-call time and build a
 // ToolContext bound to it. A compress tool can only run after messages.transform
 // initialized the session, so the state is guaranteed present.
-export function resolveToolContext(factoryCtx: ToolFactoryContext, sessionID: string): ToolContext {
+export function resolveToolContext(
+    factoryCtx: ToolFactoryContext,
+    sessionID: string,
+    stateOverride?: SessionState,
+): ToolContext {
     const host = resolveFactoryHost(factoryCtx)
-    const state = factoryCtx.registry.get(sessionID)
+    const state = stateOverride ?? factoryCtx.registry.get(sessionID)
     if (!state) {
         throw new Error(
             `ACP: session ${sessionID} has no initialized state. ` +
@@ -114,6 +123,26 @@ export function resolveToolContext(factoryCtx: ToolFactoryContext, sessionID: st
         config: factoryCtx.config,
         prompts: factoryCtx.prompts,
     }
+}
+
+/**
+ * Run one complete tool execution under the registry's session guard.
+ *
+ * The fallback keeps small isolated unit-test registries source-compatible;
+ * production registries always provide withSessionMutation and therefore wait
+ * for initialization before resolving a state.
+ */
+export async function withToolSessionMutation<T>(
+    factoryCtx: ToolFactoryContext,
+    toolCtx: ToolExecutionContext,
+    operation: (ctx: ToolContext) => Promise<T> | T,
+): Promise<T> {
+    const run = (state: SessionState) =>
+        operation(resolveToolContext(factoryCtx, toolCtx.sessionID, state))
+    if (factoryCtx.registry.withSessionMutation) {
+        return factoryCtx.registry.withSessionMutation(toolCtx.sessionID, run)
+    }
+    return run(resolveToolContext(factoryCtx, toolCtx.sessionID).state)
 }
 
 export interface CompressRangeEntry {

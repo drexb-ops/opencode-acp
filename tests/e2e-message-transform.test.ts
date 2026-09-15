@@ -18,9 +18,16 @@ import test, { beforeEach } from "node:test"
 import type { PluginConfig } from "../lib/config"
 import { createChatMessageTransformHandler } from "../lib/hooks"
 import { Logger } from "../lib/logger"
-import { createSessionState, saveSessionState, type WithParts, type SessionState } from "../lib/state"
+import {
+    cloneSessionState,
+    createSessionState,
+    saveSessionState,
+    SessionStateRegistry,
+    type WithParts,
+    type SessionState,
+} from "../lib/state"
 import { isSyntheticMessage } from "../lib/messages/query"
-import { mkdtempSync, rmSync } from "node:fs"
+import { mkdtempSync, readFileSync, rmSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { createTestRegistry } from "./registry-stub"
@@ -165,7 +172,10 @@ function createMockPrompts() {
     }
 }
 
-function setupPipeline(stateOverrides: Partial<SessionState> = {}, configOverrides: Partial<PluginConfig> = {}) {
+function setupPipeline(
+    stateOverrides: Partial<SessionState> = {},
+    configOverrides: Partial<PluginConfig> = {},
+) {
     const tempDir = mkdtempSync(join(tmpdir(), "acp-e2e-"))
     process.env.XDG_DATA_HOME = tempDir
     process.env.XDG_CONFIG_HOME = tempDir
@@ -235,10 +245,7 @@ test("message IDs remain stable across sequential pipeline calls", async () => {
 
     // First call with 2 messages
     const output1 = {
-        messages: [
-            makeUserMessage("u1", "Hello"),
-            makeAssistantMessage("a1", "Hi"),
-        ],
+        messages: [makeUserMessage("u1", "Hello"), makeAssistantMessage("a1", "Hi")],
     }
     await handler({}, output1)
 
@@ -329,7 +336,7 @@ test("filterMessagesInPlace: removes messages without valid info", async () => {
 
     const output = {
         messages: [
-            { role: "user", parts: [{ type: "text", text: "no info" }] },  // no .info → filtered
+            { role: "user", parts: [{ type: "text", text: "no info" }] }, // no .info → filtered
             makeUserMessage("u1", "Valid"),
             makeAssistantMessage("a1", "Response"),
         ] as WithParts[],
@@ -384,7 +391,7 @@ test("compression blocks: compressed messages are replaced with summaries", asyn
         batchTopic: "test topic",
         startId: "m00001",
         endId: "m00002",
-        anchorMessageId: "u2",  // summary injected at this anchor
+        anchorMessageId: "u2", // summary injected at this anchor
         compressMessageId: "msg-compress",
         compressCallId: "call-compress",
         includedBlockIds: [],
@@ -427,17 +434,17 @@ test("compression blocks: compressed messages are replaced with summaries", asyn
 
     const remainingIds = output.messages.map((m: any) => m.info.id)
 
-    assert.ok(remainingIds.includes("u1"), "u1 (first user) is force-preserved even when compressed")
+    assert.ok(
+        remainingIds.includes("u1"),
+        "u1 (first user) is force-preserved even when compressed",
+    )
     assert.ok(!remainingIds.includes("a1"), "a1 should be pruned")
 
     assert.ok(remainingIds.includes("u2"), "u2 should survive")
     assert.ok(remainingIds.includes("a2"), "a2 should survive")
 
-    const hasRecap = output.messages.some(
-        (m: any) =>
-            m.parts.some(
-                (p: any) => p.type === "tool" && p.tool === "acp_context_recap",
-            ),
+    const hasRecap = output.messages.some((m: any) =>
+        m.parts.some((p: any) => p.type === "tool" && p.tool === "acp_context_recap"),
     )
     assert.ok(!hasRecap, "no synthetic recap should be injected (compress-as-anchor)")
 
@@ -451,10 +458,7 @@ test("compression blocks: compressed messages are replaced with summaries", asyn
         !u2Text.includes("Previous conversation about greetings"),
         "summary should NOT be merged into u2 text",
     )
-    assert.ok(
-        u2Text.includes("How are you?"),
-        "u2's original text should be preserved unchanged",
-    )
+    assert.ok(u2Text.includes("How are you?"), "u2's original text should be preserved unchanged")
 })
 
 // ─── Test: Regression — no consecutive user messages after compression ──────
@@ -547,14 +551,14 @@ test("compression summary: never produces two consecutive user turns (Bug 36)", 
         .filter((p) => p.type === "text")
         .map((p) => (p as any).text)
         .join("")
-    assert.ok(!u2Text.includes("The assistant explained the plan"), "summary should NOT be merged into u2")
+    assert.ok(
+        !u2Text.includes("The assistant explained the plan"),
+        "summary should NOT be merged into u2",
+    )
     assert.ok(u2Text.includes("Sounds good, continue."), "u2 original text preserved")
 
-    const hasRecap = historical.some(
-        (m: any) =>
-            m.parts.some(
-                (p: any) => p.type === "tool" && p.tool === "acp_context_recap",
-            ),
+    const hasRecap = historical.some((m: any) =>
+        m.parts.some((p: any) => p.type === "tool" && p.tool === "acp_context_recap"),
     )
     assert.ok(!hasRecap, "no synthetic recap should be injected (compress-as-anchor)")
 })
@@ -621,11 +625,8 @@ test("compression summary: emits standalone summary when range is last (no user 
     assert.ok(!remainingIds.includes("u2"), "u2 (covered by block) should be pruned")
     assert.ok(!remainingIds.includes("a2"), "a2 (covered by block) should be pruned")
 
-    const hasRecap = output.messages.some(
-        (m: any) =>
-            m.parts.some(
-                (p: any) => p.type === "tool" && p.tool === "acp_context_recap",
-            ),
+    const hasRecap = output.messages.some((m: any) =>
+        m.parts.some((p: any) => p.type === "tool" && p.tool === "acp_context_recap"),
     )
     assert.ok(!hasRecap, "no synthetic recap should be injected (compress-as-anchor)")
 
@@ -680,10 +681,14 @@ test("message IDs remain consistent after compression and pruning", async () => 
     state.prune.messages.activeBlockIds.add(blockId)
     state.prune.messages.activeByAnchorMessageId.set("u3", blockId)
     state.prune.messages.byMessageId.set("u1", {
-        tokenCount: 200, allBlockIds: [blockId], activeBlockIds: [blockId],
+        tokenCount: 200,
+        allBlockIds: [blockId],
+        activeBlockIds: [blockId],
     })
     state.prune.messages.byMessageId.set("a1", {
-        tokenCount: 300, allBlockIds: [blockId], activeBlockIds: [blockId],
+        tokenCount: 300,
+        allBlockIds: [blockId],
+        activeBlockIds: [blockId],
     })
 
     const output = {
@@ -854,12 +859,15 @@ test("summary and compaction agent requests are skipped", async () => {
     const { state, handler } = setupPipeline()
 
     // Seed normal conversation state
-    await handler({}, {
-        messages: [
-            makeUserMessage("seed-u1", "Hello", SID, "build"),
-            makeAssistantMessage("seed-a1", "Hi"),
-        ],
-    })
+    await handler(
+        {},
+        {
+            messages: [
+                makeUserMessage("seed-u1", "Hello", SID, "build"),
+                makeAssistantMessage("seed-a1", "Hi"),
+            ],
+        },
+    )
 
     const nextRefBefore = state.messageIds.nextRef
 
@@ -907,10 +915,7 @@ test("normal agent request (build) is still fully processed", async () => {
     assert.ok(state.messageIds.byRawId.has("u1"), "build: u1 should get a ref")
     assert.ok(state.messageIds.byRawId.has("a1"), "build: a1 should get a ref")
     assert.ok(state.messageIds.nextRef >= 3, "build: nextRef should advance")
-    assert.ok(
-        messages.length >= 2,
-        "build: messages should be processed (suffix may be appended)",
-    )
+    assert.ok(messages.length >= 2, "build: messages should be processed (suffix may be appended)")
 })
 
 // ─── Test: compress.reasoning drop pass (#368) ─────────────────────────────
@@ -980,27 +985,43 @@ test("reasoning drop: drop:false kill-switch keeps oversized reasoning", async (
 
 test("reasoning drop: small thinking survives the threshold gate; threshold 0 drops it", async () => {
     // Default threshold 2048 → small thinking kept.
-    const kept = { messages: [
-        makeUserMessage("u1", "Hello"),
-        makeAssistantMessage("a1", "summary", [smallReasoningPart("r1"), compressToolPart("t1")]),
-        makeUserMessage("u2", "next round"),
-    ] }
+    const kept = {
+        messages: [
+            makeUserMessage("u1", "Hello"),
+            makeAssistantMessage("a1", "summary", [
+                smallReasoningPart("r1"),
+                compressToolPart("t1"),
+            ]),
+            makeUserMessage("u2", "next round"),
+        ],
+    }
     await setupPipeline().handler({}, kept)
     const keptA1 = kept.messages.find((m) => m.info.id === "a1")!
-    assert.deepEqual(keptA1.parts.map((p) => p.type), ["text", "reasoning", "tool"])
+    assert.deepEqual(
+        keptA1.parts.map((p) => p.type),
+        ["text", "reasoning", "tool"],
+    )
 
     // threshold 0 → unconditional drop.
-    const dropped = { messages: [
-        makeUserMessage("u1", "Hello"),
-        makeAssistantMessage("a1", "summary", [smallReasoningPart("r1"), compressToolPart("t1")]),
-        makeUserMessage("u2", "next round"),
-    ] }
+    const dropped = {
+        messages: [
+            makeUserMessage("u1", "Hello"),
+            makeAssistantMessage("a1", "summary", [
+                smallReasoningPart("r1"),
+                compressToolPart("t1"),
+            ]),
+            makeUserMessage("u2", "next round"),
+        ],
+    }
     await setupPipeline(
         {},
         { compress: { ...buildConfig().compress, reasoning: { drop: true, threshold: 0 } } },
     ).handler({}, dropped)
     const droppedA1 = dropped.messages.find((m) => m.info.id === "a1")!
-    assert.deepEqual(droppedA1.parts.map((p) => p.type), ["text", "tool"])
+    assert.deepEqual(
+        droppedA1.parts.map((p) => p.type),
+        ["text", "tool"],
+    )
 })
 
 test("reasoning drop: provider-level drop:false disables for matching provider", async () => {
@@ -1015,11 +1036,13 @@ test("reasoning drop: provider-level drop:false disables for matching provider",
         },
     )
 
-    const output = { messages: [
-        makeUserMessage("u1", "Hello"),
-        makeAssistantMessage("a1", "summary", [bigReasoningPart("r1"), compressToolPart("t1")]),
-        makeUserMessage("u2", "next round"),
-    ] }
+    const output = {
+        messages: [
+            makeUserMessage("u1", "Hello"),
+            makeAssistantMessage("a1", "summary", [bigReasoningPart("r1"), compressToolPart("t1")]),
+            makeUserMessage("u2", "next round"),
+        ],
+    }
 
     await handler({}, output)
 
@@ -1042,11 +1065,13 @@ test("reasoning drop: provider keyed for another id does not disable the drop", 
         },
     )
 
-    const output = { messages: [
-        makeUserMessage("u1", "Hello"),
-        makeAssistantMessage("a1", "summary", [bigReasoningPart("r1"), compressToolPart("t1")]),
-        makeUserMessage("u2", "next round"),
-    ] }
+    const output = {
+        messages: [
+            makeUserMessage("u1", "Hello"),
+            makeAssistantMessage("a1", "summary", [bigReasoningPart("r1"), compressToolPart("t1")]),
+            makeUserMessage("u2", "next round"),
+        ],
+    }
 
     await handler({}, output)
 
@@ -1074,11 +1099,13 @@ test("reasoning drop: model-level override beats provider-level", async () => {
         },
     )
 
-    const output = { messages: [
-        makeUserMessage("u1", "Hello"),
-        makeAssistantMessage("a1", "summary", [bigReasoningPart("r1"), compressToolPart("t1")]),
-        makeUserMessage("u2", "next round"),
-    ] }
+    const output = {
+        messages: [
+            makeUserMessage("u1", "Hello"),
+            makeAssistantMessage("a1", "summary", [bigReasoningPart("r1"), compressToolPart("t1")]),
+            makeUserMessage("u2", "next round"),
+        ],
+    }
 
     await handler({}, output)
 
@@ -1093,12 +1120,17 @@ test("reasoning drop: model-level override beats provider-level", async () => {
 test("reasoning drop: active round reasoning is never touched", async () => {
     const { handler } = setupPipeline()
 
-    const output = { messages: [
-        makeUserMessage("u1", "Hello"),
-        makeAssistantMessage("a1", "old round", [bigReasoningPart("r1"), compressToolPart("t1")]),
-        makeUserMessage("u2", "current round"),
-        makeAssistantMessage("a2", "active", [bigReasoningPart("r2"), compressToolPart("t2")]),
-    ] }
+    const output = {
+        messages: [
+            makeUserMessage("u1", "Hello"),
+            makeAssistantMessage("a1", "old round", [
+                bigReasoningPart("r1"),
+                compressToolPart("t1"),
+            ]),
+            makeUserMessage("u2", "current round"),
+            makeAssistantMessage("a2", "active", [bigReasoningPart("r2"), compressToolPart("t2")]),
+        ],
+    }
 
     await handler({}, output)
 
@@ -1114,4 +1146,129 @@ test("reasoning drop: active round reasoning is never touched", async () => {
         ["text", "reasoning", "tool"],
         "active round untouched (text + reasoning + tool)",
     )
+})
+
+test("failed transform rolls back state and defers persistence/debug effects", async () => {
+    const { state, logger, handler, tempDir } = setupPipeline(
+        { modelContextLimit: 150000 },
+        { debug: true },
+    )
+    const beforeState = cloneSessionState(state)
+    await saveSessionState(state, logger)
+    const statePath = join(tempDir, "opencode/storage/plugin/acp", `${SID}.json`)
+    const persistedBefore = readFileSync(statePath, "utf8")
+    let saveContextCalls = 0
+    const originalSaveContext = logger.saveContext.bind(logger)
+    logger.saveContext = async (...args: Parameters<typeof logger.saveContext>) => {
+        saveContextCalls++
+        return originalSaveContext(...args)
+    }
+    const originalInfo = logger.info.bind(logger)
+    logger.info = (message, metadata) => {
+        if (message === "Chat transform complete") {
+            throw new Error("synthetic transform failure")
+        }
+        originalInfo(message, metadata)
+    }
+
+    const output = {
+        messages: [
+            makeUserMessage("u1", "Hello"),
+            makeAssistantMessage("a1", "response", [makeToolPart("tool-1", "output")]),
+            makeUserMessage("u2", "Continue"),
+        ],
+    }
+    const messagesBefore = structuredClone(output.messages)
+
+    await assert.rejects(handler({}, output), /synthetic transform failure/)
+
+    const afterState = cloneSessionState(state)
+    assert.deepEqual(afterState.prune, beforeState.prune)
+    assert.deepEqual(afterState.nudges, beforeState.nudges)
+    assert.deepEqual(afterState.stats, beforeState.stats)
+    assert.deepEqual(afterState.toolParameters, beforeState.toolParameters)
+    assert.deepEqual(afterState.toolIdList, beforeState.toolIdList)
+    assert.deepEqual(afterState.messageIds, beforeState.messageIds)
+    assert.equal(afterState.modelContextLimit, beforeState.modelContextLimit)
+    assert.equal(afterState.modelProviderID, beforeState.modelProviderID)
+    assert.equal(afterState.modelID, beforeState.modelID)
+    assert.equal(afterState.noContextLimitWarned, beforeState.noContextLimitWarned)
+    assert.deepEqual(output.messages, messagesBefore)
+    assert.equal(saveContextCalls, 0)
+    assert.equal(readFileSync(statePath, "utf8"), persistedBefore)
+    rmSync(tempDir, { recursive: true, force: true })
+})
+
+test("model hydration cannot open an eviction window before guarded transform work", async () => {
+    const previousDataHome = process.env.XDG_DATA_HOME
+    const previousConfigHome = process.env.XDG_CONFIG_HOME
+    const tempDir = mkdtempSync(join(tmpdir(), "acp-eviction-window-"))
+    process.env.XDG_DATA_HOME = tempDir
+    process.env.XDG_CONFIG_HOME = tempDir
+
+    let releaseCatalog!: () => void
+    const catalogGate = new Promise<void>((resolve) => {
+        releaseCatalog = resolve
+    })
+    let catalogStarted!: () => void
+    const catalogStartedPromise = new Promise<void>((resolve) => {
+        catalogStarted = resolve
+    })
+    const client = {
+        session: {
+            get: async () => ({ data: { parentID: null } }),
+        },
+        config: {
+            providers: async () => {
+                catalogStarted()
+                await catalogGate
+                return {
+                    providers: [
+                        {
+                            id: "test-provider",
+                            models: { "test-model": { limit: { context: 262_144 } } },
+                        },
+                    ],
+                }
+            },
+        },
+    }
+    const registry = new SessionStateRegistry(new Logger(false))
+    const handler = createChatMessageTransformHandler(
+        client,
+        registry,
+        new Logger(false),
+        buildConfig(),
+        createMockPrompts(),
+        { global: undefined, agents: {} },
+    )
+    const targetSession = "hydration-eviction-target"
+    const output = {
+        messages: [
+            makeUserMessage("target-user", "Hello", targetSession),
+            makeAssistantMessage("target-assistant", "Response", [], targetSession),
+        ],
+    }
+
+    try {
+        const transform = handler({}, output)
+        await catalogStartedPromise
+
+        for (let index = 0; index < 32; index++) {
+            await registry.getOrCreate(client, `hydration-window-${index}`, [])
+        }
+
+        releaseCatalog()
+        await transform
+
+        const targetState = registry.get(targetSession)
+        assert.ok(targetState, "target state must remain registered for guarded work")
+        assert.equal(targetState.modelContextLimit, 262_144)
+    } finally {
+        if (previousDataHome === undefined) delete process.env.XDG_DATA_HOME
+        else process.env.XDG_DATA_HOME = previousDataHome
+        if (previousConfigHome === undefined) delete process.env.XDG_CONFIG_HOME
+        else process.env.XDG_CONFIG_HOME = previousConfigHome
+        rmSync(tempDir, { recursive: true, force: true })
+    }
 })

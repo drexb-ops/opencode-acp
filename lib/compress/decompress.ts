@@ -4,7 +4,7 @@ import {
     type ToolContext,
     type ToolExecutionContext,
     type ToolFactoryContext,
-    resolveToolContext,
+    withToolSessionMutation,
 } from "./types"
 import { createV1Tool, type V1Tool } from "../v1/tools"
 import type { CompressionTarget } from "../commands/compression-targets"
@@ -287,139 +287,144 @@ export function createDecompressToolDefinition(
         schema: decompressInputSchema,
         inputSchema: decompressInputSchema,
         async execute(args, toolCtx: ToolExecutionContext) {
-            const ctx = resolveToolContext(factoryCtx, toolCtx.sessionID)
-            const { rawMessages } = await prepareDecompressSession(ctx, toolCtx)
+            return withToolSessionMutation(factoryCtx, toolCtx, async (ctx) => {
+                const { rawMessages } = await prepareDecompressSession(ctx, toolCtx)
 
-            const effectiveLimitBefore = resolveEffectiveContextLimit(ctx.state, ctx.config)
-            const contextUsageBefore = effectiveLimitBefore
-                ? Math.round(
-                      (getCurrentTokenUsage(ctx.state, rawMessages) / effectiveLimitBefore.limit) *
-                          100,
-                  )
-                : undefined
+                const effectiveLimitBefore = resolveEffectiveContextLimit(ctx.state, ctx.config)
+                const contextUsageBefore = effectiveLimitBefore
+                    ? Math.round(
+                          (getCurrentTokenUsage(ctx.state, rawMessages) /
+                              effectiveLimitBefore.limit) *
+                              100,
+                      )
+                    : undefined
 
-            const resolved = resolveTargets({ ...args }, ctx.state, rawMessages, ctx.logger)
-            if (!resolved.ok) {
-                return resolved.error
-            }
-            const targets = resolved.targets
+                const resolved = resolveTargets({ ...args }, ctx.state, rawMessages, ctx.logger)
+                if (!resolved.ok) {
+                    return resolved.error
+                }
+                const targets = resolved.targets
 
-            const messagesState = ctx.state.prune.messages
-            const activeBlocks: CompressionBlock[] = []
-            for (const target of targets) {
-                for (const block of target.blocks) {
-                    if (block.active) {
-                        activeBlocks.push(block)
+                const messagesState = ctx.state.prune.messages
+                const activeBlocks: CompressionBlock[] = []
+                for (const target of targets) {
+                    for (const block of target.blocks) {
+                        if (block.active) {
+                            activeBlocks.push(block)
+                        }
                     }
                 }
-            }
 
-            if (args.toFile) {
-                const targetPath = args.toFile
-                const os = await import("os")
-                const path = await import("path")
-                const allowedDirs = [
-                    os.tmpdir() + "/",
-                    path.join(os.homedir(), ".cache", "opencode") + "/",
-                ]
-                const resolvedPath = path.resolve(targetPath)
-                const isAllowed = allowedDirs.some((dir) => {
-                    const rel = path.relative(dir, resolvedPath)
-                    return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel))
-                })
-                if (!isAllowed) {
-                    return `Error: toFile path must be under ${os.tmpdir()} or ~/.cache/opencode/. Got: ${targetPath}`
-                }
-
-                const msgIdSet = new Set<string>()
-                for (const block of activeBlocks) {
-                    for (const id of block.effectiveMessageIds ?? []) {
-                        msgIdSet.add(id)
+                if (args.toFile) {
+                    const targetPath = args.toFile
+                    const os = await import("os")
+                    const path = await import("path")
+                    const allowedDirs = [
+                        os.tmpdir() + "/",
+                        path.join(os.homedir(), ".cache", "opencode") + "/",
+                    ]
+                    const resolvedPath = path.resolve(targetPath)
+                    const isAllowed = allowedDirs.some((dir) => {
+                        const rel = path.relative(dir, resolvedPath)
+                        return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel))
+                    })
+                    if (!isAllowed) {
+                        return `Error: toFile path must be under ${os.tmpdir()} or ~/.cache/opencode/. Got: ${targetPath}`
                     }
+
+                    const msgIdSet = new Set<string>()
+                    for (const block of activeBlocks) {
+                        for (const id of block.effectiveMessageIds ?? []) {
+                            msgIdSet.add(id)
+                        }
+                    }
+                    const blockMessages = rawMessages.filter((m) =>
+                        msgIdSet.has(extractMessageId(m)),
+                    )
+                    const lines = blockMessages.map(extractMessageText)
+                    const { writeFile } = await import("fs/promises")
+                    const fileContent =
+                        lines.length > 0
+                            ? lines.join("\n\n---\n\n")
+                            : (targets[0]?.blocks[0]?.summary ?? "(no content available)")
+                    await writeFile(targetPath, fileContent, "utf-8")
+
+                    const displayIds = targets.map((t) => `b${t.displayId}`).join(", ")
+                    return `Block(s) ${displayIds} content (${blockMessages.length} messages, ${fileContent.length} chars) written to ${targetPath}. Block(s) stay compressed — context unchanged. Use read tool to access specific parts.`
                 }
-                const blockMessages = rawMessages.filter((m) => msgIdSet.has(extractMessageId(m)))
-                const lines = blockMessages.map(extractMessageText)
-                const { writeFile } = await import("fs/promises")
-                const fileContent =
-                    lines.length > 0
-                        ? lines.join("\n\n---\n\n")
-                        : (targets[0]?.blocks[0]?.summary ?? "(no content available)")
-                await writeFile(targetPath, fileContent, "utf-8")
+
+                const activeMessagesBefore = snapshotActiveMessages(messagesState)
+                const activeBlockIdsBefore = new Set(messagesState.activeBlockIds)
+
+                for (const target of targets) {
+                    deactivateCompressionTarget(messagesState, target, { full: args.full === true })
+                }
+
+                syncCompressionBlocks(ctx.state, ctx.logger, rawMessages)
+
+                const { restoredMessageCount, restoredTokens } = computeRestoredMessages(
+                    messagesState,
+                    activeMessagesBefore,
+                )
+                const reactivatedBlockIds = computeReactivatedBlockIds(
+                    messagesState,
+                    activeBlockIdsBefore,
+                )
+
+                ctx.state.stats.totalPruneTokens = Math.max(
+                    0,
+                    ctx.state.stats.totalPruneTokens - restoredTokens,
+                )
+
+                const effectiveLimitAfter = resolveEffectiveContextLimit(ctx.state, ctx.config)
+                const contextUsageAfter = effectiveLimitAfter
+                    ? Math.round(
+                          (getCurrentTokenUsage(ctx.state, rawMessages) /
+                              effectiveLimitAfter.limit) *
+                              100,
+                      )
+                    : undefined
+
+                await finalizeDecompressSession(ctx)
+
+                const restoredContentPreview = buildRestoredContentPreview(
+                    rawMessages,
+                    activeMessagesBefore,
+                    messagesState,
+                )
 
                 const displayIds = targets.map((t) => `b${t.displayId}`).join(", ")
-                return `Block(s) ${displayIds} content (${blockMessages.length} messages, ${fileContent.length} chars) written to ${targetPath}. Block(s) stay compressed — context unchanged. Use read tool to access specific parts.`
-            }
+                const lines: string[] = []
+                const headerNoun = targets.length === 1 ? "block" : "blocks"
+                lines.push(
+                    `Decompressed ${headerNoun} ${displayIds}. Restored ${restoredMessageCount} message(s) (~${formatTokenCount(restoredTokens)}).`,
+                )
 
-            const activeMessagesBefore = snapshotActiveMessages(messagesState)
-            const activeBlockIdsBefore = new Set(messagesState.activeBlockIds)
+                if (contextUsageBefore !== undefined && contextUsageAfter !== undefined) {
+                    lines.push(`Context usage: ${contextUsageBefore}% → ${contextUsageAfter}%.`)
+                }
 
-            for (const target of targets) {
-                deactivateCompressionTarget(messagesState, target, { full: args.full === true })
-            }
+                if (reactivatedBlockIds.length > 0) {
+                    const refs = reactivatedBlockIds.map((id) => `b${id}`).join(", ")
+                    lines.push(`Also restored nested block(s): ${refs}.`)
+                }
 
-            syncCompressionBlocks(ctx.state, ctx.logger, rawMessages)
+                if (restoredContentPreview) {
+                    lines.push("")
+                    lines.push("RESTORED CONTENT (condensed):")
+                    lines.push(restoredContentPreview)
+                }
 
-            const { restoredMessageCount, restoredTokens } = computeRestoredMessages(
-                messagesState,
-                activeMessagesBefore,
-            )
-            const reactivatedBlockIds = computeReactivatedBlockIds(
-                messagesState,
-                activeBlockIdsBefore,
-            )
+                ctx.logger.info("Decompress tool completed", {
+                    mode: typeof args.startId === "string" ? "range" : "block",
+                    targetBlockIds: targets.map((t) => t.displayId),
+                    restoredMessageCount,
+                    restoredTokens,
+                    reactivatedBlockIds,
+                })
 
-            ctx.state.stats.totalPruneTokens = Math.max(
-                0,
-                ctx.state.stats.totalPruneTokens - restoredTokens,
-            )
-
-            const effectiveLimitAfter = resolveEffectiveContextLimit(ctx.state, ctx.config)
-            const contextUsageAfter = effectiveLimitAfter
-                ? Math.round(
-                      (getCurrentTokenUsage(ctx.state, rawMessages) / effectiveLimitAfter.limit) *
-                          100,
-                  )
-                : undefined
-
-            await finalizeDecompressSession(ctx)
-
-            const restoredContentPreview = buildRestoredContentPreview(
-                rawMessages,
-                activeMessagesBefore,
-                messagesState,
-            )
-
-            const displayIds = targets.map((t) => `b${t.displayId}`).join(", ")
-            const lines: string[] = []
-            const headerNoun = targets.length === 1 ? "block" : "blocks"
-            lines.push(
-                `Decompressed ${headerNoun} ${displayIds}. Restored ${restoredMessageCount} message(s) (~${formatTokenCount(restoredTokens)}).`,
-            )
-
-            if (contextUsageBefore !== undefined && contextUsageAfter !== undefined) {
-                lines.push(`Context usage: ${contextUsageBefore}% → ${contextUsageAfter}%.`)
-            }
-
-            if (reactivatedBlockIds.length > 0) {
-                const refs = reactivatedBlockIds.map((id) => `b${id}`).join(", ")
-                lines.push(`Also restored nested block(s): ${refs}.`)
-            }
-
-            if (restoredContentPreview) {
-                lines.push("")
-                lines.push("RESTORED CONTENT (condensed):")
-                lines.push(restoredContentPreview)
-            }
-
-            ctx.logger.info("Decompress tool completed", {
-                mode: typeof args.startId === "string" ? "range" : "block",
-                targetBlockIds: targets.map((t) => t.displayId),
-                restoredMessageCount,
-                restoredTokens,
-                reactivatedBlockIds,
+                return lines.join("\n")
             })
-
-            return lines.join("\n")
         },
     }
 }

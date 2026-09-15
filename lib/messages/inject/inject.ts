@@ -14,7 +14,7 @@ import {
     messageHasCompressAttempt,
     isCaptureOnlyCompress,
 } from "../query"
-import { saveSessionState } from "../../state/persistence"
+import type { DeferredMutationEffects } from "../../state/transaction"
 import {
     appendToTextPart,
     appendToLastTextPart,
@@ -92,6 +92,7 @@ export const injectCompressNudges = (
     debugNotify?: (text: string) => void,
     preCompressTokens?: number,
     candidateMessages?: WithParts[],
+    effects?: DeferredMutationEffects,
 ): void => {
     if (compressPermission(state, config) === "deny") {
         return
@@ -194,7 +195,7 @@ export const injectCompressNudges = (
             }
 
             state.nudges.shouldInjectThisTurn = false
-            saveSessionState(state, logger).catch(() => {})
+            effects?.requestPersistence()
             return
         }
     } else {
@@ -868,7 +869,7 @@ export const injectCompressNudges = (
     // saturated, so the on-disk baseline went stale and the nudge refired every
     // turn after restart.
     if (anchorsChanged || nudgeAllowed || baselineReEstablished || baselineCorrected) {
-        saveSessionState(state, logger).catch(() => {})
+        effects?.requestPersistence()
     }
 }
 

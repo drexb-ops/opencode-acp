@@ -4,7 +4,7 @@ import {
     type ToolContext,
     type ToolExecutionContext,
     type ToolFactoryContext,
-    resolveToolContext,
+    withToolSessionMutation,
 } from "./types"
 import { createV1Tool, type V1Tool } from "../v1/tools"
 import { formatAge } from "../ui/utils"
@@ -669,47 +669,48 @@ export function createAcpStatusToolDefinition(
         schema: acpStatusInputSchema,
         inputSchema: acpStatusInputSchema,
         async execute(args, toolCtx: ToolExecutionContext) {
-            const ctx = resolveToolContext(factoryCtx, toolCtx.sessionID)
-            const scope =
-                args.scope === "compressed" || args.scope === "uncompressed"
-                    ? args.scope
-                    : undefined
-            const view =
-                args.view === "messages" || args.view === "ranges" || args.view === "candidates"
-                    ? args.view
-                    : "candidates"
-            const toolFilter = typeof args.tool === "string" ? args.tool : undefined
-            const sort =
-                args.sort === "time" || args.sort === "tool" || args.sort === "age"
-                    ? args.sort
-                    : "size"
-            const limit =
-                Number.isFinite(args.limit) && args.limit! > 0 ? Math.min(args.limit!, 200) : 30
+            return withToolSessionMutation(factoryCtx, toolCtx, async (ctx) => {
+                const scope =
+                    args.scope === "compressed" || args.scope === "uncompressed"
+                        ? args.scope
+                        : undefined
+                const view =
+                    args.view === "messages" || args.view === "ranges" || args.view === "candidates"
+                        ? args.view
+                        : "candidates"
+                const toolFilter = typeof args.tool === "string" ? args.tool : undefined
+                const sort =
+                    args.sort === "time" || args.sort === "tool" || args.sort === "age"
+                        ? args.sort
+                        : "size"
+                const limit =
+                    Number.isFinite(args.limit) && args.limit! > 0 ? Math.min(args.limit!, 200) : 30
 
-            if (scope === "compressed") {
-                return buildStatusReport({ state: ctx.state, config: ctx.config }, [], {
-                    scope: "compressed",
+                if (scope === "compressed") {
+                    return buildStatusReport({ state: ctx.state, config: ctx.config }, [], {
+                        scope: "compressed",
+                        sort,
+                        limit,
+                    })
+                }
+
+                let rawMessages: WithParts[] = []
+                try {
+                    rawMessages = await fetchSessionMessages(ctx.sessions, toolCtx.sessionID)
+                } catch {
+                    if (scope === "uncompressed") return "(unable to fetch messages)"
+                    rawMessages = []
+                }
+
+                hideConsumedCompressCalls(ctx.state, rawMessages)
+
+                return buildStatusReport({ state: ctx.state, config: ctx.config }, rawMessages, {
+                    scope,
+                    view,
+                    tool: toolFilter,
                     sort,
                     limit,
                 })
-            }
-
-            let rawMessages: WithParts[] = []
-            try {
-                rawMessages = await fetchSessionMessages(ctx.sessions, toolCtx.sessionID)
-            } catch {
-                if (scope === "uncompressed") return "(unable to fetch messages)"
-                rawMessages = []
-            }
-
-            hideConsumedCompressCalls(ctx.state, rawMessages)
-
-            return buildStatusReport({ state: ctx.state, config: ctx.config }, rawMessages, {
-                scope,
-                view,
-                tool: toolFilter,
-                sort,
-                limit,
             })
         },
     }

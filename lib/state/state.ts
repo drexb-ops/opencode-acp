@@ -17,6 +17,7 @@ import {
     resolveStorageDir,
     saveSessionState,
 } from "./persistence"
+import type { DeferredMutationEffects } from "./transaction"
 import { createModelLimitCatalog } from "./model-limits"
 import { rebuildCompressionState, restoreForkCompressionState } from "./rebuild"
 import {
@@ -38,6 +39,7 @@ export async function updatePerTurnState(
     state: SessionState,
     logger: Logger,
     messages: WithParts[],
+    effects?: DeferredMutationEffects,
 ): Promise<void> {
     const lastCompactionTimestamp = findLastCompactionTimestamp(messages)
     if (lastCompactionTimestamp > state.lastCompaction) {
@@ -47,11 +49,7 @@ export async function updatePerTurnState(
             timestamp: lastCompactionTimestamp,
         })
 
-        saveSessionState(state, logger).catch((error) => {
-            logger.warn("Failed to persist state reset after compaction", {
-                error: error instanceof Error ? error.message : String(error),
-            })
-        })
+        effects?.requestPersistence()
     }
 
     state.currentTurn = countTurns(state, messages)
@@ -75,6 +73,10 @@ const REGISTRY_SOFT_CAP = 32
 // iterates all sessions and only the owner matches (applied > 0).
 export class SessionStateRegistry {
     private readonly states = new Map<string, SessionState>()
+    private readonly initializations = new Map<string, Promise<SessionState>>()
+    private readonly mutationTails = new Map<string, Promise<void>>()
+    /** Includes queued work, not just the callback currently executing. */
+    private readonly guardedWork = new Map<string, number>()
     readonly compressionTiming: CompressionTimingState = {
         startsByCallId: new Map<string, number>(),
         pendingByCallId: new Map<string, PendingCompressionDuration>(),
@@ -142,11 +144,16 @@ export class SessionStateRegistry {
     }
 
     get(sessionId: string): SessionState | undefined {
+        // A state object is inserted before async initialization can begin, but
+        // it is deliberately invisible until that initialization has completed.
+        if (this.initializations.has(sessionId)) return undefined
         return this.states.get(sessionId)
     }
 
     all(): SessionState[] {
-        return Array.from(this.states.values())
+        return Array.from(this.states.keys())
+            .map((sessionId) => this.get(sessionId))
+            .filter((state): state is SessionState => state !== undefined)
     }
 
     get size(): number {
@@ -162,19 +169,38 @@ export class SessionStateRegistry {
         messages: WithParts[],
         config?: PluginConfig,
     ): Promise<SessionState> {
-        const sessionService = resolveSessionService(sessions)
         let state = this.states.get(sessionId)
+        let initialization = this.initializations.get(sessionId)
         if (!state) {
             state = createSessionState()
             // Assign shared compressionTiming BEFORE ensureSessionInitialized so
             // its init-time applyPendingCompressionDurations reads the shared map.
             state.compressionTiming = this.compressionTiming
             this.states.set(sessionId, state)
+            initialization = this.initializeState(sessions, state, sessionId, messages, config)
+            this.initializations.set(sessionId, initialization)
             this.enforceSoftCap()
+            void initialization.then(
+                () => this.finishInitialization(sessionId, initialization!),
+                (error) => {
+                    if (this.states.get(sessionId)?.sessionId === sessionId) {
+                        this.states.delete(sessionId)
+                    }
+                    this.logger.error("Failed to initialize session state", {
+                        sessionId,
+                        error: error instanceof Error ? error.message : String(error),
+                    })
+                    this.finishInitialization(sessionId, initialization!)
+                },
+            )
         }
-        try {
+        if (initialization) {
+            await initialization
+        } else {
+            // Existing, fully initialized states remain idempotent. Keep this
+            // call for callers that seeded a registry state directly in tests.
             await ensureSessionInitialized(
-                sessionService,
+                resolveSessionService(sessions),
                 state,
                 sessionId,
                 this.logger,
@@ -182,17 +208,90 @@ export class SessionStateRegistry {
                 config,
                 this.projectDir,
             )
-        } catch (err: any) {
-            this.logger.error("Failed to initialize session state", {
-                error: err.message,
-            })
         }
         return state
     }
 
+    /**
+     * Serialize all state-sensitive work for one session. Different sessions
+     * use independent tails and therefore remain concurrent.
+     */
+    async withSessionMutation<T>(
+        sessionId: string,
+        operation: (state: SessionState) => Promise<T> | T,
+    ): Promise<T> {
+        const initialization = this.initializations.get(sessionId)
+        if (initialization) {
+            await initialization
+        }
+
+        if (!this.states.has(sessionId)) {
+            throw new Error(`ACP: session ${sessionId} has no initialized state`)
+        }
+
+        const previous = this.mutationTails.get(sessionId) ?? Promise.resolve()
+        let release!: () => void
+        const current = new Promise<void>((resolve) => {
+            release = resolve
+        })
+        this.mutationTails.set(sessionId, current)
+        this.guardedWork.set(sessionId, (this.guardedWork.get(sessionId) ?? 0) + 1)
+
+        await previous
+        try {
+            const state = this.states.get(sessionId)
+            if (!state || this.initializations.has(sessionId)) {
+                throw new Error(`ACP: session ${sessionId} is not initialized`)
+            }
+            return await operation(state)
+        } finally {
+            const count = (this.guardedWork.get(sessionId) ?? 1) - 1
+            if (count > 0) this.guardedWork.set(sessionId, count)
+            else this.guardedWork.delete(sessionId)
+            release()
+            if (this.mutationTails.get(sessionId) === current) {
+                this.mutationTails.delete(sessionId)
+            }
+            this.enforceSoftCap()
+        }
+    }
+
+    private initializeState(
+        sessions: SessionService,
+        state: SessionState,
+        sessionId: string,
+        messages: WithParts[],
+        config?: PluginConfig,
+    ): Promise<SessionState> {
+        return ensureSessionInitialized(
+            resolveSessionService(sessions),
+            state,
+            sessionId,
+            this.logger,
+            messages,
+            config,
+            this.projectDir,
+        ).then(() => state)
+    }
+
+    private finishInitialization(sessionId: string, initialization: Promise<SessionState>): void {
+        if (this.initializations.get(sessionId) === initialization) {
+            this.initializations.delete(sessionId)
+        }
+        // Do not evict here: the getOrCreate caller is about to receive this
+        // state, and no guarded-work reservation exists until it enters the
+        // mutation queue. Subsequent insertions/guard releases enforce the cap.
+    }
+
     private enforceSoftCap(): void {
         if (this.states.size <= REGISTRY_SOFT_CAP) return
-        const oldest = this.states.keys().next().value
+        let oldest: string | undefined
+        for (const sessionId of this.states.keys()) {
+            if (!this.initializations.has(sessionId) && !this.guardedWork.has(sessionId)) {
+                oldest = sessionId
+                break
+            }
+        }
         if (oldest !== undefined) {
             this.states.delete(oldest as string)
             this.logger.info("SessionStateRegistry evicted session (soft cap)", {

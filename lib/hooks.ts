@@ -3,54 +3,31 @@ import type { Logger } from "./logger"
 import type { PluginConfig } from "./config"
 import type { HostServices } from "./host"
 import { resolveHostServices } from "./host/legacy"
-import { assignMessageRefs } from "./message-ids"
-import {
-    buildPriorityMap,
-    buildToolIdList,
-    computeInputBudget,
-    dropCompressReasoning,
-    dropEmptyMessages,
-    injectCompressNudges,
-    injectMessageIds,
-    prune,
-    stripHallucinations,
-    stripHallucinationsFromString,
-    stripStaleMetadata,
-    syncCompressionBlocks,
-} from "./messages"
-import { applyCompressOverrides } from "./messages/inject/utils"
+import { stripHallucinationsFromString } from "./messages"
 import { renderSystemPrompt, type PromptStore } from "./prompts"
 import { buildProtectedToolsExtension } from "./prompts/extensions/system"
-import { DEFAULT_COMPRESS_REASONING } from "./config"
 import {
     applyPendingCompressionDurations,
     buildCompressionTimingKey,
     resolveCompressionDuration,
 } from "./compress/timing"
 import { filterMessagesInPlace } from "./messages/shape"
-import { getLastUserMessage, isSyntheticMessage } from "./messages/query"
-import { OUTPUT_RESERVE_TOKENS, truncateLargeToolOutputs } from "./messages/truncate-tools"
-import { resolveEffectiveContextLimit } from "./state/utils"
-import { enforceContextBudget } from "./messages/enforce-budget"
+import { getLastUserMessage } from "./messages/query"
 import { handleContextCommand, handleStatsCommand } from "./commands"
 import { handleExportCommand } from "./commands/export"
 import { sendIgnoredMessage } from "./ui/notification"
 import { type HostPermissionSnapshot } from "./host-permissions"
 import { compressPermission, syncCompressPermissionState } from "./compress-permission"
-import { hideConsumedCompressCalls } from "./compress/hide-consumed"
-import { hideFailedCompressCalls } from "./compress/hide-failed"
-import { applyMessageFilters } from "./messages/filter/apply"
 import { ensureBuiltinFiltersRegistered } from "./messages/filter/builtin"
 import {
     createSessionState,
+    cloneSessionState,
+    commitSessionState,
     saveSessionState,
-    syncToolCache,
-    updatePerTurnState,
     type SessionStateRegistry,
 } from "./state"
-import { cacheSystemPromptTokens } from "./ui/utils"
-import { runBatchCleanup } from "./gc/merge"
-import { getCurrentTokenUsage } from "./token-utils"
+import { DeferredMutationEffects } from "./state/transaction"
+import { runMessageTransform } from "./messages/transform"
 
 const INTERNAL_AGENT_SIGNATURES = [
     "You are a title generator",
@@ -75,6 +52,61 @@ function isInternalAgentRequest(messages: WithParts[]): boolean {
     }
     const agent = (lastUserMessage.info as { agent?: unknown }).agent
     return typeof agent === "string" && INTERNAL_AGENT_NAMES.has(agent)
+}
+
+async function runMessageTransformTransaction(
+    messages: WithParts[],
+    state: SessionState,
+    config: PluginConfig,
+    logger: Logger,
+    prompts: PromptStore,
+    hostPermissions: HostPermissionSnapshot,
+    requestModelLimit: number | undefined,
+    modelLimitKnown: boolean | undefined,
+    debugNotify: (text: string) => void | Promise<void>,
+): Promise<void> {
+    const workingMessages = structuredClone(messages) as WithParts[]
+    const workingState = cloneSessionState(state)
+    const effects = new DeferredMutationEffects()
+    prompts.reload()
+    ensureBuiltinFiltersRegistered()
+
+    await runMessageTransform(
+        workingMessages,
+        workingState,
+        config,
+        prompts.getRuntimePrompts(),
+        logger,
+        hostPermissions,
+        {
+            requestModelLimit,
+            modelLimitKnown,
+            effects,
+            debugNotify,
+        },
+    )
+
+    commitSessionState(state, workingState)
+    messages.splice(0, messages.length, ...workingMessages)
+
+    if (effects.persistenceRequested) {
+        try {
+            await saveSessionState(state, logger)
+        } catch (error) {
+            logger.warn("Failed to persist message transform state", {
+                sessionId: state.sessionId,
+                error: error instanceof Error ? error.message : String(error),
+            })
+        }
+    }
+    try {
+        await effects.run()
+    } catch (error) {
+        logger.warn("Deferred message transform effect failed", {
+            sessionId: state.sessionId,
+            error: error instanceof Error ? error.message : String(error),
+        })
+    }
 }
 
 export function createSystemPromptHandler(
@@ -106,9 +138,9 @@ export function createSystemPromptHandler(
 
         // messages.transform creates the session state before this fires; if
         // absent (internal-agent early-return), there is nothing to attribute.
-        const state = input.sessionID ? registry.get(input.sessionID) : undefined
+        const existingState = input.sessionID ? registry.get(input.sessionID) : undefined
 
-        if (!state || (state.isSubAgent && !config.allowSubAgents)) {
+        if (!existingState || (existingState.isSubAgent && !config.allowSubAgents)) {
             return
         }
 
@@ -121,56 +153,63 @@ export function createSystemPromptHandler(
             return
         }
 
-        // [FIX #346] Attribute the limit to the session only for real session
-        // requests: internal agents (title/summary/compaction) may run on a
-        // different model and must not overwrite the session's limit.
-        // Persist on change so a freshly spawned process (headless
-        // spawn+resume) resumes with the limit already known — the system
-        // hook is the only writer and fires AFTER messages.transform within
-        // a request, so without this the limit is learned and lost every
-        // message and the safety net never engages.
-        if (input.model?.limit?.context) {
-            const limit = input.model.limit.context
-            const providerID = input.model?.providerID
-            const modelID = input.model?.id
-            // Identity fields are only written when present: a limit without
-            // identity must not clobber the pair the messages hook relies on
-            // for staleness detection (#312).
-            const changed =
-                state.modelContextLimit !== limit ||
-                (providerID !== undefined && state.modelProviderID !== providerID) ||
-                (modelID !== undefined && state.modelID !== modelID)
-            state.modelContextLimit = limit
-            // [FIX #312 follow-up] Record WHICH model the limit belongs to so
-            // the messages hook can detect staleness on a catalog miss.
-            if (providerID !== undefined) {
-                state.modelProviderID = providerID
-            }
-            if (modelID !== undefined) {
-                state.modelID = modelID
-            }
-            if (changed) {
-                saveSessionState(state, logger).catch(() => {})
-            }
-        }
-
-        const effectivePermission = compressPermission(state, config)
-
-        if (effectivePermission === "deny") {
-            return
-        }
-
         prompts.reload()
-        const runtimePrompts = prompts.getRuntimePrompts()
-        const newPrompt = renderSystemPrompt(
-            runtimePrompts,
-            buildProtectedToolsExtension(config.compress.protectedTools),
-            state.isSubAgent && config.allowSubAgents,
-        )
-        if (output.system.length > 0) {
-            output.system[output.system.length - 1] += "\n\n" + newPrompt
+        const runSystemTransform = async (state: SessionState) => {
+            // [FIX #346] Attribute the limit to the session only for real session
+            // requests: internal agents (title/summary/compaction) may run on a
+            // different model and must not overwrite the session's limit.
+            // Persist on change so a freshly spawned process (headless
+            // spawn+resume) resumes with the limit already known — the system
+            // hook is the only writer and fires AFTER messages.transform within
+            // a request, so without this the limit is learned and lost every
+            // message and the safety net never engages.
+            if (input.model?.limit?.context) {
+                const limit = input.model.limit.context
+                const providerID = input.model?.providerID
+                const modelID = input.model?.id
+                // Identity fields are only written when present: a limit without
+                // identity must not clobber the pair the messages hook relies on
+                // for staleness detection (#312).
+                const changed =
+                    state.modelContextLimit !== limit ||
+                    (providerID !== undefined && state.modelProviderID !== providerID) ||
+                    (modelID !== undefined && state.modelID !== modelID)
+                state.modelContextLimit = limit
+                // [FIX #312 follow-up] Record WHICH model the limit belongs to so
+                // the messages hook can detect staleness on a catalog miss.
+                if (providerID !== undefined) {
+                    state.modelProviderID = providerID
+                }
+                if (modelID !== undefined) {
+                    state.modelID = modelID
+                }
+                if (changed) {
+                    saveSessionState(state, logger).catch(() => {})
+                }
+            }
+
+            const effectivePermission = compressPermission(state, config)
+
+            if (effectivePermission === "deny") {
+                return
+            }
+
+            const runtimePrompts = prompts.getRuntimePrompts()
+            const newPrompt = renderSystemPrompt(
+                runtimePrompts,
+                buildProtectedToolsExtension(config.compress.protectedTools),
+                state.isSubAgent && config.allowSubAgents,
+            )
+            if (output.system.length > 0) {
+                output.system[output.system.length - 1] += "\n\n" + newPrompt
+            } else {
+                output.system.push(newPrompt)
+            }
+        }
+        if (registry.withSessionMutation) {
+            await registry.withSessionMutation(input.sessionID!, runSystemTransform)
         } else {
-            output.system.push(newPrompt)
+            await runSystemTransform(existingState)
         }
     }
 }
@@ -184,7 +223,7 @@ export function createChatMessageTransformHandler(
     hostPermissions: HostPermissionSnapshot,
 ) {
     const services = resolveHostServices(host)
-    return async (input: {}, output: { messages: WithParts[] }) => {
+    return async (_input: {}, output: { messages: WithParts[] }) => {
         const receivedMessages = Array.isArray(output.messages) ? output.messages.length : 0
         const messages = filterMessagesInPlace(output.messages)
         if (messages.length !== receivedMessages) {
@@ -194,270 +233,70 @@ export function createChatMessageTransformHandler(
             })
         }
 
-        // [FIX Bug 37] Skip OpenCode internal agents (title/summary/compaction).
-        // These small hidden LLM requests must not be mutated, and resolving a
-        // session state for them would corrupt it (currentTurn, etc.).
         if (isInternalAgentRequest(messages)) {
             logger.debug("Skipping message transform for internal agent request")
             return
         }
 
         const lastUserMessage = getLastUserMessage(messages)
-        let state: SessionState
+        const debugNotify = (text: string) =>
+            services.notifications.notify({
+                title: "ACP: Nudge Injected",
+                message: text,
+                variant: "info",
+                duration: 5000,
+            })
+
         if (!lastUserMessage) {
-            // Ephemeral state: no session to resolve, but keep running
-            // state-independent stages (e.g. stripHallucinations).
-            state = createSessionState()
-        } else {
-            // [FIX #33] Per-session state: each session keeps its own SessionState,
-            // so interleaved sessions no longer reset each other's modelContextLimit.
-            state = await registry.getOrCreate(
-                services.sessions,
-                lastUserMessage.info.sessionID,
+            const state = createSessionState()
+            await runMessageTransformTransaction(
                 messages,
+                state,
                 config,
+                logger,
+                prompts,
+                hostPermissions,
+                undefined,
+                undefined,
+                debugNotify,
             )
-
-            // [FIX #312] system.transform (the only writer of
-            // state.modelContextLimit) fires AFTER messages.transform within
-            // one request, so on the first request after a model switch the
-            // value still reflects the previous model. Reconcile it from the
-            // catalog entry for the model named on this request's user message
-            // before any consumer (filters, GC, nudge thresholds) reads it.
-            const requestModel = (
-                lastUserMessage.info as { model?: { providerID?: string; modelID?: string } }
-            ).model
-            let requestModelLimit = registry.resolveModelLimit(
-                requestModel?.providerID,
-                requestModel?.modelID,
-            )
-            // [FIX #346] Catalog miss: the init-time seed is fire-and-forget and
-            // races server readiness, so in headless spawn+resume mode the
-            // catalog can stay empty for the whole process lifetime. During a
-            // request the server is guaranteed up (we are inside its pipeline),
-            // so retry hydration once per process before any threshold math.
-            if (
-                requestModelLimit === undefined &&
-                requestModel?.providerID &&
-                requestModel?.modelID
-            ) {
-                requestModelLimit = await registry.hydrateAndResolve(
-                    services.models,
-                    requestModel.providerID,
-                    requestModel.modelID,
-                )
-            }
-            const prevModelID = state.modelID
-            if (requestModelLimit !== undefined) {
-                state.modelContextLimit = requestModelLimit
-                state.modelProviderID = requestModel?.providerID
-                state.modelID = requestModel?.modelID
-            } else if (
-                // [FIX #312 fallback] Catalog miss: we cannot CORRECT the
-                // limit, but we can tell when it belongs to a DIFFERENT model.
-                // Invalidate instead of letting every percentage threshold
-                // below run against the wrong window (#312's false positive).
-                // States persisted before this identity pair existed carry no
-                // identity and are treated as stale for the same reason.
-                // Consumers already tolerate undefined — fresh sessions run
-                // with it until the first system.transform sets the pair.
-                requestModel?.providerID &&
-                requestModel?.modelID &&
-                state.modelContextLimit !== undefined &&
-                (state.modelProviderID !== requestModel.providerID ||
-                    state.modelID !== requestModel.modelID)
-            ) {
-                state.modelContextLimit = undefined
-                state.modelProviderID = requestModel.providerID
-                state.modelID = requestModel.modelID
-            }
-            if (requestModel?.modelID && requestModel.modelID !== prevModelID) {
-                logger.info("Model switched mid-session", {
-                    session: state.sessionId,
-                    from: prevModelID,
-                    to: requestModel.modelID,
-                    contextLimit: state.modelContextLimit,
-                })
-            }
-            await updatePerTurnState(state, logger, messages)
-
-            if (
-                state.modelContextLimit === undefined &&
-                !state.noContextLimitWarned &&
-                requestModel?.providerID &&
-                requestModel?.modelID &&
-                registry.resolveModelLimit(requestModel.providerID, requestModel.modelID) ===
-                    undefined
-            ) {
-                state.noContextLimitWarned = true
-                logger.warn(
-                    'Model reports no context window and the catalog has no entry for it; all percentage thresholds (min/max/emergency, GC) and the context-budget guard are disabled. Set the model limit in opencode.json (e.g. "limit": {"context": 262144, "output": 16384}) to enable them (also fixes the 32000 max_tokens fallback); an absolute compress.maxContextLimit in acp.jsonc only enables proactive nudges, not the guard.',
-                    {
-                        session: state.sessionId,
-                        model: `${requestModel.providerID}/${requestModel.modelID}`,
-                    },
-                )
-            }
-        }
-
-        syncCompressPermissionState(state, config, hostPermissions, output.messages)
-
-        if (state.isSubAgent && !config.allowSubAgents) {
             return
         }
 
-        stripHallucinations(output.messages)
-
-        // [#368] Drop oversized reasoning from closed-turn compress tool calls.
-        // compress calls are hard-exempt from compression (Bug 39), so their
-        // thinking otherwise rides along every request as an unreclaimable
-        // floor. Gated by the nested `compress.reasoning` config, resolved
-        // through the #344 cascade (model > provider > global) using THIS
-        // request's model identity (request metadata first, session state as
-        // fallback). Runs BEFORE token accounting / pruning so every later
-        // stage sees the post-drop array.
-        const dropReasoningModel = (
-            lastUserMessage?.info as
-                { model?: { providerID?: string; modelID?: string } } | undefined
-        )?.model
-        const reasoningConfig = applyCompressOverrides(
-            config,
-            dropReasoningModel?.providerID ?? state.modelProviderID,
-            dropReasoningModel?.modelID ?? state.modelID,
-        ).compress.reasoning
-        if (reasoningConfig?.drop !== false) {
-            const droppedReasoning = dropCompressReasoning(
-                output.messages,
-                reasoningConfig?.threshold ?? DEFAULT_COMPRESS_REASONING.threshold,
+        const sessionId = lastUserMessage.info.sessionID
+        const requestModel = (
+            lastUserMessage.info as { model?: { providerID?: string; modelID?: string } }
+        ).model
+        let requestModelLimit = registry.resolveModelLimit(
+            requestModel?.providerID,
+            requestModel?.modelID,
+        )
+        if (requestModelLimit === undefined && requestModel?.providerID && requestModel?.modelID) {
+            requestModelLimit = await registry.hydrateAndResolve(
+                services.models,
+                requestModel.providerID,
+                requestModel.modelID,
             )
-            if (droppedReasoning > 0) {
-                logger.debug("compress.reasoning: dropped oversized reasoning parts", {
-                    dropped: droppedReasoning,
-                    threshold: reasoningConfig?.threshold ?? DEFAULT_COMPRESS_REASONING.threshold,
-                })
-            }
         }
 
-        ensureBuiltinFiltersRegistered()
-        const effectiveLimit = resolveEffectiveContextLimit(state, config)
-        applyMessageFilters(output.messages, config.messageFilters, logger, {
-            sessionId: state.sessionId ?? "",
-            isSubAgent: state.isSubAgent,
-            modelContextLimit: effectiveLimit?.limit,
-        })
-        cacheSystemPromptTokens(state, output.messages)
-        assignMessageRefs(state, output.messages)
-        const activeBlockCountBefore = state.prune.messages.activeBlockIds.size // [FIX Bug 4]
-        const compressionStateChanged = syncCompressionBlocks(state, logger, output.messages)
-        if (
-            compressionStateChanged ||
-            state.prune.messages.activeBlockIds.size !== activeBlockCountBefore
-        ) {
-            // [FIX Bug 4]
-            saveSessionState(state, logger).catch(() => {}) // [FIX Bug 4] persist deactivations
-        }
-        syncToolCache(state, config, logger, output.messages)
-        buildToolIdList(state, output.messages)
-        const batchResult = runBatchCleanup(state, config, logger, output.messages)
-        if (batchResult.mergedCount > 0) {
-            saveSessionState(state, logger).catch(() => {})
-        }
-        const prePruneTokens = getCurrentTokenUsage(state, output.messages)
-        // Keep the full post-filter projection for candidate planning. The
-        // nudge receives a pruned view, while range validation still needs the
-        // original ordering to prove tool-pair and protection parity.
-        // Skip the copy entirely when candidates are disabled (default).
-        const candidateMessages =
-            config.compress.candidates === true ? output.messages.slice() : undefined
-        prune(state, logger, config, output.messages)
-        hideConsumedCompressCalls(state, output.messages)
-        assignMessageRefs(state, output.messages)
-        const compressionPriorities = buildPriorityMap(config, state, output.messages)
-        prompts.reload()
-        injectCompressNudges(
-            state,
-            config,
-            logger,
-            output.messages,
-            prompts.getRuntimePrompts(),
-            compressionPriorities,
-            config.debug
-                ? (text: string) => {
-                      // sendIgnoredMessage writes an ignored:true user msg to DB.
-                      // opencode's runtime loop detects it as "last user" (role-only,
-                      // ignores the flag) → phantom turn → compress → notification →
-                      // infinite loop. Use logger.debug + toast instead.
-                      logger.debug(`[ACP Debug] Nudge injected:\n${text}`)
-                      void Promise.resolve(
-                          services.notifications.notify({
-                              title: "ACP: Nudge Injected",
-                              message: text.slice(0, 500),
-                              variant: "info",
-                              duration: 5000,
-                          }),
-                      ).catch(() => {})
-                  }
-                : undefined,
-            prePruneTokens,
-            candidateMessages,
-        )
-        // Candidate planning consumes the pre-truncation snapshot so its
-        // executor-parity check matches the fresh messages fetched by compress.
-        truncateLargeToolOutputs(
-            state,
-            config,
-            logger,
-            output.messages.filter((message) => !isSyntheticMessage(message)),
-        )
-        // Keep candidate planning independent from the final budget guard:
-        // candidates are computed from the pre-truncation snapshot so their
-        // ranges remain valid when the compress executor fetches fresh history.
-        enforceContextBudget(state, config, logger, output.messages)
-        injectMessageIds(state, config, output.messages, compressionPriorities)
-        hideFailedCompressCalls(output.messages)
-        stripStaleMetadata(output.messages)
-        dropEmptyMessages(output.messages)
-        const postTokens = getCurrentTokenUsage(state, output.messages)
-        // [FIX #346] Hard guard: if the post-transform context still exceeds
-        // the model's real request budget (window minus system prompt + tool
-        // schemas + output-token reserve), the backend will reject the
-        // request. opencode exits 0 with zero output in that case (upstream
-        // behavior the plugin cannot change), so this ERROR is the only
-        // signal that the session has hit the length-rejection wall.
-        if (postTokens !== undefined && effectiveLimit) {
-            const budget =
-                effectiveLimit.limit - (state.systemPromptTokens ?? 0) - OUTPUT_RESERVE_TOKENS
-            if (postTokens > budget) {
-                logger.error(
-                    "ACP hard guard: context exceeds model budget after in-flight reduction",
-                    {
-                        session: state.sessionId,
-                        postTokens,
-                        budget,
-                        contextLimit: effectiveLimit.limit,
-                        contextLimitSource: effectiveLimit.source,
-                        hint: "request will likely be rejected; run /compact or start a new session",
-                    },
-                )
-            }
-        }
-        logger.info("Chat transform complete", {
-            session: state.sessionId,
-            model: state.modelID,
-            messages: output.messages.length,
-            prePruneTokens,
-            postTokens,
-            contextLimit: effectiveLimit?.limit,
-            contextLimitSource: effectiveLimit?.source,
-            usagePct:
-                postTokens !== undefined && effectiveLimit
-                    ? `${((postTokens / effectiveLimit.limit) * 100).toFixed(1)}%`
-                    : undefined,
-            nudged: state.nudges.shouldInjectThisTurn,
-        })
-
-        if (state.sessionId) {
-            await logger.saveContext(state.sessionId, output.messages)
+        await registry.getOrCreate(services.sessions, sessionId, messages, config)
+        const run = (state: SessionState) =>
+            runMessageTransformTransaction(
+                messages,
+                state,
+                config,
+                logger,
+                prompts,
+                hostPermissions,
+                requestModelLimit,
+                requestModelLimit !== undefined,
+                debugNotify,
+            )
+        if (registry.withSessionMutation) {
+            await registry.withSessionMutation(sessionId, run)
+        } else {
+            const state = registry.get(sessionId)
+            if (state) await run(state)
         }
     }
 }
@@ -504,51 +343,59 @@ export function createCommandExecuteHandler(
                 config,
             )
 
-            syncCompressPermissionState(state, config, hostPermissions, messages)
+            const runCommand = async (state: SessionState) => {
+                syncCompressPermissionState(state, config, hostPermissions, messages)
 
-            const commandCtx = {
-                notices: services.notices,
-                state,
-                config,
-                logger,
-                sessionId: input.sessionID,
-                messages,
-                workingDirectory,
-            }
-
-            // [FIX #398] Every handled /acp branch MUST abort the command by throwing
-            // __DCP_CONTEXT_HANDLED__. A normal return does NOT stop execution:
-            // opencode's Plugin.trigger only aborts on hook errors, and the command is
-            // registered with template: "" (no $ARGUMENTS), so opencode appends the raw
-            // arguments to the empty template and sends them to the model as a user
-            // message ("/acp status" leaked "status" to the model in v1.17.0+). The
-            // resulting level=ERROR log line on opencode >= 1.18.18 is the known cost
-            // of this mechanism (#296) — do NOT replace these throws with returns.
-            const sub = input.arguments?.trim().toLowerCase()
-            if (sub === "stats" || sub === "status" || sub === "") {
-                await handleStatsCommand(commandCtx)
-                throw new Error("__DCP_CONTEXT_HANDLED__")
-            }
-
-            if (sub === "export" || sub.startsWith("export ")) {
-                const exportArgs = input.arguments?.trim().slice("export".length).trim() || ""
-                await handleExportCommand(commandCtx, exportArgs)
-                throw new Error("__DCP_CONTEXT_HANDLED__")
-            }
-
-            if (sub === "help") {
-                await sendIgnoredMessage(
-                    services.notices,
-                    input.sessionID,
-                    buildHelpText(),
-                    {},
+                const commandCtx = {
+                    notices: services.notices,
+                    state,
+                    config,
                     logger,
-                )
+                    sessionId: input.sessionID,
+                    messages,
+                    workingDirectory,
+                }
+
+                // [FIX #398] Every handled /acp branch MUST abort the command by throwing
+                // __DCP_CONTEXT_HANDLED__. A normal return does NOT stop execution:
+                // opencode's Plugin.trigger only aborts on hook errors, and the command is
+                // registered with template: "" (no $ARGUMENTS), so opencode appends the raw
+                // arguments to the empty template and sends them to the model as a user
+                // message ("/acp status" leaked "status" to the model in v1.17.0+). The
+                // resulting level=ERROR log line on opencode >= 1.18.18 is the known cost
+                // of this mechanism (#296) — do NOT replace these throws with returns.
+                const sub = input.arguments?.trim().toLowerCase()
+                if (sub === "stats" || sub === "status" || sub === "") {
+                    await handleStatsCommand(commandCtx)
+                    throw new Error("__DCP_CONTEXT_HANDLED__")
+                }
+
+                if (sub === "export" || sub.startsWith("export ")) {
+                    const exportArgs = input.arguments?.trim().slice("export".length).trim() || ""
+                    await handleExportCommand(commandCtx, exportArgs)
+                    throw new Error("__DCP_CONTEXT_HANDLED__")
+                }
+
+                if (sub === "help") {
+                    await sendIgnoredMessage(
+                        services.notices,
+                        input.sessionID,
+                        buildHelpText(),
+                        {},
+                        logger,
+                    )
+                    throw new Error("__DCP_CONTEXT_HANDLED__")
+                }
+
+                await handleContextCommand(commandCtx)
                 throw new Error("__DCP_CONTEXT_HANDLED__")
             }
 
-            await handleContextCommand(commandCtx)
-            throw new Error("__DCP_CONTEXT_HANDLED__")
+            if (registry.withSessionMutation) {
+                await registry.withSessionMutation(input.sessionID, runCommand)
+            } else {
+                await runCommand(state)
+            }
         }
     }
 }
@@ -625,18 +472,27 @@ export function createEventHandler(registry: SessionStateRegistry, logger: Logge
                 durationMs,
             })
 
-            for (const state of registry.all()) {
-                const updates = applyPendingCompressionDurations(state)
-                if (updates > 0) {
-                    await saveSessionState(state, logger)
-                    logger.info("Attached compression time to blocks", {
-                        messageID: part.messageID,
-                        callID: part.callID,
-                        blocks: updates,
-                        durationMs,
-                    })
-                }
-            }
+            await Promise.all(
+                registry.all().map(async (state) => {
+                    const apply = async (guardedState: SessionState) => {
+                        const updates = applyPendingCompressionDurations(guardedState)
+                        if (updates > 0) {
+                            await saveSessionState(guardedState, logger)
+                            logger.info("Attached compression time to blocks", {
+                                messageID: part.messageID,
+                                callID: part.callID,
+                                blocks: updates,
+                                durationMs,
+                            })
+                        }
+                    }
+                    if (registry.withSessionMutation && state.sessionId) {
+                        await registry.withSessionMutation(state.sessionId, apply)
+                    } else {
+                        await apply(state)
+                    }
+                }),
+            )
             return
         }
 

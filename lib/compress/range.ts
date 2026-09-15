@@ -3,7 +3,7 @@ import {
     type SharedToolDefinition,
     type ToolExecutionContext,
     type ToolFactoryContext,
-    resolveToolContext,
+    withToolSessionMutation,
 } from "./types"
 import { createV1Tool, type V1Tool } from "../v1/tools"
 import { countTokens } from "../token-utils"
@@ -109,267 +109,271 @@ export function createCompressRangeToolDefinition(
         schema,
         inputSchema: schema,
         async execute(args, toolCtx: ToolExecutionContext) {
-            const ctx0 = resolveToolContext(factoryCtx, toolCtx.sessionID)
-            const input: CompressRangeToolArgs = args
-            validateArgs(input)
+            return withToolSessionMutation(factoryCtx, toolCtx, async (ctx0) => {
+                const input: CompressRangeToolArgs = args
+                validateArgs(input)
 
-            const maxLen = args.summaryMaxChars ?? ctx0.config.compress.maxSummaryLengthHard
-            for (const entry of input.content) {
-                if (entry.summary.length > maxLen) {
-                    throw new Error(
-                        `Summary too long (${entry.summary.length} chars, max ${maxLen}).\n1. If this summary is nearly the same size as the original content, it may not be worth compressing — skip it.\n2. Strip noise (failed attempts, verbose outputs) but keep project-critical details (file paths, decisions, exact values).\n3. For important content needing detail, pass summaryMaxChars to increase the limit — don't lose critical info just to fit. Example: add "summaryMaxChars": 6000 to the tool call args.`,
-                    )
-                }
-            }
-
-            const callId = typeof toolCtx.callID === "string" ? toolCtx.callID : undefined
-
-            const { rawMessages, searchContext } = await prepareSession(
-                ctx0,
-                toolCtx,
-                `Compress Range: ${input.topic ?? "(batch)"}`,
-            )
-            // Three-level cascade (issue #344): once the session messages are
-            // loaded, swap in the effective compress config for the active
-            // provider/model so every ctx.config.compress.X read below picks up
-            // per-model > per-provider > global resolution.
-            const { providerId, modelId } = getModelInfo(rawMessages)
-            const ctx: typeof ctx0 = {
-                ...ctx0,
-                config: applyCompressOverrides(ctx0.config, providerId, modelId),
-            }
-            // Intentionally runs after prepareSession: resolution and char accounting
-            // require the prepared search context, and no state is persisted on error.
-            // Use the effective provider/model config so planning and execution agree.
-            const { plans: filteredPlans } = prepareExecutableRangePlans(
-                input,
-                searchContext,
-                ctx.state,
-                ctx.config,
-                ctx.logger,
-            )
-
-            const notifications: NotificationEntry[] = []
-            let preparedPlans: Array<{
-                entry: (typeof filteredPlans)[number]["entry"]
-                selection: (typeof filteredPlans)[number]["selection"]
-                anchorMessageId: string
-                finalSummary: string
-                consumedBlockIds: number[]
-            }> = []
-            let totalCompressedMessages = 0
-
-            for (const plan of filteredPlans) {
-                const parsedPlaceholders = parseBlockPlaceholders(plan.entry.summary)
-                validateSummaryPlaceholders(
-                    parsedPlaceholders,
-                    plan.selection.requiredBlockIds,
-                    plan.selection.startReference,
-                    plan.selection.endReference,
-                    searchContext.summaryByBlockId,
-                    ctx.logger,
-                )
-
-                const injected = injectBlockPlaceholders(
-                    plan.entry.summary,
-                    parsedPlaceholders,
-                    searchContext.summaryByBlockId,
-                    plan.selection.startReference,
-                    plan.selection.endReference,
-                )
-
-                const summaryWithUsers = appendProtectedUserMessages(
-                    injected.expandedSummary,
-                    plan.selection,
-                    searchContext,
-                    ctx.state,
-                    ctx.config.compress.protectUserMessages,
-                )
-
-                const summaryWithPromptInfo = appendProtectedPromptInfo(
-                    summaryWithUsers,
-                    plan.selection,
-                    searchContext,
-                    ctx.state,
-                    ctx.config.compress.protectTags,
-                )
-
-                const summaryWithTools = await appendProtectedTools(
-                    ctx.state,
-                    summaryWithPromptInfo,
-                    plan.selection,
-                    searchContext,
-                    ctx.config.compress.protectedTools,
-                    ctx.config.protectedFilePatterns,
-                )
-
-                const completedSummary = appendMissingBlockSummaries(
-                    summaryWithTools,
-                    [],
-                    searchContext.summaryByBlockId,
-                    injected.consumedBlockIds,
-                )
-
-                // [Plan B] Auto-detect consumed blocks: requiredBlockIds already
-                // covers every active block whose anchor is in [start, end]; merge
-                // with boundary blocks (when start/end is a bN ref) and dedup.
-                const boundaryConsumed = extractBoundaryConsumedBlocks(
-                    plan.selection.startReference,
-                    plan.selection.endReference,
-                )
-                const seenConsumed = new Set<number>()
-                const mergeConsumedBlockIds = [
-                    ...plan.selection.requiredBlockIds,
-                    ...boundaryConsumed,
-                ].filter((id) => {
-                    if (seenConsumed.has(id)) return false
-                    seenConsumed.add(id)
-                    return true
-                })
-
-                preparedPlans.push({
-                    entry: plan.entry,
-                    selection: plan.selection,
-                    anchorMessageId: plan.anchorMessageId,
-                    finalSummary: completedSummary.expandedSummary,
-                    consumedBlockIds: mergeConsumedBlockIds,
-                })
-            }
-
-            // Issue #290: drop phantom entries and compress the rest. Must run
-            // BEFORE snapshot/apply so dropped entries leave no ghost blocks.
-            const partition = partitionPhantomPlans(
-                identifyPhantomPlans(
-                    ctx.state,
-                    preparedPlans.map((p) => ({
-                        messageIds: p.selection.messageIds,
-                        consumedBlockIds: p.consumedBlockIds,
-                    })),
-                ),
-                preparedPlans.length,
-            )
-            let phantomSkipNotice: string | null = null
-            if (partition.kind === "all-phantom") {
-                ctx.logger.warn("Batch compress: ALL entries phantom", {
-                    totalCount: preparedPlans.length,
-                    details: partition.details,
-                })
-                throw new Error(buildPhantomErrorMessage(partition.details))
-            }
-            if (partition.kind === "partial") {
-                ctx.logger.warn("Batch compress: phantom entries detected", {
-                    phantomCount: partition.dropIndices.length,
-                    totalCount: preparedPlans.length,
-                    phantomIndices: partition.dropIndices,
-                    details: partition.details,
-                })
-                const dropSet = new Set(partition.dropIndices)
-                preparedPlans = preparedPlans.filter((_, i) => !dropSet.has(i))
-                phantomSkipNotice = partition.notice
-            }
-
-            const acknowledgeRisk = args.acknowledgeRisk === true
-
-            const qualityGateRetryPendingBefore = ctx.state.qualityGateRetryPending
-
-            // #301: the model routinely carries acknowledgeRisk over from
-            // non-quality errors (e.g. argument validation failures), which
-            // used to hard-fail with "no rejection pending". Without a pending
-            // quality-gate rejection the flag is a no-op instead — quality
-            // still runs. Only a real rejection arms the bypass.
-            const bypassQuality = acknowledgeRisk && ctx.state.qualityGateRetryPending
-            const ignoredAcknowledgeRisk = acknowledgeRisk && !ctx.state.qualityGateRetryPending
-            if (ignoredAcknowledgeRisk) {
-                ctx.logger.warn(
-                    "compress: acknowledgeRisk ignored — no quality gate rejection pending",
-                )
-            }
-            ctx.state.qualityGateRetryPending = false
-            if (!bypassQuality) {
-                for (const plan of preparedPlans) {
-                    const result = evaluatePreCommitQuality(
-                        rawMessages,
-                        plan.selection.messageIds,
-                        plan.selection.messageTokenById,
-                        plan.finalSummary,
-                        ctx.config,
-                        ctx.logger,
-                    )
-                    if (result && !result.passed) {
-                        ctx.state.qualityGateRetryPending = true
-                        throw buildQualityRejectionError(
-                            {
-                                startId: plan.entry.startId,
-                                endId: plan.entry.endId,
-                                summary: plan.finalSummary,
-                                messageIds: plan.selection.messageIds,
-                                messageTokenById: plan.selection.messageTokenById,
-                            },
-                            result,
+                const maxLen = args.summaryMaxChars ?? ctx0.config.compress.maxSummaryLengthHard
+                for (const entry of input.content) {
+                    if (entry.summary.length > maxLen) {
+                        throw new Error(
+                            `Summary too long (${entry.summary.length} chars, max ${maxLen}).\n1. If this summary is nearly the same size as the original content, it may not be worth compressing — skip it.\n2. Strip noise (failed attempts, verbose outputs) but keep project-critical details (file paths, decisions, exact values).\n3. For important content needing detail, pass summaryMaxChars to increase the limit — don't lose critical info just to fit. Example: add "summaryMaxChars": 6000 to the tool call args.`,
                         )
                     }
                 }
-            }
 
-            const snapshot = snapshotCompressionState(ctx.state)
-            const runId = allocateRunId(ctx.state)
+                const callId = typeof toolCtx.callID === "string" ? toolCtx.callID : undefined
 
-            try {
-                for (const preparedPlan of preparedPlans) {
-                    const blockId = allocateBlockId(ctx.state)
-                    const keepResult = resolveKeepMarkers(
-                        preparedPlan.finalSummary,
-                        rawMessages,
-                        ctx.state,
-                        ctx.config,
+                const { rawMessages, searchContext } = await prepareSession(
+                    ctx0,
+                    toolCtx,
+                    `Compress Range: ${input.topic ?? "(batch)"}`,
+                )
+                // Three-level cascade (issue #344): once the session messages are
+                // loaded, swap in the effective compress config for the active
+                // provider/model so every ctx.config.compress.X read below picks up
+                // per-model > per-provider > global resolution.
+                const { providerId, modelId } = getModelInfo(rawMessages)
+                const ctx: typeof ctx0 = {
+                    ...ctx0,
+                    config: applyCompressOverrides(ctx0.config, providerId, modelId),
+                }
+                // Intentionally runs after prepareSession: resolution and char accounting
+                // require the prepared search context, and no state is persisted on error.
+                // Use the effective provider/model config so planning and execution agree.
+                const { plans: filteredPlans } = prepareExecutableRangePlans(
+                    input,
+                    searchContext,
+                    ctx.state,
+                    ctx.config,
+                    ctx.logger,
+                )
+
+                const notifications: NotificationEntry[] = []
+                let preparedPlans: Array<{
+                    entry: (typeof filteredPlans)[number]["entry"]
+                    selection: (typeof filteredPlans)[number]["selection"]
+                    anchorMessageId: string
+                    finalSummary: string
+                    consumedBlockIds: number[]
+                }> = []
+                let totalCompressedMessages = 0
+
+                for (const plan of filteredPlans) {
+                    const parsedPlaceholders = parseBlockPlaceholders(plan.entry.summary)
+                    validateSummaryPlaceholders(
+                        parsedPlaceholders,
+                        plan.selection.requiredBlockIds,
+                        plan.selection.startReference,
+                        plan.selection.endReference,
+                        searchContext.summaryByBlockId,
+                        ctx.logger,
                     )
-                    preparedPlan.finalSummary = keepResult.summary
-                    const storedSummary = wrapCompressedSummary(blockId, preparedPlan.finalSummary)
-                    const summaryTokens = countTokens(storedSummary)
 
-                    const applied = applyCompressionState(
-                        ctx.state,
-                        {
-                            topic: preparedPlan.entry.topic ?? input.topic ?? "",
-                            batchTopic: input.topic,
-                            startId: preparedPlan.entry.startId,
-                            endId: preparedPlan.entry.endId,
-                            mode: "range",
-                            runId,
-                            compressMessageId: toolCtx.messageID ?? "",
-                            compressCallId: callId,
-                            summaryTokens,
-                        },
-                        preparedPlan.selection,
-                        preparedPlan.anchorMessageId,
-                        blockId,
-                        storedSummary,
-                        preparedPlan.consumedBlockIds,
-                        ctx.config.gc,
+                    const injected = injectBlockPlaceholders(
+                        plan.entry.summary,
+                        parsedPlaceholders,
+                        searchContext.summaryByBlockId,
+                        plan.selection.startReference,
+                        plan.selection.endReference,
                     )
 
-                    totalCompressedMessages += applied.messageIds.length
+                    const summaryWithUsers = appendProtectedUserMessages(
+                        injected.expandedSummary,
+                        plan.selection,
+                        searchContext,
+                        ctx.state,
+                        ctx.config.compress.protectUserMessages,
+                    )
 
-                    notifications.push({
-                        blockId,
-                        runId,
-                        summary: preparedPlan.finalSummary,
-                        summaryTokens,
+                    const summaryWithPromptInfo = appendProtectedPromptInfo(
+                        summaryWithUsers,
+                        plan.selection,
+                        searchContext,
+                        ctx.state,
+                        ctx.config.compress.protectTags,
+                    )
+
+                    const summaryWithTools = await appendProtectedTools(
+                        ctx.state,
+                        summaryWithPromptInfo,
+                        plan.selection,
+                        searchContext,
+                        ctx.config.compress.protectedTools,
+                        ctx.config.protectedFilePatterns,
+                    )
+
+                    const completedSummary = appendMissingBlockSummaries(
+                        summaryWithTools,
+                        [],
+                        searchContext.summaryByBlockId,
+                        injected.consumedBlockIds,
+                    )
+
+                    // [Plan B] Auto-detect consumed blocks: requiredBlockIds already
+                    // covers every active block whose anchor is in [start, end]; merge
+                    // with boundary blocks (when start/end is a bN ref) and dedup.
+                    const boundaryConsumed = extractBoundaryConsumedBlocks(
+                        plan.selection.startReference,
+                        plan.selection.endReference,
+                    )
+                    const seenConsumed = new Set<number>()
+                    const mergeConsumedBlockIds = [
+                        ...plan.selection.requiredBlockIds,
+                        ...boundaryConsumed,
+                    ].filter((id) => {
+                        if (seenConsumed.has(id)) return false
+                        seenConsumed.add(id)
+                        return true
+                    })
+
+                    preparedPlans.push({
+                        entry: plan.entry,
+                        selection: plan.selection,
+                        anchorMessageId: plan.anchorMessageId,
+                        finalSummary: completedSummary.expandedSummary,
+                        consumedBlockIds: mergeConsumedBlockIds,
                     })
                 }
 
-                await finalizeSession(ctx, toolCtx, rawMessages, notifications, input.topic)
-            } catch (error) {
-                restoreCompressionState(ctx.state, snapshot)
-                ctx.state.qualityGateRetryPending = qualityGateRetryPendingBefore
-                throw error
-            }
+                // Issue #290: drop phantom entries and compress the rest. Must run
+                // BEFORE snapshot/apply so dropped entries leave no ghost blocks.
+                const partition = partitionPhantomPlans(
+                    identifyPhantomPlans(
+                        ctx.state,
+                        preparedPlans.map((p) => ({
+                            messageIds: p.selection.messageIds,
+                            consumedBlockIds: p.consumedBlockIds,
+                        })),
+                    ),
+                    preparedPlans.length,
+                )
+                let phantomSkipNotice: string | null = null
+                if (partition.kind === "all-phantom") {
+                    ctx.logger.warn("Batch compress: ALL entries phantom", {
+                        totalCount: preparedPlans.length,
+                        details: partition.details,
+                    })
+                    throw new Error(buildPhantomErrorMessage(partition.details))
+                }
+                if (partition.kind === "partial") {
+                    ctx.logger.warn("Batch compress: phantom entries detected", {
+                        phantomCount: partition.dropIndices.length,
+                        totalCount: preparedPlans.length,
+                        phantomIndices: partition.dropIndices,
+                        details: partition.details,
+                    })
+                    const dropSet = new Set(partition.dropIndices)
+                    preparedPlans = preparedPlans.filter((_, i) => !dropSet.has(i))
+                    phantomSkipNotice = partition.notice
+                }
 
-            const skippedNote = phantomSkipNotice !== null ? `\n⚠️ ${phantomSkipNotice}\n` : ""
-            const ackNote = ignoredAcknowledgeRisk
-                ? `\n⚠️ acknowledgeRisk was ignored: no quality gate rejection was pending, so quality checks ran normally. Only pass it when retrying immediately after a quality gate rejection.\n`
-                : ""
-            return `Compressed ${totalCompressedMessages} messages into ${COMPRESSED_BLOCK_HEADER}.${skippedNote}${ackNote}\nIMPORTANT: This was an automatic context compression. You MUST continue your previous task exactly where you left off. Do NOT ask the user what to do next.\n💡 Tip: Use search_context('keyword') to find compressed content when you need it later.`
+                const acknowledgeRisk = args.acknowledgeRisk === true
+
+                const qualityGateRetryPendingBefore = ctx.state.qualityGateRetryPending
+
+                // #301: the model routinely carries acknowledgeRisk over from
+                // non-quality errors (e.g. argument validation failures), which
+                // used to hard-fail with "no rejection pending". Without a pending
+                // quality-gate rejection the flag is a no-op instead — quality
+                // still runs. Only a real rejection arms the bypass.
+                const bypassQuality = acknowledgeRisk && ctx.state.qualityGateRetryPending
+                const ignoredAcknowledgeRisk = acknowledgeRisk && !ctx.state.qualityGateRetryPending
+                if (ignoredAcknowledgeRisk) {
+                    ctx.logger.warn(
+                        "compress: acknowledgeRisk ignored — no quality gate rejection pending",
+                    )
+                }
+                ctx.state.qualityGateRetryPending = false
+                if (!bypassQuality) {
+                    for (const plan of preparedPlans) {
+                        const result = evaluatePreCommitQuality(
+                            rawMessages,
+                            plan.selection.messageIds,
+                            plan.selection.messageTokenById,
+                            plan.finalSummary,
+                            ctx.config,
+                            ctx.logger,
+                        )
+                        if (result && !result.passed) {
+                            ctx.state.qualityGateRetryPending = true
+                            throw buildQualityRejectionError(
+                                {
+                                    startId: plan.entry.startId,
+                                    endId: plan.entry.endId,
+                                    summary: plan.finalSummary,
+                                    messageIds: plan.selection.messageIds,
+                                    messageTokenById: plan.selection.messageTokenById,
+                                },
+                                result,
+                            )
+                        }
+                    }
+                }
+
+                const snapshot = snapshotCompressionState(ctx.state)
+                const runId = allocateRunId(ctx.state)
+
+                try {
+                    for (const preparedPlan of preparedPlans) {
+                        const blockId = allocateBlockId(ctx.state)
+                        const keepResult = resolveKeepMarkers(
+                            preparedPlan.finalSummary,
+                            rawMessages,
+                            ctx.state,
+                            ctx.config,
+                        )
+                        preparedPlan.finalSummary = keepResult.summary
+                        const storedSummary = wrapCompressedSummary(
+                            blockId,
+                            preparedPlan.finalSummary,
+                        )
+                        const summaryTokens = countTokens(storedSummary)
+
+                        const applied = applyCompressionState(
+                            ctx.state,
+                            {
+                                topic: preparedPlan.entry.topic ?? input.topic ?? "",
+                                batchTopic: input.topic,
+                                startId: preparedPlan.entry.startId,
+                                endId: preparedPlan.entry.endId,
+                                mode: "range",
+                                runId,
+                                compressMessageId: toolCtx.messageID ?? "",
+                                compressCallId: callId,
+                                summaryTokens,
+                            },
+                            preparedPlan.selection,
+                            preparedPlan.anchorMessageId,
+                            blockId,
+                            storedSummary,
+                            preparedPlan.consumedBlockIds,
+                            ctx.config.gc,
+                        )
+
+                        totalCompressedMessages += applied.messageIds.length
+
+                        notifications.push({
+                            blockId,
+                            runId,
+                            summary: preparedPlan.finalSummary,
+                            summaryTokens,
+                        })
+                    }
+
+                    await finalizeSession(ctx, toolCtx, rawMessages, notifications, input.topic)
+                } catch (error) {
+                    restoreCompressionState(ctx.state, snapshot)
+                    ctx.state.qualityGateRetryPending = qualityGateRetryPendingBefore
+                    throw error
+                }
+
+                const skippedNote = phantomSkipNotice !== null ? `\n⚠️ ${phantomSkipNotice}\n` : ""
+                const ackNote = ignoredAcknowledgeRisk
+                    ? `\n⚠️ acknowledgeRisk was ignored: no quality gate rejection was pending, so quality checks ran normally. Only pass it when retrying immediately after a quality gate rejection.\n`
+                    : ""
+                return `Compressed ${totalCompressedMessages} messages into ${COMPRESSED_BLOCK_HEADER}.${skippedNote}${ackNote}\nIMPORTANT: This was an automatic context compression. You MUST continue your previous task exactly where you left off. Do NOT ask the user what to do next.\n💡 Tip: Use search_context('keyword') to find compressed content when you need it later.`
+            })
         },
     }
 }
