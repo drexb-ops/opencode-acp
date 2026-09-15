@@ -2,8 +2,8 @@
 
 - Task ID: `2026-09-15_restore-command-abort-throw`
 - Home Repo: `opencode-acp`
-- Status: InProgress
-- Updated: 2026-09-15 14:30
+- Status: Done
+- Updated: 2026-09-15 15:10
 
 ## 1. Summary
 
@@ -19,6 +19,8 @@
 | Commit | Description |
 |--------|-------------|
 | `2c59c07` | fix: restore throw-based abort for /acp subcommands (regression guard #398) |
+| `85bc780` | docs: record final commit sha in WORKLOG |
+| `2202bcc` | test: address review nits - type prompt recorder, tighten deny-permission abort assertion (#398) |
 
 ### Key Files
 
