@@ -205,7 +205,7 @@ test("evaluatePreCommitQuality returns null when no chunks can be extracted", ()
 
 // === buildQualityRejectionError ===
 
-test("buildQualityRejectionError includes range, stats, and acknowledgeRisk instructions", () => {
+function buildRejectionFixture() {
     const messageIds = ["msg-1", "msg-2"]
     const plan = {
         startId: "m00001",
@@ -226,15 +226,40 @@ test("buildQualityRejectionError includes range, stats, and acknowledgeRisk inst
             { name: "top20Recall", value: 0.05, format: "ratio" },
         ],
     }
+    return { plan, result }
+}
 
-    const error = buildQualityRejectionError(plan, result)
-    const msg = error.message
+test("buildQualityRejectionError includes range, reason, stats, and retry guidance", () => {
+    const { plan, result } = buildRejectionFixture()
+    const msg = buildQualityRejectionError(plan, result).message
 
     assert.ok(msg.includes("COMPRESSION REJECTED"), "should have rejection header")
     assert.ok(msg.includes("m00001–m00005"), "should include range")
+    assert.ok(msg.includes("Summary too short"), "should include gate failure reason")
     assert.ok(msg.includes("1000 tokens"), "should include original token count")
-    assert.ok(msg.includes("acknowledgeRisk"), "should mention acknowledgeRisk")
-    assert.ok(msg.includes("HOW TO COMPRESS") || msg.includes("KEEP VERBATIM"), "should include compress rules")
+    assert.ok(msg.includes("Retry:"), "should include retry directive")
+    assert.ok(msg.includes("acknowledgeRisk"), "should mention acknowledgeRisk escape hatch")
+})
+
+test("buildQualityRejectionError does not re-inject the full compression rules", () => {
+    const { plan, result } = buildRejectionFixture()
+    const msg = buildQualityRejectionError(plan, result).message
+
+    // The full HOW TO COMPRESS rules are already in the system prompt
+    // (lib/prompts/system.ts); embedding them in every rejection payload
+    // defeats compression (issue #396).
+    assert.ok(!msg.includes("HOW TO COMPRESS"), "must not embed HOW TO COMPRESS rules")
+    assert.ok(!msg.includes("KEEP VERBATIM"), "must not embed KEEP VERBATIM section")
+    assert.ok(!msg.includes("CRITICAL"), "must not embed the old warning paragraph")
+})
+
+test("buildQualityRejectionError stays within the compact size budget", () => {
+    const { plan, result } = buildRejectionFixture()
+    const msg = buildQualityRejectionError(plan, result).message
+
+    // Regression guard: the message is returned to the model as tool output on
+    // every rejection and must stay far below the ~5.4K-char pre-fix payload.
+    assert.ok(msg.length < 1000, `rejection message should be compact, got ${msg.length} chars`)
 })
 
 test("buildQualityRejectionError computes ratio and retention from plan data", () => {

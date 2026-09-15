@@ -1,4 +1,3 @@
-import { HOW_TO_COMPRESS_RULES } from "context-compress-algorithms/prompts"
 import type { QualityGateResult } from "./types"
 
 export interface RejectionPlanInfo {
@@ -45,6 +44,7 @@ export function buildQualityRejectionError(
 ): Error {
     const stats = computeStats(plan)
     const metrics = [
+        `Reason: ${result.reason || "unknown"}`,
         `Original: ~${stats.originalTokens} tokens`,
         `Summary: ${stats.summaryChars} chars`,
         `Ratio: ${stats.ratio}:1`,
@@ -54,22 +54,16 @@ export function buildQualityRejectionError(
         `top20Recall: ${formatMetric(result, "top20Recall")}`,
     ]
 
+    // Keep this payload small: it is returned to the model as tool output on
+    // every rejection, and the full HOW TO COMPRESS rules already live in the
+    // system prompt (lib/prompts/system.ts) — re-injecting them here defeats
+    // compression. Restate only a targeted retry hint.
     const message = `⚠️ COMPRESSION REJECTED — QUALITY GATE FAILURE
 
 Range: ${plan.startId}–${plan.endId}
 ${metrics.join("\n")}
 
-⚠️ CRITICAL: Compression is the ONLY mechanism for preserving historical context in this session.
-Once a compression is accepted, the original messages are permanently removed from visible context.
-Your summary becomes the SOLE record. If it fails, subsequent work is built on a broken foundation —
-memory loss → wrong assumptions → entire reasoning chain collapse.
-Treat every compression with maximum care.
-
-${HOW_TO_COMPRESS_RULES}
-
-To retry: rewrite a more complete summary that preserves critical details (file paths, decisions,
-exact values, errors). Then add "acknowledgeRisk": true to the compress tool call parameters.
-Without acknowledgeRisk: true, the compression will be rejected again.`
+Retry: rewrite a more complete summary that preserves critical details (file paths, decisions, exact values, errors) and call compress again on the same range — the gate re-evaluates automatically. Full compression rules are already in your system prompt. If you are confident the summary is correct despite the metrics, add "acknowledgeRisk": true to bypass the quality gate on your next compress call.`
 
     return new Error(message)
 }
