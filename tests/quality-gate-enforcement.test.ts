@@ -237,6 +237,7 @@ test("buildQualityRejectionError includes range, reason, stats, and retry guidan
     assert.ok(msg.includes("m00001–m00005"), "should include range")
     assert.ok(msg.includes("Summary too short"), "should include gate failure reason")
     assert.ok(msg.includes("1000 tokens"), "should include original token count")
+    assert.ok(msg.includes("Retry:"), "should include retry directive")
     assert.ok(msg.includes("acknowledgeRisk"), "should mention acknowledgeRisk escape hatch")
 })
 
