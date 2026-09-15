@@ -5,7 +5,7 @@
  * them from the LLM tool list), (b) skips the /acp command + primary_tools
  * wiring, and (c) turns every ACP hook into a no-op via the guard flag.
  *
- * The plugin is imported through the real factory (index.ts) with an
+ * The plugin is imported through the real dual entrypoint (index.ts) with an
  * isolated XDG_CONFIG_HOME / XDG_DATA_HOME so no host config or state is
  * touched. autoUpdate is disabled via the ACP config file so the factory
  * performs no network activity.
@@ -83,7 +83,7 @@ function makeUserMessage(id: string, text: string, sessionId: string): WithParts
 }
 
 async function makeHooks(): Promise<Hooks> {
-    const hooks = await plugin(makeCtx())
+    const hooks = await plugin.server(makeCtx())
     assert.ok(hooks.config, "plugin factory must register a config hook")
     return hooks
 }

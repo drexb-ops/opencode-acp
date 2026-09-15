@@ -3,7 +3,7 @@
 - Task ID: `2026-09-15_opencode-v2`
 - Home Repo: `opencode-acp`
 - Status: InProgress
-- Updated: 2026-09-15 20:24 UTC
+- Updated: 2026-09-15 20:42 UTC
 
 ## 1. Summary
 
@@ -24,7 +24,22 @@
 | ----------- | ------------------------------------------------------------- |
 | `7224ab9`   | Record the approved OpenCode V2 compatibility design          |
 | `3c00b9a`   | Refine concurrency boundaries and add the implementation plan |
-| This commit | Record the integrated pre-change verification baseline        |
+| `b42d827`   | Record the integrated pre-change verification baseline        |
+| This commit | Add the dual V1/V2 entrypoint and dependency foundation       |
+
+### Phase 1 working tree (uncommitted)
+
+- Moved the unchanged V1 factory to `lib/v1/plugin.ts` and exposed it through a
+  lazy `server()` adapter on the dual default export.
+- Added the exact `@opencode/plugin@2.0.3` V2 type boundary in
+  `lib/v2/plugin.ts`; setup intentionally registers no unfinished APIs.
+- Kept `.` and `./server` pointed at the root dual entrypoint. No `./tui` or
+  `./rpc` export was added before those files exist.
+- Raised the V1 compatibility floor to `@opencode-ai/plugin >=1.18.29` and
+  aligned the V1 SDK/dev ranges to `^1.18.29`. The package version remains
+  `1.18.1`.
+- Added source and built-entrypoint shape tests and updated the direct V1
+  integration test to invoke `.server()`.
 
 ### Key Files
 
@@ -72,6 +87,20 @@
   files inherited from the integrated upstream tree. The migration will not
   mass-format unrelated history; every file changed by this work must pass a
   targeted Prettier check.
+
+### Phase 1 verification
+
+- **PASS**: `npm ci --ignore-scripts` — lockfile is installable.
+- **PASS**: `npm run typecheck`.
+- **PASS**: `node --import tsx --test tests/plugin-entrypoint.test.ts tests/bili-proxy-integration.test.ts` — 6/6.
+- **PASS**: `npm test` — 1,291/1,291.
+- **PASS**: `npm run build` — root plus lazy V1/V2 chunks and declarations.
+- **PASS**: Built root and `opencode-acp/server` imports expose `id`, `setup`, and `server`.
+- **PASS**: `npm run verify:package` — 191 tarball entries.
+- **PASS**: Targeted Prettier check for every changed source, manifest, lockfile,
+  and test file.
+- **PRE-EXISTING FAIL**: `npm run format:check` still reports the same 450
+  inherited formatting failures; no unrelated files were formatted.
 
 ## 5. Risk Assessment and Rollback
 
