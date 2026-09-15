@@ -3,7 +3,7 @@
 - Task ID: `2026-09-15_opencode-v2`
 - Home Repo: `opencode-acp`
 - Status: InProgress
-- Updated: 2026-09-15 20:21 UTC
+- Updated: 2026-09-15 20:24 UTC
 
 ## 1. Summary
 
@@ -23,7 +23,8 @@
 | Commit      | Description                                                   |
 | ----------- | ------------------------------------------------------------- |
 | `7224ab9`   | Record the approved OpenCode V2 compatibility design          |
-| This commit | Refine concurrency boundaries and add the implementation plan |
+| `3c00b9a`   | Refine concurrency boundaries and add the implementation plan |
+| This commit | Record the integrated pre-change verification baseline        |
 
 ### Key Files
 
@@ -63,7 +64,14 @@
 ### Results
 
 - **PASS**: Design approved by the user in four sections.
-- **Not run**: Build/test commands are deferred until implementation begins.
+- **PASS**: Baseline `npm run typecheck`.
+- **PASS**: Baseline `npm test` — 1,289/1,289 tests.
+- **PASS**: Baseline `npm run build`.
+- **PASS**: Baseline `npm run verify:package` — 183 tarball entries.
+- **PRE-EXISTING FAIL**: Repository-wide `npm run format:check` reports 450
+  files inherited from the integrated upstream tree. The migration will not
+  mass-format unrelated history; every file changed by this work must pass a
+  targeted Prettier check.
 
 ## 5. Risk Assessment and Rollback
 
