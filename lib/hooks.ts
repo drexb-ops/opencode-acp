@@ -110,8 +110,11 @@ export function createSystemPromptHandler(
             return
         }
 
-        const systemText = output.system.join("\n")
-        if (INTERNAL_AGENT_SIGNATURES.some((sig) => systemText.includes(sig))) {
+        const primarySystemPrompt = output.system[0]
+        if (
+            typeof primarySystemPrompt === "string" &&
+            INTERNAL_AGENT_SIGNATURES.some((sig) => primarySystemPrompt.includes(sig))
+        ) {
             logger.info("Skipping DCP system prompt injection for internal agent")
             return
         }

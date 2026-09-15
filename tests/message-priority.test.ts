@@ -11,34 +11,66 @@ import { buildPriorityMap } from "../lib/messages/priority"
 import { stripHallucinationsFromString } from "../lib/messages/utils"
 import { createSessionState, type WithParts } from "../lib/state"
 
-function buildConfig(mode: "message" | "range" = "message"): PluginConfig {
+function buildConfig(): PluginConfig {
     return {
         enabled: true,
+        autoUpdate: false,
         debug: false,
+        logLevel: "silent",
+        allowSubAgents: false,
         pruneNotification: "off",
         pruneNotificationType: "chat",
         commands: {
             enabled: true,
             protectedTools: [],
         },
-        experimental: {
-            allowSubAgents: false,
-            customPrompts: false,
-        },
+        experimental: { customPrompts: false },
         protectedFilePatterns: [],
         compress: {
-            mode,
             permission: "allow",
             showCompression: false,
+            summaryBuffer: true,
+            candidates: false,
             maxContextLimit: 150000,
             minContextLimit: 50000,
+            contextLimitFallback: 128000,
             nudgeFrequency: 5,
+            minNudgeContextPercent: 5,
+            nudgeGrowthTokens: 50000,
             iterationNudgeThreshold: 15,
             nudgeForce: "soft",
             protectedTools: ["task"],
             protectTags: false,
             protectUserMessages: false,
+            maxSummaryLengthHard: 20000,
+            minCompressRange: 5000,
+            minNudgeGrowthRatio: 0.45,
+            minNudgeGrowthFloor: 5000,
+            emergencyThresholdPercent: "98%",
+            maxVisibleSegments: 50,
+            keepEmbedMaxChars: 2000,
         },
+        gc: {
+            algorithm: "truncate",
+            promotionThreshold: 5,
+            maxBlockAge: Number.MAX_SAFE_INTEGER,
+            maxOldGenSummaryLength: 3000,
+            majorGcThresholdPercent: "100%",
+            batchCleanup: { lowThreshold: "55%", highThreshold: "75%", forceThreshold: "90%" },
+        },
+        qualityGate: {
+            enabled: false,
+            algorithm: "rouge-recall-v1",
+            algorithms: {
+                "rouge-recall-v1": {
+                    layer1MinChars: 200,
+                    layer1MinRetentionPct: 5,
+                    layer2MaxRougeF1: 0.05,
+                    layer2MaxTop20Recall: 0.2,
+                },
+            },
+        },
+        messageFilters: { enabled: false, filters: {} },
     }
 }
 
@@ -194,14 +226,8 @@ test("injectMessageIds injects ID into every tool output for assistant messages"
     assert.equal(assistantTextTwo?.type, "text")
     assert.equal(assistantToolTwo?.type, "tool")
     // User messages: still injected into all text parts
-    assert.match(
-        (userTextOne as any).text,
-        /\n\n<dcp-message-id[^>]*>m00001<\/dcp-message-id>/,
-    )
-    assert.match(
-        (userTextTwo as any).text,
-        /\n\n<dcp-message-id[^>]*>m00001<\/dcp-message-id>/,
-    )
+    assert.match((userTextOne as any).text, /\n\n<dcp-message-id[^>]*>m00001<\/dcp-message-id>/)
+    assert.match((userTextTwo as any).text, /\n\n<dcp-message-id[^>]*>m00001<\/dcp-message-id>/)
     // Assistant messages: ID injected into every tool output
     assert.doesNotMatch((assistantTextOne as any).text, /dcp-message-id/)
     assert.match((assistantToolOne as any).state.output, /m00002<\/dcp-message-id>/)
@@ -236,7 +262,7 @@ test("injectMessageIds injects ID into every tool output in range mode", () => {
         },
     ]
     const state = createSessionState()
-    const config = buildConfig("range")
+    const config = buildConfig()
 
     assignMessageRefs(state, messages)
     injectMessageIds(state, config, messages)
@@ -252,7 +278,6 @@ test("injectMessageIds injects ID into every tool output in range mode", () => {
     assert.doesNotMatch((assistantTextTwo as any).text, /dcp-message-id/)
     assert.match((assistantToolTwo as any).state.output, /m00002<\/dcp-message-id>/)
 })
-
 
 test("range-mode nudges append to existing text parts before tool outputs", () => {
     const sessionID = "ses_range_nudge_injection"
@@ -273,7 +298,7 @@ test("range-mode nudges append to existing text parts before tool outputs", () =
         },
     ]
     const state = createSessionState()
-    const config = buildConfig("range")
+    const config = buildConfig()
 
     assignMessageRefs(state, messages)
     state.prune.messages.activeBlockIds.add(7)
@@ -320,7 +345,7 @@ test("range-mode nudges inject only once for assistant messages with multiple te
         },
     ]
     const state = createSessionState()
-    const config = buildConfig("range")
+    const config = buildConfig()
 
     assignMessageRefs(state, messages)
     state.nudges.contextLimitAnchors.add("msg-assistant-1")
@@ -354,7 +379,7 @@ test("range-mode nudges skip empty assistant messages to avoid prefill (issue #4
         },
     ]
     const state = createSessionState()
-    const config = buildConfig("range")
+    const config = buildConfig()
 
     assignMessageRefs(state, messages)
     state.nudges.contextLimitAnchors.add("msg-assistant-empty")
@@ -400,7 +425,7 @@ test("range-mode nudges skip assistant with only pending tool parts (issue #463)
         },
     ]
     const state = createSessionState()
-    const config = buildConfig("range")
+    const config = buildConfig()
 
     assignMessageRefs(state, messages)
     state.nudges.contextLimitAnchors.add("msg-assistant-pending")
@@ -434,7 +459,7 @@ test("range-mode nudges skip assistant messages with only empty text parts (issu
         },
     ]
     const state = createSessionState()
-    const config = buildConfig("range")
+    const config = buildConfig()
 
     assignMessageRefs(state, messages)
     state.nudges.contextLimitAnchors.add("msg-assistant-empty-text")
@@ -472,8 +497,14 @@ test("hallucination stripping removes all dcp-prefixed XML tags including varian
 
 test("hallucination stripping removes colon and underscore dcp tag variants", async () => {
     // The regex matches <dcp...> with any suffix (colon, underscore, etc.)
-    assert.equal(stripHallucinationsFromString('before<dcp:block>content</dcp:block>after'), "beforeafter")
-    assert.equal(stripHallucinationsFromString('start<dcp_summary>text</dcp_summary>end'), "startend")
+    assert.equal(
+        stripHallucinationsFromString("before<dcp:block>content</dcp:block>after"),
+        "beforeafter",
+    )
+    assert.equal(
+        stripHallucinationsFromString("start<dcp_summary>text</dcp_summary>end"),
+        "startend",
+    )
 })
 
 test("hallucination stripping removes orphan opening tags", async () => {
@@ -514,6 +545,30 @@ test("hallucination stripping does not affect non-dcp tags", async () => {
     )
 })
 
+test("hallucination stripping preserves text that mentions an injected message tag", () => {
+    for (const tag of ["acp-message-id", "dcp-message-id"]) {
+        for (const ref of ["m0001", "m00001"]) {
+            const input =
+                `The tag called \`<${tag}>\` tracks messages. This text must survive.\n\n` +
+                `<${tag} tokens="1K">${ref}</${tag}>`
+
+            assert.equal(
+                stripHallucinationsFromString(input),
+                `The tag called \`\` tracks messages. This text must survive.\n`,
+            )
+        }
+    }
+})
+
+test("hallucination stripping removes a trailing parameter-close artifact", () => {
+    for (const ref of ["m0001", "m00001"]) {
+        assert.equal(
+            stripHallucinationsFromString(`Total: 20 files changed.\n\n${ref}</parameter>\n\n`),
+            "Total: 20 files changed.\n",
+        )
+    }
+})
+
 test("injectMessageIds skips empty assistant messages to avoid prefill (issue #463)", () => {
     const sessionID = "ses_empty_assistant"
     const messages: WithParts[] = [
@@ -531,7 +586,7 @@ test("injectMessageIds skips empty assistant messages to avoid prefill (issue #4
         buildMessage("msg-user-2", "user", sessionID, "continue", 3),
     ]
     const state = createSessionState()
-    const config = buildConfig("range")
+    const config = buildConfig()
 
     assignMessageRefs(state, messages)
     injectMessageIds(state, config, messages)
@@ -570,7 +625,7 @@ test("injectMessageIds skips assistant with only pending tool parts (issue #463)
         buildMessage("msg-user-2", "user", sessionID, "continue", 3),
     ]
     const state = createSessionState()
-    const config = buildConfig("range")
+    const config = buildConfig()
 
     assignMessageRefs(state, messages)
     injectMessageIds(state, config, messages)
@@ -601,7 +656,7 @@ test("injectMessageIds skips assistant with empty text part (issue #463)", () =>
         buildMessage("msg-user-2", "user", sessionID, "continue", 3),
     ]
     const state = createSessionState()
-    const config = buildConfig("range")
+    const config = buildConfig()
 
     assignMessageRefs(state, messages)
     injectMessageIds(state, config, messages)

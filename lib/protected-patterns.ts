@@ -1,5 +1,5 @@
 function normalizePath(input: string): string {
-    return input.replaceAll("\\\\", "/")
+    return input.replaceAll("\\", "/")
 }
 
 function escapeRegExpChar(ch: string): string {

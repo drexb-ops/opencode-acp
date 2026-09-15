@@ -10,6 +10,9 @@ const DCP_BLOCK_ID_TAG_REGEX = /(<(?:dcp|acp)-message-id[^>]*>)b\d+(<\/(?:dcp|ac
 const DCP_MESSAGE_REF_TAG_REGEX = /<(?:dcp|acp)-message-id[^>]*>m\d+<\/(?:dcp|acp)-message-id>/g
 const DCP_PAIRED_TAG_REGEX = /<(?:dcp|acp)[^>]*>[\s\S]*?<\/(?:dcp|acp)[^>]*>/gi
 const DCP_UNPAIRED_TAG_REGEX = /<\/?(?:dcp|acp)[^>]*>/gi
+const INJECTED_MESSAGE_ID_SUFFIX_REGEX =
+    /\n<(?:dcp|acp)-message-id[^>]*>m\d{4,5}<\/(?:dcp|acp)-message-id>\s*$/
+const HALLUCINATED_PARAMETER_SUFFIX_REGEX = /\nm\d{4,5}<\/parameter>\s*$/
 
 const generateStableId = (prefix: string, seed: string): string => {
     const hash = createHash("sha256").update(seed).digest("hex").slice(0, SUMMARY_ID_HASH_LENGTH)
@@ -201,7 +204,12 @@ export const stripStaleMessageRefs = (text: string): string => {
 }
 
 export const stripHallucinationsFromString = (text: string): string => {
-    return text.replace(DCP_PAIRED_TAG_REGEX, "").replace(DCP_UNPAIRED_TAG_REGEX, "")
+    const withoutTrailingArtifacts = text
+        .replace(INJECTED_MESSAGE_ID_SUFFIX_REGEX, "")
+        .replace(HALLUCINATED_PARAMETER_SUFFIX_REGEX, "")
+    return withoutTrailingArtifacts
+        .replace(DCP_PAIRED_TAG_REGEX, "")
+        .replace(DCP_UNPAIRED_TAG_REGEX, "")
 }
 
 export const stripHallucinations = (messages: WithParts[]): void => {
@@ -242,7 +250,8 @@ export const dropEmptyMessages = (messages: WithParts[]): number => {
         const isEmpty = parts.every(
             (part) =>
                 part.type === "text" &&
-                ((typeof part.text !== "string" || part.text.trim().length === 0) ||
+                (typeof part.text !== "string" ||
+                    part.text.trim().length === 0 ||
                     (part as { ignored?: boolean }).ignored === true),
         )
         if (isEmpty) {

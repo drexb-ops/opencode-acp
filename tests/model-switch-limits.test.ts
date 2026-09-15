@@ -23,7 +23,13 @@ import { tmpdir } from "node:os"
 import type { PluginConfig } from "../lib/config"
 import { createChatMessageTransformHandler, createSystemPromptHandler } from "../lib/hooks"
 import { Logger } from "../lib/logger"
-import { SessionStateRegistry, createSessionState, type SessionState, type WithParts } from "../lib/state"
+import {
+    SessionStateRegistry,
+    createSessionState,
+    saveSessionState,
+    type SessionState,
+    type WithParts,
+} from "../lib/state"
 import { createTestRegistry } from "./registry-stub"
 
 const SID = "session-model-switch"
@@ -40,25 +46,36 @@ function buildConfig(): PluginConfig {
         enabled: true,
         autoUpdate: true,
         debug: false,
+        logLevel: "silent",
+        allowSubAgents: false,
         pruneNotification: "off",
         pruneNotificationType: "chat",
         commands: { enabled: true, protectedTools: [] },
-        experimental: { allowSubAgents: false, customPrompts: false },
+        experimental: { customPrompts: false },
         protectedFilePatterns: [],
         compress: {
-            mode: "message",
             permission: "allow",
             showCompression: false,
             summaryBuffer: true,
+            candidates: false,
             maxContextLimit: 5_000_000,
             minContextLimit: 5_000,
+            contextLimitFallback: 128_000,
             nudgeFrequency: 5,
+            minNudgeContextPercent: 5,
+            nudgeGrowthTokens: 50_000,
             iterationNudgeThreshold: 15,
             nudgeForce: "soft",
             protectedTools: ["task"],
             protectTags: false,
             protectUserMessages: false,
+            maxSummaryLengthHard: 20_000,
+            minCompressRange: 5_000,
+            minNudgeGrowthRatio: 0.45,
+            minNudgeGrowthFloor: 5_000,
             emergencyThresholdPercent: EMERGENCY_PERCENT,
+            maxVisibleSegments: 50,
+            keepEmbedMaxChars: 2_000,
         },
         gc: {
             algorithm: "truncate",
@@ -68,6 +85,19 @@ function buildConfig(): PluginConfig {
             majorGcThresholdPercent: "100%",
             batchCleanup: { lowThreshold: "60%", highThreshold: "75%", forceThreshold: "90%" },
         },
+        qualityGate: {
+            enabled: false,
+            algorithm: "rouge-recall-v1",
+            algorithms: {
+                "rouge-recall-v1": {
+                    layer1MinChars: 200,
+                    layer1MinRetentionPct: 5,
+                    layer2MaxRougeF1: 0.05,
+                    layer2MaxTop20Recall: 0.2,
+                },
+            },
+        },
+        messageFilters: { enabled: false, filters: {} },
     }
 }
 
@@ -138,7 +168,7 @@ function createMockPrompts() {
 
 function collectText(messages: WithParts[]): string {
     return messages
-        .flatMap((m) => (m.parts ?? []))
+        .flatMap((m) => m.parts ?? [])
         .filter((p) => p.type === "text")
         .map((p) => (p as { text?: string }).text ?? "")
         .join("\n")
@@ -170,6 +200,7 @@ async function runTransform(opts: {
     try {
         const state = createSessionState()
         state.sessionId = SID
+        state.storageDir = join(tempDir, "state")
         state.modelContextLimit = opts.initialLimit
         // Simulates the identity pair the system hook would have recorded
         // alongside the limit; omitting it simulates a legacy persisted state
@@ -184,10 +215,11 @@ async function runTransform(opts: {
             registry.recordModelLimit(providerId, modelId, limit)
         }
 
+        const logger = opts.logger ?? new Logger(false)
         const handler = createChatMessageTransformHandler(
             opts.client ?? createMockClient(),
             registry,
-            opts.logger ?? new Logger(false),
+            logger,
             opts.config ?? buildConfig(),
             createMockPrompts(),
             { global: undefined, agents: {} },
@@ -202,6 +234,7 @@ async function runTransform(opts: {
         messages.splice(2, 0, makeAssistantMessage("msg-a2", "big answer", opts.currentTokens))
 
         await handler({}, { messages })
+        await saveSessionState(state, logger)
 
         return { text: collectText(messages), state }
     } finally {
@@ -238,16 +271,23 @@ test("catalog miss + model switch invalidates the stale limit (legacy state)", a
     // the stale 200K window. The #312 false positive is eliminated even when
     // the catalog misses; system.transform refreshes the pair later in this
     // same request.
+    const config = buildConfig()
+    config.compress.contextLimitFallback = 0
     const { text, state } = await runTransform({
         currentTokens: 260_000,
         modelId: NEW_MODEL,
         initialLimit: OLD_LIMIT,
+        config,
     })
 
     assert.equal(state.modelContextLimit, undefined, "stale limit must be invalidated")
     assert.equal(state.modelProviderID, PROVIDER)
     assert.equal(state.modelID, NEW_MODEL)
     assert.ok(!text.includes("Context limit reached"), "no emergency math against unknown window")
+    assert.ok(
+        !text.includes("Context is critically full"),
+        "no emergency notice against unknown window",
+    )
 })
 
 test("catalog miss + identity mismatch invalidates the stale limit", async () => {
@@ -323,27 +363,30 @@ test("system.transform records model limit even when session state is absent", a
 })
 
 test("system.transform records the model identity alongside the limit", async () => {
+    const storageDir = mkdtempSync(join(tmpdir(), "acp-system-transform-"))
     const state = createSessionState()
     state.sessionId = SID
+    state.storageDir = storageDir
     const registry = createTestRegistry(state)
-    const handler = createSystemPromptHandler(
-        registry,
-        new Logger(false),
-        buildConfig(),
-        createMockPrompts(),
-    )
+    const logger = new Logger(false)
+    const handler = createSystemPromptHandler(registry, logger, buildConfig(), createMockPrompts())
 
-    await handler(
-        {
-            sessionID: SID,
-            model: { id: NEW_MODEL, providerID: PROVIDER, limit: { context: NEW_LIMIT } },
-        },
-        { system: ["base system prompt"] },
-    )
+    try {
+        await handler(
+            {
+                sessionID: SID,
+                model: { id: NEW_MODEL, providerID: PROVIDER, limit: { context: NEW_LIMIT } },
+            },
+            { system: ["base system prompt"] },
+        )
+        await saveSessionState(state, logger)
 
-    assert.equal(state.modelContextLimit, NEW_LIMIT)
-    assert.equal(state.modelProviderID, PROVIDER)
-    assert.equal(state.modelID, NEW_MODEL)
+        assert.equal(state.modelContextLimit, NEW_LIMIT)
+        assert.equal(state.modelProviderID, PROVIDER)
+        assert.equal(state.modelID, NEW_MODEL)
+    } finally {
+        rmSync(storageDir, { recursive: true, force: true })
+    }
 })
 
 test("registry catalog ignores invalid entries and unknown lookups", () => {
@@ -395,7 +438,11 @@ test("hydrateModelLimitsFromClient tolerates missing and throwing clients", asyn
     assert.equal(await registry.hydrateModelLimitsFromClient({}), 0)
     assert.equal(
         await registry.hydrateModelLimitsFromClient({
-            config: { providers: async () => { throw new Error("offline") } },
+            config: {
+                providers: async () => {
+                    throw new Error("offline")
+                },
+            },
         }),
         0,
     )
@@ -463,10 +510,12 @@ test("system.transform persists the limit so spawned processes resume with it (#
         const deadline = Date.now() + 2000
         while (!persisted && Date.now() < deadline) {
             if (existsSync(file)) {
-                persisted = JSON.parse(readFileSync(file, "utf8"))
-            } else {
-                await new Promise((resolve) => setTimeout(resolve, 50))
+                try {
+                    persisted = JSON.parse(readFileSync(file, "utf8"))
+                    continue
+                } catch {}
             }
+            await new Promise((resolve) => setTimeout(resolve, 50))
         }
         assert.ok(persisted, "state file must be written by the system hook")
         assert.equal(persisted.modelContextLimit, NEW_LIMIT)
@@ -497,16 +546,61 @@ test("internal-agent system prompts must not overwrite the session limit (#346)"
         createMockPrompts(),
     )
 
+    const output = { system: ["You are a title generator for conversations."] }
     await handler(
         {
             sessionID: SID,
             model: { id: "title-model", providerID: PROVIDER, limit: { context: 8_000 } },
         },
-        { system: ["You are a title generator for conversations."] },
+        output,
     )
 
     assert.equal(state.modelContextLimit, OLD_LIMIT, "title-agent limit must not overwrite")
     assert.equal(state.modelID, OLD_MODEL)
+    assert.deepEqual(output.system, ["You are a title generator for conversations."])
+})
+
+test("bundled internal prompts do not suppress a primary session request", async () => {
+    const storageDir = mkdtempSync(join(tmpdir(), "acp-primary-prompt-"))
+    const state = createSessionState()
+    state.sessionId = SID
+    state.storageDir = storageDir
+    state.modelContextLimit = OLD_LIMIT
+    const registry = createTestRegistry(state)
+    const handler = createSystemPromptHandler(
+        registry,
+        new Logger(false),
+        buildConfig(),
+        createMockPrompts(),
+    )
+
+    const output = {
+        system: [
+            "You are the primary coding assistant.",
+            "You are a title generator for conversations.",
+        ],
+    }
+    try {
+        await handler(
+            {
+                sessionID: SID,
+                model: { id: NEW_MODEL, providerID: PROVIDER, limit: { context: NEW_LIMIT } },
+            },
+            output,
+        )
+
+        assert.equal(state.modelContextLimit, NEW_LIMIT)
+        assert.equal(state.modelID, NEW_MODEL)
+        assert.equal(output.system[0], "You are the primary coding assistant.")
+        assert.match(
+            output.system[1],
+            /^You are a title generator for conversations\.\n\nACP system/,
+        )
+        await saveSessionState(state, new Logger(false))
+        assert.ok(existsSync(join(storageDir, `${SID}.json`)))
+    } finally {
+        rmSync(storageDir, { recursive: true, force: true })
+    }
 })
 
 test("hydrateAndResolve: cached hit never touches the client", async () => {
@@ -557,7 +651,11 @@ test("hydrateAndResolve: hydrates at most once per process, then stops retrying 
 test("hydrateAndResolve: tolerates throwing clients", async () => {
     const registry = new SessionStateRegistry(new Logger(false))
     const client = {
-        config: { providers: async () => { throw new Error("offline") } },
+        config: {
+            providers: async () => {
+                throw new Error("offline")
+            },
+        },
     }
 
     assert.equal(await registry.hydrateAndResolve(client, PROVIDER, NEW_MODEL), undefined)
