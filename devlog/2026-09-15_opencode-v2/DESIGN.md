@@ -114,8 +114,9 @@ Host adapters
 │   └── @opencode-ai/plugin tool wrappers
 └── V2
     ├── setup and lifecycle
-    ├── projected-history normalization
+    ├── projected-history normalization + provenance/opaque sidecar
     ├── validated outgoing-context patching
+    ├── per-session state transaction guard
     ├── @opencode/plugin tool and command transforms
     ├── catalog/proxy monitoring
     └── server notification RPC emission
@@ -185,6 +186,20 @@ into V2 plugin key-value storage. This preserves:
 The state codec accepts only ACP's internal representation. Host message objects
 must be normalized before state logic sees them.
 
+### 5.4 State transaction boundary
+
+Initialization, context transformation, and compression tool state mutations for
+one session share a per-session guard. The registry tracks in-flight
+initialization so a second caller cannot return the newly inserted state before
+its persisted data, fork translation, refs, and indexes are ready.
+
+V2 request transforms use a complete working clone of mutable `SessionState`.
+The clone includes prune data and transient indexes, nudges, stats, tool caches,
+message refs, compaction/turn fields, model data, permissions, and request flags.
+It deliberately preserves the identity of the registry-wide compression-timing
+object. Persistence, notifications, and debug snapshots are deferred effects;
+they run only after patch validation and state commit.
+
 ## 6. V2 Context Data Flow
 
 ### 6.1 Request flow
@@ -196,15 +211,19 @@ or title hooks.
 For each primary request:
 
 1. Resolve `event.model` in the V2 catalog and record its current context limit.
-2. Read `ctx.session.context({ sessionID })` for projected, ID-bearing history.
-3. Normalize projected messages into ACP's existing internal message envelope.
-4. Snapshot request-mutated registry state.
-5. Run the existing ACP message pipeline against a copy.
-6. Derive a context patch by comparing original and transformed internal data.
-7. Validate every patch correlation and structural invariant.
-8. Apply the validated patch to V2's already-lowered `event.messages`.
-9. Commit request state and persist it.
-10. Render and append the ACP system prompt to `event.system`.
+2. Acquire the per-session state guard and await complete initialization.
+3. Read `ctx.session.context({ sessionID })` for projected, ID-bearing history.
+4. Normalize projected messages into ACP's internal envelope plus a provenance
+   sidecar that records origins and opaque host-owned content.
+5. Clone the complete mutable runtime state and stage external effects.
+6. Run the existing ACP message pipeline against the working state and message
+   copy.
+7. Derive a context patch by comparing original and transformed internal data.
+8. Validate every patch correlation and structural invariant.
+9. Render the ACP system prompt from the validated working state.
+10. Replace `event.messages`, append `event.system`, commit working state, and
+    run deferred persistence/effects.
+11. Release the session guard.
 
 Combining message and system behavior in one V2 hook preserves the V1 ordering
 assumption that message processing establishes the current model and state before
@@ -225,7 +244,10 @@ The V2 adapter therefore applies only ACP-owned changes:
 - insert an ACP summary or nudge with an ACP-owned ID
 - remove ACP-owned model-invisible notices
 
-All other fields and content parts remain the original V2 objects.
+All other fields and content parts remain the original V2 objects. The sidecar
+marks attachments, decoded provider checkpoints, provider metadata, structured
+or file tool output, un-IDed system messages, and uncorrelated host messages as
+opaque unless an exact origin mapping proves a specific ACP patch is safe.
 
 ### 6.3 Projection categories
 
@@ -238,6 +260,11 @@ Normalization explicitly handles:
 - completed, running, and failed compaction messages
 - synthetic, system, skill, shell, and location messages
 - agent/model/control messages that do not enter model context
+
+The normalizer adds internal-only turn markers derived from projected assistant
+steps so existing turn-count logic does not depend on V1 `step-start` parts.
+These markers never patch V2 output. Provider checkpoint messages decoded into
+arbitrary model messages remain opaque.
 
 A completed compaction maps to ACP's current boundary semantics: transient refs,
 nudge baselines, and tool-parameter caches reset, while active ACP blocks and
@@ -253,10 +280,15 @@ Before mutation:
 - tool calls and results remain paired
 - inserted IDs are ACP-owned and collision-free
 - the resulting V2 messages satisfy their schemas
+- the projection fingerprint still matches the already-lowered request
 
 Validation failure preserves the original request. ACP restores the registry
 snapshot so its state cannot claim a transform the model never received. The
 failure is logged without message bodies or credentials.
+
+Because `ctx.session.context()` and `event.messages` are not returned with a
+shared sequence token, any fingerprint mismatch is treated as an ambiguous
+projection and leaves the request unchanged.
 
 ## 7. V2 Lifecycle and Integrations
 
@@ -280,6 +312,11 @@ and status metadata currently sent through V1 tool metadata.
 Timing uses V2 tool execute-before/after hooks for ACP tools rather than
 reconstructing V1 `message.part.updated` events. This retains reliable call and
 session correlation.
+
+OpenCode V2.0.3 tool context does not expose a cancellation signal. ACP passes
+host cancellation only on V1 and otherwise relies on session interruption and
+plugin cleanup; it does not claim that already-running V2 tool code can be
+force-cancelled through the public plugin API.
 
 ### 7.3 Commands and model-invisible notices
 
@@ -370,7 +407,8 @@ correlations preserve the request, state rolls back, pairs remain atomic, and
 only ACP-owned notices are hidden.
 
 Lifecycle tests cover partial setup, unload/reload, update cancellation, catalog
-changes, RPC cleanup, and duplicate-registration prevention.
+changes, RPC cleanup, duplicate-registration prevention, concurrent same-session
+initialization, and context/tool serialization.
 
 ### 10.2 Installed-package E2E
 

@@ -6,7 +6,8 @@
 - Status: InProgress
 - Priority: P0
 - Owner: OpenCode agent
-- References: https://github.com/ranxianglei/opencode-acp/issues/395
+- References: https://github.com/ranxianglei/opencode-acp/issues/395,
+  https://github.com/ranxianglei/opencode-acp/issues/404
 
 ## 1. Background & Problem Statement
 
@@ -59,6 +60,8 @@
       OpenCode 2.0.3 does not expose a post-generation mutation hook.
     - All source and modified test files require two independent agent reviews.
     - `package.json` version must not change on this feature branch.
+    - Same-session initialization, context transforms, and compression tools must
+      serialize state mutations so no caller observes or commits partial state.
 - **Performance requirements**:
     - Avoid wholesale reconstruction of the V2 model transcript.
     - Do not add model calls or network services to the per-request transform.
@@ -107,6 +110,8 @@
           call ID.
     - [ ] An invalid or ambiguous patch preserves the original model request and
           rolls back request-scoped ACP state changes.
+    - [ ] Same-session concurrent initialization and transform/tool work cannot
+          expose partial state or overwrite a newer committed state.
     - [ ] Tool-call/result pairs remain atomic and unchanged provider data is
           retained.
     - [ ] Completed compaction resets transient ACP state while preserving active

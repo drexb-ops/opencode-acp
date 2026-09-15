@@ -3,7 +3,7 @@
 - Task ID: `2026-09-15_opencode-v2`
 - Home Repo: `opencode-acp`
 - Status: InProgress
-- Updated: 2026-09-15 19:42 UTC
+- Updated: 2026-09-15 20:21 UTC
 
 ## 1. Summary
 
@@ -20,9 +20,10 @@
 
 ### Commits
 
-| Commit      | Description                                          |
-| ----------- | ---------------------------------------------------- |
-| This commit | Record the approved OpenCode V2 compatibility design |
+| Commit      | Description                                                   |
+| ----------- | ------------------------------------------------------------- |
+| `7224ab9`   | Record the approved OpenCode V2 compatibility design          |
+| This commit | Refine concurrency boundaries and add the implementation plan |
 
 ### Key Files
 
@@ -53,6 +54,11 @@
   contracts and runtime lowering behavior.
 - Used three read-only subagents to independently map ACP behavior, V2 APIs, and
   test/package/release constraints.
+- Used two additional read-only subagents to trace message mutations,
+  persistence boundaries, runtime adapter seams, and exact package entrypoint
+  behavior before implementation planning.
+- Filed issue #404 for the discovered same-session partial-initialization and
+  concurrent-state race.
 
 ### Results
 
@@ -70,5 +76,6 @@
 ## 6. Follow-ups
 
 - Implement the approved design in bounded, reviewable slices.
+- Follow `docs/superpowers/plans/2026-09-15-opencode-v2-implementation.md`.
 - Obtain at least two independent agent reviews for all changed source/tests.
 - Run packed-artifact V1 and V2 E2E verification before PR readiness.
