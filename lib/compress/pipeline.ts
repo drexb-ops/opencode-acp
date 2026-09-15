@@ -5,7 +5,7 @@ import { assignMessageRefs } from "../message-ids"
 import { isIgnoredUserMessage, isSyntheticMessage } from "../messages/query"
 import { getCurrentParams, getCurrentTokenUsage } from "../token-utils"
 import { sendCompressNotification } from "../ui/notification"
-import type { ToolContext } from "./types"
+import { resolveToolHost, type ToolContext, type ToolExecutionContext } from "./types"
 import { buildSearchContext, fetchSessionMessages } from "./search"
 import type { SearchContext } from "./types"
 import { applyPendingCompressionDurations } from "./timing"
@@ -28,17 +28,6 @@ export function restoreCompressionState(state: SessionState, snapshot: Compressi
     state.stats = { ...snapshot.stats }
 }
 
-interface RunContext {
-    ask(input: {
-        permission: string
-        patterns: string[]
-        always: string[]
-        metadata: Record<string, unknown>
-    }): Promise<void>
-    metadata(input: { title: string }): void
-    sessionID: string
-}
-
 export interface NotificationEntry {
     blockId: number
     runId: number
@@ -53,9 +42,10 @@ export interface PreparedSession {
 
 export async function prepareSession(
     ctx: ToolContext,
-    toolCtx: RunContext,
+    toolCtx: ToolExecutionContext,
     title: string,
 ): Promise<PreparedSession> {
+    const host = resolveToolHost(ctx)
     await toolCtx.ask({
         permission: "compress",
         patterns: ["*"],
@@ -65,10 +55,10 @@ export async function prepareSession(
 
     toolCtx.metadata({ title })
 
-    const rawMessages = await fetchSessionMessages(ctx.client, toolCtx.sessionID)
+    const rawMessages = await fetchSessionMessages(host.sessions, toolCtx.sessionID)
 
     await ensureSessionInitialized(
-        ctx.client,
+        host.sessions,
         ctx.state,
         toolCtx.sessionID,
         ctx.logger,
@@ -86,11 +76,12 @@ export async function prepareSession(
 
 export async function finalizeSession(
     ctx: ToolContext,
-    toolCtx: RunContext,
+    toolCtx: ToolExecutionContext,
     rawMessages: WithParts[],
     entries: NotificationEntry[],
     batchTopic: string | undefined,
 ): Promise<void> {
+    const host = resolveToolHost(ctx)
     applyPendingCompressionDurations(ctx.state)
     await saveSessionState(ctx.state, ctx.logger)
 
@@ -122,7 +113,7 @@ export async function finalizeSession(
     const contextTokensBefore = getCurrentTokenUsage(ctx.state, rawMessages)
 
     await sendCompressNotification(
-        ctx.client,
+        host.notifications,
         ctx.logger,
         ctx.config,
         ctx.state,

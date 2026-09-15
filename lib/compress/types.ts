@@ -1,11 +1,18 @@
 import type { PluginConfig } from "../config"
+import type { HostServices } from "../host"
+import { createLegacyHostServices } from "../host/legacy"
 import type { Logger } from "../logger"
 import type { PromptStore } from "../prompts/store"
 import type { CompressionBlock, CompressionMode, SessionState, WithParts } from "../state"
-import type { SessionStateRegistry } from "../state"
+import type { z } from "zod"
 
 export interface ToolContext {
-    client: any
+    /** Host-neutral services; V1/V2 adapters own concrete client access. */
+    host: HostServices
+    sessions: HostServices["sessions"]
+    models: HostServices["models"]
+    notices: HostServices["notices"]
+    notifications: HostServices["notifications"]
     state: SessionState
     logger: Logger
     config: PluginConfig
@@ -13,17 +20,82 @@ export interface ToolContext {
 }
 
 export interface ToolFactoryContext {
-    client: any
-    registry: SessionStateRegistry
+    /** Preferred host-neutral service bundle. */
+    host?: HostServices
+    /** Legacy structural client accepted only by V1 compatibility factories. */
+    client?: unknown
+    registry: ToolStateRegistry
     logger: Logger
     config: PluginConfig
     prompts: PromptStore
+}
+
+/** The only registry operation needed while resolving a tool call. */
+export interface ToolStateRegistry {
+    get(sessionID: string): SessionState | undefined
+}
+
+export interface ToolAskInput {
+    permission: string
+    patterns: string[]
+    always: string[]
+    metadata: Record<string, unknown>
+}
+
+export interface ToolExecutionContext {
+    sessionID: string
+    messageID?: string
+    callID?: string
+    agent?: string
+    directory?: string
+    abort?: AbortSignal
+    permission?: "allow" | "ask" | "deny"
+    ask(input: ToolAskInput): Promise<void>
+    metadata(input: { title?: string; metadata?: Record<string, unknown> }): void
+    progress?(input: { title?: string; status?: string }): Promise<void> | void
+}
+
+export type SharedToolResult =
+    | string
+    | {
+          title?: string
+          output: string
+          metadata?: Record<string, unknown>
+          attachments?: Array<{
+              type: "file"
+              mime: string
+              url: string
+              filename?: string
+          }>
+      }
+
+export type AnyToolSchema = z.ZodObject<z.ZodRawShape>
+
+/** A host-neutral model tool definition shared by both runtime adapters. */
+export interface SharedToolDefinition<Schema extends AnyToolSchema = AnyToolSchema> {
+    name: string
+    description: string
+    schema: Schema
+    /** Alias used by hosts that call the field `inputSchema`. */
+    inputSchema: Schema
+    execute(input: z.infer<Schema>, context: ToolExecutionContext): Promise<SharedToolResult>
+}
+
+/** Resolve a factory's host without exposing a V1 client to shared execution. */
+export function resolveFactoryHost(factoryCtx: ToolFactoryContext): HostServices {
+    return factoryCtx.host ?? createLegacyHostServices(factoryCtx.client)
+}
+
+export function resolveToolHost(ctx: ToolContext): HostServices {
+    const legacyClient = (ctx as ToolContext & { client?: unknown }).client
+    return ctx.host ?? createLegacyHostServices(legacyClient)
 }
 
 // [FIX #33] Resolve the caller's per-session state at tool-call time and build a
 // ToolContext bound to it. A compress tool can only run after messages.transform
 // initialized the session, so the state is guaranteed present.
 export function resolveToolContext(factoryCtx: ToolFactoryContext, sessionID: string): ToolContext {
+    const host = resolveFactoryHost(factoryCtx)
     const state = factoryCtx.registry.get(sessionID)
     if (!state) {
         throw new Error(
@@ -32,7 +104,11 @@ export function resolveToolContext(factoryCtx: ToolFactoryContext, sessionID: st
         )
     }
     return {
-        client: factoryCtx.client,
+        host,
+        sessions: host.sessions,
+        models: host.models,
+        notices: host.notices,
+        notifications: host.notifications,
         state,
         logger: factoryCtx.logger,
         config: factoryCtx.config,

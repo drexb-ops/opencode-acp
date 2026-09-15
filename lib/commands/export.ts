@@ -19,12 +19,8 @@ import { existsSync } from "fs"
 import { dirname, isAbsolute, join, resolve } from "path"
 import type { Logger } from "../logger"
 import type { PluginConfig } from "../config"
-import type {
-    CompressionBlock,
-    CompressionTier,
-    SessionState,
-    WithParts,
-} from "../state/types"
+import type { NoticeSink } from "../host"
+import type { CompressionBlock, CompressionTier, SessionState, WithParts } from "../state/types"
 import { sendIgnoredMessage } from "../ui/notification"
 
 const ALL_TIERS: CompressionTier[] = [1, 2, 3]
@@ -36,7 +32,7 @@ const TIER_NAMES: Record<number, string> = {
 }
 
 export interface ExportCommandContext {
-    client: any
+    notices: NoticeSink
     state: SessionState
     config: PluginConfig
     logger: Logger
@@ -203,10 +199,7 @@ function collectActiveBlocks(state: SessionState): CompressionBlock[] {
     return blocks
 }
 
-function filterByTier(
-    blocks: CompressionBlock[],
-    tiers: Set<CompressionTier>,
-): CompressionBlock[] {
+function filterByTier(blocks: CompressionBlock[], tiers: Set<CompressionTier>): CompressionBlock[] {
     if (tiers.size === 0) return blocks
     return blocks.filter((b) => tiers.has((b.tier ?? 1) as CompressionTier))
 }
@@ -243,7 +236,11 @@ export function renderExportMarkdown(params: {
     const out: string[] = []
 
     const tierFilterLabel =
-        tiers.size === 0 ? "all" : ALL_TIERS.filter((t) => tiers.has(t)).map((t) => `T${t}`).join(", ")
+        tiers.size === 0
+            ? "all"
+            : ALL_TIERS.filter((t) => tiers.has(t))
+                  .map((t) => `T${t}`)
+                  .join(", ")
 
     out.push("# ACP Session Export")
     out.push("")
@@ -318,11 +315,8 @@ export function renderExportMarkdown(params: {
  * Main handler invoked by the command hook.
  * @param args raw argument string following `/acp export` (may be empty).
  */
-export async function handleExportCommand(
-    ctx: ExportCommandContext,
-    args: string,
-): Promise<void> {
-    const { client, state, logger, sessionId } = ctx
+export async function handleExportCommand(ctx: ExportCommandContext, args: string): Promise<void> {
+    const { state, logger, sessionId } = ctx
 
     let options: ExportOptions
     try {
@@ -330,7 +324,7 @@ export async function handleExportCommand(
     } catch (err: any) {
         const msg = err?.message ?? String(err)
         logger.warn("export: argument parse failed", { error: msg, args })
-        await sendExportNotice(client, sessionId, ctx, `[ACP Export] ${msg}`)
+        await sendExportNotice(sessionId, ctx, `[ACP Export] ${msg}`)
         return
     }
 
@@ -350,7 +344,7 @@ export async function handleExportCommand(
 
     // Stream-to-chat mode: `--output -` or `--stdout`.
     if (options.outputPath === "-") {
-        await sendExportNotice(client, sessionId, ctx, markdown)
+        await sendExportNotice(sessionId, ctx, markdown)
         return
     }
 
@@ -378,7 +372,6 @@ export async function handleExportCommand(
         const msg = err?.message ?? String(err)
         logger.warn("export: file write failed", { path: targetPath, error: msg })
         await sendExportNotice(
-            client,
             sessionId,
             ctx,
             `[ACP Export] Failed to write \`${targetPath}\`: ${msg}`,
@@ -393,7 +386,7 @@ export async function handleExportCommand(
     })
 
     const summary = formatExportSummary(targetPath, blocks, allActive, generatedAt)
-    await sendExportNotice(client, sessionId, ctx, summary)
+    await sendExportNotice(sessionId, ctx, summary)
 }
 
 function formatExportSummary(
@@ -422,10 +415,9 @@ function formatExportSummary(
 }
 
 async function sendExportNotice(
-    client: any,
     sessionId: string,
     ctx: ExportCommandContext,
     text: string,
 ): Promise<void> {
-    await sendIgnoredMessage(client, sessionId, text, {}, ctx.logger)
+    await sendIgnoredMessage(ctx.notices, sessionId, text, {}, ctx.logger)
 }

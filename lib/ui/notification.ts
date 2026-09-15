@@ -1,9 +1,7 @@
 import type { Logger } from "../logger"
 import type { SessionState } from "../state"
-import {
-    formatProgressBar,
-    formatTokenCount,
-} from "./utils"
+import type { NoticeSink, NotificationSink } from "../host"
+import { formatProgressBar, formatTokenCount } from "./utils"
 import { PluginConfig } from "../config"
 
 interface CompressionNotificationEntry {
@@ -62,11 +60,11 @@ function buildCompressionSummary(
     let shown = 0
     for (let i = 0; i < entries.length; i++) {
         const entry = entries[i]
-        const topic =
-            state.prune.messages.blocksById.get(entry.blockId)?.topic ?? "(unknown topic)"
-        const truncated = entry.summary.length > perEntryMax
-            ? entry.summary.slice(0, perEntryMax - 3) + "..."
-            : entry.summary
+        const topic = state.prune.messages.blocksById.get(entry.blockId)?.topic ?? "(unknown topic)"
+        const truncated =
+            entry.summary.length > perEntryMax
+                ? entry.summary.slice(0, perEntryMax - 3) + "..."
+                : entry.summary
         const section = `### ${topic}\n${truncated}`
         if (result.length + section.length + 2 > NOTIFICATION_SUMMARY_MAX_CHARS) {
             const remaining = entries.length - shown
@@ -106,7 +104,7 @@ function formatContextTransition(tokensBefore: number, tokensAfter: number): str
 }
 
 export async function sendCompressNotification(
-    client: any,
+    notifications: NotificationSink,
     logger: Logger,
     config: PluginConfig,
     state: SessionState,
@@ -122,8 +120,9 @@ export async function sendCompressNotification(
     }
 
     const logBlockIds = entries.map((e) => e.blockId)
-    const logTopics = entries
-        .map((e) => state.prune.messages.blocksById.get(e.blockId)?.topic ?? "?")
+    const logTopics = entries.map(
+        (e) => state.prune.messages.blocksById.get(e.blockId)?.topic ?? "?",
+    )
     const logCompressedTokens = entries.reduce((sum, e) => {
         const block = state.prune.messages.blocksById.get(e.blockId)
         return sum + (block?.effectiveCompressedTokens ?? block?.compressedTokens ?? 0)
@@ -201,10 +200,7 @@ export async function sendCompressNotification(
               ? entryBlockTopics.join(" · ")
               : "(unknown topic)")
 
-    const contextTokensAfter = Math.max(
-        0,
-        contextTokensBefore - compressedTokens + summaryTokens,
-    )
+    const contextTokensAfter = Math.max(0, contextTokensBefore - compressedTokens + summaryTokens)
     const notificationHeader = `▣ ACP | ${formatContextTransition(
         contextTokensBefore,
         contextTokensAfter,
@@ -285,51 +281,36 @@ export async function sendCompressNotification(
         logger.debug(`[ACP Debug] Compress notification:\n${message}`)
     }
 
-    await client.tui.showToast({
-        body: {
-            title: "ACP: Compress Notification",
-            message: toastMessage,
-            variant: "info",
-            duration: 5000,
-        },
+    await notifications.notify({
+        title: "ACP: Compress Notification",
+        message: toastMessage,
+        variant: "info",
+        duration: 5000,
     })
     return true
 }
 
 export async function sendIgnoredMessage(
-    client: any,
+    notices: NoticeSink,
     sessionID: string,
     text: string,
-    params: any,
+    params: {
+        providerId?: string
+        modelId?: string
+        agent?: string
+        variant?: string
+    },
     logger: Logger,
 ): Promise<void> {
-    const agent = params.agent || undefined
-    const variant = params.variant || undefined
-    const model =
-        params.providerId && params.modelId
-            ? {
-                  providerID: params.providerId,
-                  modelID: params.modelId,
-              }
-            : undefined
-
     try {
-        await client.session.prompt({
-            path: {
-                id: sessionID,
-            },
-            body: {
-                noReply: true,
-                agent: agent,
-                model: model,
-                variant: variant,
-                parts: [
-                    {
-                        type: "text",
-                        text: text,
-                        ignored: true,
-                    },
-                ],
+        await notices.send({
+            sessionID,
+            text,
+            metadata: {
+                providerId: params.providerId || undefined,
+                modelId: params.modelId || undefined,
+                agent: params.agent || undefined,
+                variant: params.variant || undefined,
             },
         })
     } catch (error: any) {

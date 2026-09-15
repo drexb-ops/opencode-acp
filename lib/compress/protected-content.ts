@@ -6,7 +6,6 @@ import {
     isFilePathProtected,
     isToolNameProtected,
 } from "../protected-patterns"
-import { fetchSessionMessages } from "./search"
 import type { SearchContext, SelectionResolution } from "./types"
 
 export function appendProtectedUserMessages(
@@ -104,7 +103,6 @@ export function extractProtectedPromptInfo(text: string): string[] {
 }
 
 export async function appendProtectedTools(
-    client: any,
     state: SessionState,
     summary: string,
     selection: SelectionResolution,
@@ -213,9 +211,7 @@ export function filterProtectedToolMessages(
         return selection
     }
 
-    const filteredMessageIds = selection.messageIds.filter(
-        (id) => !removedMessageIds.has(id),
-    )
+    const filteredMessageIds = selection.messageIds.filter((id) => !removedMessageIds.has(id))
     const filteredMessageTokenById = new Map<string, number>()
     for (const id of filteredMessageIds) {
         const tokens = selection.messageTokenById.get(id)

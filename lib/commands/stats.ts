@@ -1,11 +1,12 @@
 import type { Logger } from "../logger"
 import type { PluginConfig } from "../config"
+import type { NoticeSink } from "../host"
 import type { SessionState, WithParts } from "../state"
 import { sendIgnoredMessage } from "../ui/notification"
 import { buildStatusReport } from "../compress/status"
 
 export interface StatsCommandContext {
-    client: any
+    notices: NoticeSink
     state: SessionState
     config: PluginConfig
     logger: Logger
@@ -20,15 +21,12 @@ export interface StatsCommandContext {
 }
 
 export async function handleStatsCommand(ctx: StatsCommandContext): Promise<void> {
-    const report = buildStatusReport(
-        { state: ctx.state, config: ctx.config },
-        ctx.messages,
-    )
+    const report = buildStatusReport({ state: ctx.state, config: ctx.config }, ctx.messages)
 
     const text = `[ACP Status]\n${report}`
 
     await sendIgnoredMessage(
-        ctx.client,
+        ctx.notices,
         ctx.sessionId,
         text,
         {

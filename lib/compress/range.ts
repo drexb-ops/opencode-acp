@@ -1,5 +1,11 @@
-import { tool } from "@opencode-ai/plugin"
-import { type ToolFactoryContext, resolveToolContext } from "./types"
+import { z } from "zod"
+import {
+    type SharedToolDefinition,
+    type ToolExecutionContext,
+    type ToolFactoryContext,
+    resolveToolContext,
+} from "./types"
+import { createV1Tool, type V1Tool } from "../v1/tools"
 import { countTokens } from "../token-utils"
 import { RANGE_FORMAT_EXTENSION } from "../prompts/extensions/tool"
 import {
@@ -35,37 +41,34 @@ import {
 import type { CompressRangeToolArgs } from "./types"
 import { resolveKeepMarkers } from "./keep-markers"
 import { getModelInfo, applyCompressOverrides } from "../messages/inject/utils"
-import {
-    buildQualityRejectionError,
-    evaluatePreCommitQuality,
-} from "./quality-gate"
+import { buildQualityRejectionError, evaluatePreCommitQuality } from "./quality-gate"
 
 function buildSchema(maxSummaryLengthHard: number) {
-    return {
-        topic: tool.schema
+    return z.object({
+        topic: z
             .string()
             .optional()
             .describe(
                 "Fallback topic for entries without their own. Omit when each content entry specifies its own topic.",
             ),
-        content: tool.schema
+        content: z
             .array(
-                tool.schema.object({
-                    topic: tool.schema
+                z.object({
+                    topic: z
                         .string()
                         .optional()
                         .describe(
                             "Short label (3-5 words) for THIS range, e.g. 'Auth System Exploration'. Omit to use top-level topic. When compressing multiple unrelated ranges, give each its own topic for better quality.",
                         ),
-                    startId: tool.schema
+                    startId: z
                         .string()
                         .describe(
                             "Message or block ID marking the beginning of range (e.g. m00001, b2)",
                         ),
-                    endId: tool.schema
+                    endId: z
                         .string()
                         .describe("Message or block ID marking the end of range (e.g. m00012, b5)"),
-                    summary: tool.schema
+                    summary: z
                         .string()
                         .describe(
                             "Complete technical summary replacing all content in range. Keep only essential details (conclusions, file paths, decisions, exact values, etc.).",
@@ -75,37 +78,42 @@ function buildSchema(maxSummaryLengthHard: number) {
             .describe(
                 "One or more ranges to compress, each with start/end boundaries and a summary. When compressing multiple unrelated ranges in one call, give each its own topic.",
             ),
-        summaryMaxChars: tool.schema
+        summaryMaxChars: z
             .number()
             .optional()
             .describe(
                 `Override max summary length (default max: ${maxSummaryLengthHard} chars). Use when content is important and needs more detail — don't lose critical info just to fit the limit.`,
             ),
-        dangerous: tool.schema
+        dangerous: z
             .boolean()
             .optional()
             .describe(
                 "Set to true ONLY when you are certain the most recent message(s) must be compressed. Required when a range includes the tail of the conversation.",
             ),
-        acknowledgeRisk: tool.schema.boolean().optional(),
-    }
+        acknowledgeRisk: z.boolean().optional(),
+    })
 }
 
-export function createCompressRangeTool(factoryCtx: ToolFactoryContext): ReturnType<typeof tool> {
+export const compressRangeInputSchema = buildSchema(20000)
+
+export function createCompressRangeToolDefinition(
+    factoryCtx: ToolFactoryContext,
+): SharedToolDefinition<ReturnType<typeof buildSchema>> {
     factoryCtx.prompts.reload()
     const runtimePrompts = factoryCtx.prompts.getRuntimePrompts()
+    const schema = buildSchema(factoryCtx.config.compress.maxSummaryLengthHard)
 
-    return tool({
+    return {
+        name: "compress",
         description: runtimePrompts.compressRange + RANGE_FORMAT_EXTENSION,
-        args: buildSchema(factoryCtx.config.compress.maxSummaryLengthHard),
-        async execute(args, toolCtx) {
+        schema,
+        inputSchema: schema,
+        async execute(args, toolCtx: ToolExecutionContext) {
             const ctx0 = resolveToolContext(factoryCtx, toolCtx.sessionID)
-            const input = args as CompressRangeToolArgs
+            const input: CompressRangeToolArgs = args
             validateArgs(input)
 
-            const maxLen =
-                (args as { summaryMaxChars?: number }).summaryMaxChars ??
-                ctx0.config.compress.maxSummaryLengthHard
+            const maxLen = args.summaryMaxChars ?? ctx0.config.compress.maxSummaryLengthHard
             for (const entry of input.content) {
                 if (entry.summary.length > maxLen) {
                     throw new Error(
@@ -114,10 +122,7 @@ export function createCompressRangeTool(factoryCtx: ToolFactoryContext): ReturnT
                 }
             }
 
-            const callId =
-                typeof (toolCtx as unknown as { callID?: unknown }).callID === "string"
-                    ? (toolCtx as unknown as { callID: string }).callID
-                    : undefined
+            const callId = typeof toolCtx.callID === "string" ? toolCtx.callID : undefined
 
             const { rawMessages, searchContext } = await prepareSession(
                 ctx0,
@@ -190,7 +195,6 @@ export function createCompressRangeTool(factoryCtx: ToolFactoryContext): ReturnT
                 )
 
                 const summaryWithTools = await appendProtectedTools(
-                    ctx.client,
                     ctx.state,
                     summaryWithPromptInfo,
                     plan.selection,
@@ -264,7 +268,7 @@ export function createCompressRangeTool(factoryCtx: ToolFactoryContext): ReturnT
                 phantomSkipNotice = partition.notice
             }
 
-            const acknowledgeRisk = (args as { acknowledgeRisk?: boolean }).acknowledgeRisk === true
+            const acknowledgeRisk = args.acknowledgeRisk === true
 
             const qualityGateRetryPendingBefore = ctx.state.qualityGateRetryPending
 
@@ -332,7 +336,7 @@ export function createCompressRangeTool(factoryCtx: ToolFactoryContext): ReturnT
                             endId: preparedPlan.entry.endId,
                             mode: "range",
                             runId,
-                            compressMessageId: toolCtx.messageID,
+                            compressMessageId: toolCtx.messageID ?? "",
                             compressCallId: callId,
                             summaryTokens,
                         },
@@ -367,7 +371,12 @@ export function createCompressRangeTool(factoryCtx: ToolFactoryContext): ReturnT
                 : ""
             return `Compressed ${totalCompressedMessages} messages into ${COMPRESSED_BLOCK_HEADER}.${skippedNote}${ackNote}\nIMPORTANT: This was an automatic context compression. You MUST continue your previous task exactly where you left off. Do NOT ask the user what to do next.\n💡 Tip: Use search_context('keyword') to find compressed content when you need it later.`
         },
-    })
+    }
+}
+
+/** V1 compatibility factory; new hosts consume the shared definition directly. */
+export function createCompressRangeTool(factoryCtx: ToolFactoryContext): V1Tool {
+    return createV1Tool(createCompressRangeToolDefinition(factoryCtx))
 }
 
 function extractBoundaryConsumedBlocks(

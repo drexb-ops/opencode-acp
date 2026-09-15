@@ -1,5 +1,12 @@
-import { tool } from "@opencode-ai/plugin"
-import { type ToolContext, type ToolFactoryContext, resolveToolContext } from "./types"
+import { z } from "zod"
+import {
+    type SharedToolDefinition,
+    type ToolContext,
+    type ToolExecutionContext,
+    type ToolFactoryContext,
+    resolveToolContext,
+} from "./types"
+import { createV1Tool, type V1Tool } from "../v1/tools"
 import type { CompressionTarget } from "../commands/compression-targets"
 import type { CompressionBlock } from "../state/types"
 import type { SessionState, WithParts } from "../state"
@@ -29,21 +36,11 @@ import {
 } from "./decompress-logic"
 import { formatTokenCount } from "../ui/utils"
 
-interface RunContext {
-    ask(input: {
-        permission: string
-        patterns: string[]
-        always: string[]
-        metadata: Record<string, unknown>
-    }): Promise<void>
-    metadata(input: { title: string }): void
-    sessionID: string
-}
-
 async function prepareDecompressSession(
     ctx: ToolContext,
-    toolCtx: RunContext,
+    toolCtx: ToolExecutionContext,
 ): Promise<{ rawMessages: WithParts[] }> {
+    const sessions = ctx.sessions
     await toolCtx.ask({
         permission: "compress",
         patterns: ["*"],
@@ -53,10 +50,10 @@ async function prepareDecompressSession(
 
     toolCtx.metadata({ title: "Decompress" })
 
-    const rawMessages = await fetchSessionMessages(ctx.client, toolCtx.sessionID)
+    const rawMessages = await fetchSessionMessages(sessions, toolCtx.sessionID)
 
     await ensureSessionInitialized(
-        ctx.client,
+        sessions,
         ctx.state,
         toolCtx.sessionID,
         ctx.logger,
@@ -73,9 +70,7 @@ async function finalizeDecompressSession(ctx: ToolContext): Promise<void> {
     await saveSessionState(ctx.state, ctx.logger)
 }
 
-type ResolveResult =
-    | { ok: true; targets: CompressionTarget[] }
-    | { ok: false; error: string }
+type ResolveResult = { ok: true; targets: CompressionTarget[] } | { ok: false; error: string }
 
 function resolveTargets(
     args: Record<string, unknown>,
@@ -94,7 +89,13 @@ function resolveTargets(
         return resolveSingleBlockTarget(messagesState, args.blockId as string)
     }
 
-    return resolveRangeTarget(state, rawMessages, args.startId as string, args.endId as string, logger)
+    return resolveRangeTarget(
+        state,
+        rawMessages,
+        args.startId as string,
+        args.endId as string,
+        logger,
+    )
 }
 
 function resolveSingleBlockTarget(
@@ -228,30 +229,38 @@ IMPORTANT:
 - After decompression, the restored content will appear in full in your next context window.
 - Do NOT call this tool in parallel with compress — their state mutations may conflict.`
 
-function buildSchema() {
-    return {
-        blockId: tool.schema
-            .string()
-            .optional()
-            .describe('Block reference to decompress (e.g., "b0", "b2"). Mutually exclusive with startId/endId.'),
-        startId: tool.schema
-            .string()
-            .optional()
-            .describe('Range start: message ref (e.g., "m00150") or block ref (e.g., "b2"). Used with endId.'),
-        endId: tool.schema
-            .string()
-            .optional()
-            .describe('Range end: message ref (e.g., "m00200") or block ref (e.g., "b5"). Used with startId.'),
-        toFile: tool.schema
-            .string()
-            .optional()
-            .describe("If provided, writes restored content to this file path instead of inflating context. Block stays compressed. Path must be under /tmp or ~/.cache/opencode/. Example: '/tmp/block52.txt'"),
-        full: tool.schema
-            .boolean()
-            .optional()
-            .describe("If true, restores ALL content down to original messages (multi-level decompress). Default: false — restores one tier up (e.g., decompressing a T2 block restores T1 summaries, not raw messages). Use full:true only when you need the exact original content and have context budget for it."),
-    }
-}
+export const decompressInputSchema = z.object({
+    blockId: z
+        .string()
+        .optional()
+        .describe(
+            'Block reference to decompress (e.g., "b0", "b2"). Mutually exclusive with startId/endId.',
+        ),
+    startId: z
+        .string()
+        .optional()
+        .describe(
+            'Range start: message ref (e.g., "m00150") or block ref (e.g., "b2"). Used with endId.',
+        ),
+    endId: z
+        .string()
+        .optional()
+        .describe(
+            'Range end: message ref (e.g., "m00200") or block ref (e.g., "b5"). Used with startId.',
+        ),
+    toFile: z
+        .string()
+        .optional()
+        .describe(
+            "If provided, writes restored content to this file path instead of inflating context. Block stays compressed. Path must be under /tmp or ~/.cache/opencode/. Example: '/tmp/block52.txt'",
+        ),
+    full: z
+        .boolean()
+        .optional()
+        .describe(
+            "If true, restores ALL content down to original messages (multi-level decompress). Default: false — restores one tier up (e.g., decompressing a T2 block restores T1 summaries, not raw messages). Use full:true only when you need the exact original content and have context budget for it.",
+        ),
+})
 
 function extractMessageId(m: WithParts): string {
     return (m as { id?: string }).id ?? (m as { messageId?: string }).messageId ?? ""
@@ -269,11 +278,15 @@ function extractMessageText(m: WithParts): string {
     return `[${role}]\n${content}`
 }
 
-export function createDecompressTool(factoryCtx: ToolFactoryContext): ReturnType<typeof tool> {
-    return tool({
+export function createDecompressToolDefinition(
+    factoryCtx: ToolFactoryContext,
+): SharedToolDefinition<typeof decompressInputSchema> {
+    return {
+        name: "decompress",
         description: TOOL_DESCRIPTION,
-        args: buildSchema(),
-        async execute(args, toolCtx) {
+        schema: decompressInputSchema,
+        inputSchema: decompressInputSchema,
+        async execute(args, toolCtx: ToolExecutionContext) {
             const ctx = resolveToolContext(factoryCtx, toolCtx.sessionID)
             const { rawMessages } = await prepareDecompressSession(ctx, toolCtx)
 
@@ -285,7 +298,7 @@ export function createDecompressTool(factoryCtx: ToolFactoryContext): ReturnType
                   )
                 : undefined
 
-            const resolved = resolveTargets(args as Record<string, unknown>, ctx.state, rawMessages, ctx.logger)
+            const resolved = resolveTargets({ ...args }, ctx.state, rawMessages, ctx.logger)
             if (!resolved.ok) {
                 return resolved.error
             }
@@ -302,7 +315,7 @@ export function createDecompressTool(factoryCtx: ToolFactoryContext): ReturnType
             }
 
             if (args.toFile) {
-                const targetPath = args.toFile as string
+                const targetPath = args.toFile
                 const os = await import("os")
                 const path = await import("path")
                 const allowedDirs = [
@@ -408,5 +421,10 @@ export function createDecompressTool(factoryCtx: ToolFactoryContext): ReturnType
 
             return lines.join("\n")
         },
-    })
+    }
+}
+
+/** V1 compatibility factory; new hosts consume the shared definition directly. */
+export function createDecompressTool(factoryCtx: ToolFactoryContext): V1Tool {
+    return createV1Tool(createDecompressToolDefinition(factoryCtx))
 }

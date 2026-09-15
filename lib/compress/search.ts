@@ -1,4 +1,6 @@
-import { tool } from "@opencode-ai/plugin"
+import { z } from "zod"
+import type { SessionService } from "../host"
+import { resolveSessionService } from "../host/legacy"
 import type { CompressionBlock, SessionState, WithParts } from "../state"
 import { formatBlockRef, formatMessageRef, parseBoundaryId, parseMessageRef } from "../message-ids"
 import { isIgnoredUserMessage } from "../messages/query"
@@ -8,16 +10,18 @@ import {
     type BoundaryReference,
     type SearchContext,
     type SelectionResolution,
+    type SharedToolDefinition,
     type ToolFactoryContext,
+    type ToolExecutionContext,
     resolveToolContext,
 } from "./types"
+import { createV1Tool, type V1Tool } from "../v1/tools"
 
-export async function fetchSessionMessages(client: any, sessionId: string): Promise<WithParts[]> {
-    const response = await client.session.messages({
-        path: { id: sessionId },
-    })
-
-    return filterMessages(response?.data || response)
+export async function fetchSessionMessages(
+    sessions: SessionService,
+    sessionId: string,
+): Promise<WithParts[]> {
+    return filterMessages(await resolveSessionService(sessions).messages(sessionId))
 }
 
 export function buildSearchContext(state: SessionState, rawMessages: WithParts[]): SearchContext {
@@ -527,25 +531,28 @@ function buildSearchPreview(text: string, firstTerm: string): string {
     return text.substring(0, 200) + (text.length > 200 ? "..." : "")
 }
 
-export function createSearchContextTool(factoryCtx: ToolFactoryContext): ReturnType<typeof tool> {
+export const searchContextInputSchema = z.object({
+    query: z.string().describe("Search query — keywords or phrase to find"),
+    limit: z.number().optional().describe("Maximum results to return (default: 10)"),
+    deep: z
+        .boolean()
+        .optional()
+        .describe(
+            "Reserved for compatibility; the current search indexes active compressed block summaries.",
+        ),
+})
+
+export function createSearchContextToolDefinition(
+    factoryCtx: ToolFactoryContext,
+): SharedToolDefinition<typeof searchContextInputSchema> {
     factoryCtx.prompts.reload()
 
-    return tool({
+    return {
+        name: "search_context",
         description: SEARCH_CONTEXT_TOOL_DESCRIPTION,
-        args: {
-            query: tool.schema.string().describe("Search query — keywords or phrase to find"),
-            limit: tool.schema
-                .number()
-                .optional()
-                .describe("Maximum results to return (default: 10)"),
-            deep: tool.schema
-                .boolean()
-                .optional()
-                .describe(
-                    "Reserved for compatibility; the current search indexes active compressed block summaries.",
-                ),
-        },
-        async execute(args, toolCtx) {
+        schema: searchContextInputSchema,
+        inputSchema: searchContextInputSchema,
+        async execute(args, toolCtx: ToolExecutionContext) {
             const ctx = resolveToolContext(factoryCtx, toolCtx.sessionID)
             const query = (args.query || "").toLowerCase().trim()
             const limit = args.limit ?? 10
@@ -644,5 +651,10 @@ export function createSearchContextTool(factoryCtx: ToolFactoryContext): ReturnT
 
             return output
         },
-    })
+    }
+}
+
+/** V1 compatibility factory; new hosts consume the shared definition directly. */
+export function createSearchContextTool(factoryCtx: ToolFactoryContext): V1Tool {
+    return createV1Tool(createSearchContextToolDefinition(factoryCtx))
 }

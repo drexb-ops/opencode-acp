@@ -1,6 +1,8 @@
 import { existsSync } from "fs"
 import { join } from "path"
 import { cwd } from "process"
+import type { ModelInventory, SessionService } from "../host"
+import { resolveModelInventory, resolveSessionService } from "../host/legacy"
 import type { SessionState, ToolParameterEntry, WithParts } from "./types"
 import type { PluginConfig } from "../config"
 import type { Logger } from "../logger"
@@ -105,11 +107,12 @@ export class SessionStateRegistry {
         return this.catalog.resolve(providerId, modelId)
     }
 
-    /**
-     * Best-effort one-time seed from the host's provider catalog
-     * (`client.config.providers()` → GET /config/providers). Never throws;
-     * returns the number of model-limit entries recorded.
-     */
+    /** Best-effort one-time seed from a host-neutral model inventory. */
+    hydrateModelLimits(inventory: ModelInventory): Promise<number> {
+        return this.catalog.hydrate(inventory)
+    }
+
+    /** @deprecated Use hydrateModelLimits() with a host model inventory. */
     hydrateModelLimitsFromClient(client: unknown): Promise<number> {
         return this.catalog.hydrateFromClient(client)
     }
@@ -125,7 +128,7 @@ export class SessionStateRegistry {
     private lazyHydration: Promise<number> | undefined
 
     async hydrateAndResolve(
-        client: unknown,
+        inventory: ModelInventory,
         providerId: string,
         modelId: string,
     ): Promise<number | undefined> {
@@ -133,7 +136,7 @@ export class SessionStateRegistry {
         if (existing !== undefined) {
             return existing
         }
-        this.lazyHydration ??= this.catalog.hydrateFromClient(client)
+        this.lazyHydration ??= this.catalog.hydrate(resolveModelInventory(inventory))
         await this.lazyHydration
         return this.catalog.resolve(providerId, modelId)
     }
@@ -154,11 +157,12 @@ export class SessionStateRegistry {
     // state.sessionId === sessionId (assigned synchronously before any await),
     // so repeat calls for the same session never re-reset.
     async getOrCreate(
-        client: any,
+        sessions: SessionService,
         sessionId: string,
         messages: WithParts[],
         config?: PluginConfig,
     ): Promise<SessionState> {
+        const sessionService = resolveSessionService(sessions)
         let state = this.states.get(sessionId)
         if (!state) {
             state = createSessionState()
@@ -170,7 +174,7 @@ export class SessionStateRegistry {
         }
         try {
             await ensureSessionInitialized(
-                client,
+                sessionService,
                 state,
                 sessionId,
                 this.logger,
@@ -292,7 +296,7 @@ export function resetSessionState(state: SessionState): void {
 }
 
 export async function ensureSessionInitialized(
-    client: any,
+    sessions: SessionService,
     state: SessionState,
     sessionId: string,
     logger: Logger,
@@ -300,6 +304,7 @@ export async function ensureSessionInitialized(
     config?: PluginConfig,
     projectDir?: string,
 ): Promise<void> {
+    const sessionService = resolveSessionService(sessions)
     if (state.sessionId === sessionId) {
         return
     }
@@ -313,7 +318,7 @@ export async function ensureSessionInitialized(
         ? resolveStorageDir(config.storagePath, projectDir ?? cwd())
         : undefined
 
-    const parentSessionId = await getSessionParentId(client, sessionId)
+    const parentSessionId = await getSessionParentId(sessionService, sessionId)
     const isChildSession = parentSessionId !== undefined
     state.isSubAgent = isChildSession
 
@@ -346,14 +351,9 @@ export async function ensureSessionInitialized(
             if (parentSessionId) {
                 try {
                     const parent = await loadSessionState(parentSessionId, logger)
-                    const response = parent
-                        ? await client.session.messages({ path: { id: parentSessionId } })
-                        : undefined
-                    const parentMessages = Array.isArray(response?.data)
-                        ? response.data
-                        : Array.isArray(response)
-                          ? response
-                          : []
+                    const parentMessages = parent
+                        ? await sessionService.parentMessages(parentSessionId)
+                        : []
                     if (parent && parentMessages.length > 0) {
                         // Standard subagents skip their first user prompt when
                         // assigning refs. A copied fork needs that prompt to

@@ -3,12 +3,15 @@ declare const ACP_VERSION: string | undefined
 import type { Plugin } from "@opencode-ai/plugin"
 import { getConfig } from "../config"
 import {
-    createAcpStatusTool,
-    createAcpContextRecapTool,
-    createCompressRangeTool,
-    createDecompressTool,
-    createSearchContextTool,
+    createAcpContextRecapToolDefinition,
+    createAcpStatusToolDefinition,
+    createCompressRangeToolDefinition,
+    createDecompressToolDefinition,
+    createSearchContextToolDefinition,
 } from "../compress"
+import type { ToolFactoryContext } from "../compress"
+import { createV1Tool } from "./tools"
+import { createV1Host } from "./host"
 import {
     compressDisabledByOpencode,
     hasExplicitToolPermission,
@@ -29,7 +32,8 @@ import { findBiliProxyProviders } from "../bili-proxy"
 import { startAutoUpdate } from "../update"
 
 const server: Plugin = (async (ctx) => {
-    const config = getConfig(ctx)
+    const host = createV1Host(ctx)
+    const config = getConfig({ directory: ctx.directory, notifications: host.notifications })
 
     if (!config.enabled) {
         return {}
@@ -74,7 +78,7 @@ const server: Plugin = (async (ctx) => {
     // this instance). Fire-and-forget — never blocks init; outcome is logged
     // so a silent degrade (empty catalog / failed fetch) is debuggable. On
     // failure the fallback is per-request refresh, the pre-fix behavior.
-    registry.hydrateModelLimitsFromClient(ctx.client).then(
+    registry.hydrateModelLimits(host.models).then(
         (recorded) => {
             if (recorded > 0) {
                 logger.info("Model limit catalog seeded from provider config", {
@@ -98,10 +102,10 @@ const server: Plugin = (async (ctx) => {
 
     logger.info("DCP initialized")
 
-    startAutoUpdate(ctx, config.autoUpdate, logger)
+    startAutoUpdate(host.notifications, config.autoUpdate, logger)
 
-    const compressToolContext = {
-        client: ctx.client,
+    const compressToolContext: ToolFactoryContext = {
+        host,
         registry,
         logger,
         config,
@@ -126,7 +130,7 @@ const server: Plugin = (async (ctx) => {
         ),
         "experimental.chat.messages.transform": guard(
             createChatMessageTransformHandler(
-                ctx.client,
+                host,
                 registry,
                 logger,
                 config,
@@ -137,7 +141,7 @@ const server: Plugin = (async (ctx) => {
         "experimental.text.complete": guard(createTextCompleteHandler()),
         "command.execute.before": guard(
             createCommandExecuteHandler(
-                ctx.client,
+                host,
                 registry,
                 logger,
                 config,
@@ -148,11 +152,15 @@ const server: Plugin = (async (ctx) => {
         event: guard(createEventHandler(registry, logger)),
         tool: {
             ...(config.compress.permission !== "deny" && {
-                compress: createCompressRangeTool(compressToolContext),
-                decompress: createDecompressTool(compressToolContext),
-                search_context: createSearchContextTool(compressToolContext),
-                acp_status: createAcpStatusTool(compressToolContext),
-                acp_context_recap: createAcpContextRecapTool(compressToolContext),
+                compress: createV1Tool(createCompressRangeToolDefinition(compressToolContext)),
+                decompress: createV1Tool(createDecompressToolDefinition(compressToolContext)),
+                search_context: createV1Tool(
+                    createSearchContextToolDefinition(compressToolContext),
+                ),
+                acp_status: createV1Tool(createAcpStatusToolDefinition(compressToolContext)),
+                acp_context_recap: createV1Tool(
+                    createAcpContextRecapToolDefinition(compressToolContext),
+                ),
             }),
         },
         config: async (opencodeConfig) => {

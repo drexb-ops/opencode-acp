@@ -1,5 +1,12 @@
-import { tool } from "@opencode-ai/plugin"
-import { type ToolContext, type ToolFactoryContext, resolveToolContext } from "./types"
+import { z } from "zod"
+import {
+    type SharedToolDefinition,
+    type ToolContext,
+    type ToolExecutionContext,
+    type ToolFactoryContext,
+    resolveToolContext,
+} from "./types"
+import { createV1Tool, type V1Tool } from "../v1/tools"
 import { formatAge } from "../ui/utils"
 import type { CompressionBlock, WithParts } from "../state/types"
 import type { SessionState } from "../state/types"
@@ -630,35 +637,38 @@ export function buildStatusReport(
     return lines.join("\n")
 }
 
-export function createAcpStatusTool(factoryCtx: ToolFactoryContext): ReturnType<typeof tool> {
+export const acpStatusInputSchema = z.object({
+    scope: z
+        .string()
+        .optional()
+        .describe('Drill down: "compressed" or "uncompressed". No arg = overview of both.'),
+    view: z
+        .string()
+        .optional()
+        .describe(
+            'Display format for scope:"uncompressed": "candidates" (default when compress.candidates is enabled — otherwise "ranges"), "ranges" (raw grouped ranges), or "messages" (per-message listing with sort/filter)',
+        ),
+    tool: z
+        .string()
+        .optional()
+        .describe(
+            'Filter by tool type (only with scope:"uncompressed", view:"messages"). e.g., "bash", "todowrite", "write"',
+        ),
+    sort: z.string().optional().describe('Sort order: "size" (default), "time", or "tool"'),
+    limit: z.number().optional().describe("Max items to list (default 30)"),
+})
+
+export function createAcpStatusToolDefinition(
+    factoryCtx: ToolFactoryContext,
+): SharedToolDefinition<typeof acpStatusInputSchema> {
     factoryCtx.prompts.reload()
 
-    return tool({
+    return {
+        name: "acp_status",
         description: ACP_STATUS_TOOL_DESCRIPTION,
-        args: {
-            scope: tool.schema
-                .string()
-                .optional()
-                .describe('Drill down: "compressed" or "uncompressed". No arg = overview of both.'),
-            view: tool.schema
-                .string()
-                .optional()
-                .describe(
-                    'Display format for scope:"uncompressed": "candidates" (default when compress.candidates is enabled — otherwise "ranges"), "ranges" (raw grouped ranges), or "messages" (per-message listing with sort/filter)',
-                ),
-            tool: tool.schema
-                .string()
-                .optional()
-                .describe(
-                    'Filter by tool type (only with scope:"uncompressed", view:"messages"). e.g., "bash", "todowrite", "write"',
-                ),
-            sort: tool.schema
-                .string()
-                .optional()
-                .describe('Sort order: "size" (default), "time", or "tool"'),
-            limit: tool.schema.number().optional().describe("Max items to list (default 30)"),
-        },
-        async execute(args, toolCtx) {
+        schema: acpStatusInputSchema,
+        inputSchema: acpStatusInputSchema,
+        async execute(args, toolCtx: ToolExecutionContext) {
             const ctx = resolveToolContext(factoryCtx, toolCtx.sessionID)
             const scope =
                 args.scope === "compressed" || args.scope === "uncompressed"
@@ -686,7 +696,7 @@ export function createAcpStatusTool(factoryCtx: ToolFactoryContext): ReturnType<
 
             let rawMessages: WithParts[] = []
             try {
-                rawMessages = await fetchSessionMessages(ctx.client, toolCtx.sessionID)
+                rawMessages = await fetchSessionMessages(ctx.sessions, toolCtx.sessionID)
             } catch {
                 if (scope === "uncompressed") return "(unable to fetch messages)"
                 rawMessages = []
@@ -702,5 +712,10 @@ export function createAcpStatusTool(factoryCtx: ToolFactoryContext): ReturnType<
                 limit,
             })
         },
-    })
+    }
+}
+
+/** V1 compatibility factory; new hosts consume the shared definition directly. */
+export function createAcpStatusTool(factoryCtx: ToolFactoryContext): V1Tool {
+    return createV1Tool(createAcpStatusToolDefinition(factoryCtx))
 }

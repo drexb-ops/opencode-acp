@@ -5,6 +5,8 @@ import type {
     SessionState,
     WithParts,
 } from "./types"
+import type { SessionService } from "../host"
+import { resolveSessionService } from "../host/legacy"
 import type { PluginConfig } from "../config"
 import { isIgnoredUserMessage, messageHasCompress } from "../messages/query"
 import { isMessageWithInfo } from "../messages/shape"
@@ -70,19 +72,22 @@ export function serializePruneMessagesState(
 }
 
 export async function getSessionParentId(
-    client: any,
+    sessions: SessionService,
     sessionID: string,
 ): Promise<string | undefined> {
     try {
-        const result = await client.session.get({ path: { id: sessionID } })
-        return typeof result.data?.parentID === "string" ? result.data.parentID : undefined
+        const session = await resolveSessionService(sessions).get(sessionID)
+        return typeof session?.parentID === "string" ? session.parentID : undefined
     } catch (error: any) {
         return undefined
     }
 }
 
-export async function isSubAgentSession(client: any, sessionID: string): Promise<boolean> {
-    return (await getSessionParentId(client, sessionID)) !== undefined
+export async function isSubAgentSession(
+    sessions: SessionService,
+    sessionID: string,
+): Promise<boolean> {
+    return (await getSessionParentId(sessions, sessionID)) !== undefined
 }
 
 export function findLastCompactionTimestamp(messages: WithParts[]): number {

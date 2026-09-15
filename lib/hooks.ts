@@ -1,6 +1,8 @@
 import type { SessionState, WithParts } from "./state"
 import type { Logger } from "./logger"
 import type { PluginConfig } from "./config"
+import type { HostServices } from "./host"
+import { resolveHostServices } from "./host/legacy"
 import { assignMessageRefs } from "./message-ids"
 import {
     buildPriorityMap,
@@ -25,7 +27,7 @@ import {
     buildCompressionTimingKey,
     resolveCompressionDuration,
 } from "./compress/timing"
-import { filterMessages, filterMessagesInPlace } from "./messages/shape"
+import { filterMessagesInPlace } from "./messages/shape"
 import { getLastUserMessage, isSyntheticMessage } from "./messages/query"
 import { OUTPUT_RESERVE_TOKENS, truncateLargeToolOutputs } from "./messages/truncate-tools"
 import { resolveEffectiveContextLimit } from "./state/utils"
@@ -174,13 +176,14 @@ export function createSystemPromptHandler(
 }
 
 export function createChatMessageTransformHandler(
-    client: any,
+    host: HostServices,
     registry: SessionStateRegistry,
     logger: Logger,
     config: PluginConfig,
     prompts: PromptStore,
     hostPermissions: HostPermissionSnapshot,
 ) {
+    const services = resolveHostServices(host)
     return async (input: {}, output: { messages: WithParts[] }) => {
         const receivedMessages = Array.isArray(output.messages) ? output.messages.length : 0
         const messages = filterMessagesInPlace(output.messages)
@@ -209,7 +212,7 @@ export function createChatMessageTransformHandler(
             // [FIX #33] Per-session state: each session keeps its own SessionState,
             // so interleaved sessions no longer reset each other's modelContextLimit.
             state = await registry.getOrCreate(
-                client,
+                services.sessions,
                 lastUserMessage.info.sessionID,
                 messages,
                 config,
@@ -239,7 +242,7 @@ export function createChatMessageTransformHandler(
                 requestModel?.modelID
             ) {
                 requestModelLimit = await registry.hydrateAndResolve(
-                    client,
+                    services.models,
                     requestModel.providerID,
                     requestModel.modelID,
                 )
@@ -385,16 +388,14 @@ export function createChatMessageTransformHandler(
                       // ignores the flag) → phantom turn → compress → notification →
                       // infinite loop. Use logger.debug + toast instead.
                       logger.debug(`[ACP Debug] Nudge injected:\n${text}`)
-                      client.tui
-                          .showToast({
-                              body: {
-                                  title: "ACP: Nudge Injected",
-                                  message: text.slice(0, 500),
-                                  variant: "info",
-                                  duration: 5000,
-                              },
-                          })
-                          .catch(() => {})
+                      void Promise.resolve(
+                          services.notifications.notify({
+                              title: "ACP: Nudge Injected",
+                              message: text.slice(0, 500),
+                              variant: "info",
+                              duration: 5000,
+                          }),
+                      ).catch(() => {})
                   }
                 : undefined,
             prePruneTokens,
@@ -477,13 +478,14 @@ function buildHelpText(): string {
 }
 
 export function createCommandExecuteHandler(
-    client: any,
+    host: HostServices,
     registry: SessionStateRegistry,
     logger: Logger,
     config: PluginConfig,
     workingDirectory: string,
     hostPermissions: HostPermissionSnapshot,
 ) {
+    const services = resolveHostServices(host)
     return async (
         input: { command: string; sessionID: string; arguments: string },
         output: { parts: any[] },
@@ -493,17 +495,19 @@ export function createCommandExecuteHandler(
         }
 
         if (input.command === "acp" || input.command === "dcp") {
-            const messagesResponse = await client.session.messages({
-                path: { id: input.sessionID },
-            })
-            const messages = filterMessages(messagesResponse.data || messagesResponse)
+            const messages = await services.sessions.messages(input.sessionID)
 
-            const state = await registry.getOrCreate(client, input.sessionID, messages, config)
+            const state = await registry.getOrCreate(
+                services.sessions,
+                input.sessionID,
+                messages,
+                config,
+            )
 
             syncCompressPermissionState(state, config, hostPermissions, messages)
 
             const commandCtx = {
-                client,
+                notices: services.notices,
                 state,
                 config,
                 logger,
@@ -533,7 +537,13 @@ export function createCommandExecuteHandler(
             }
 
             if (sub === "help") {
-                await sendIgnoredMessage(client, input.sessionID, buildHelpText(), {}, logger)
+                await sendIgnoredMessage(
+                    services.notices,
+                    input.sessionID,
+                    buildHelpText(),
+                    {},
+                    logger,
+                )
                 throw new Error("__DCP_CONTEXT_HANDLED__")
             }
 

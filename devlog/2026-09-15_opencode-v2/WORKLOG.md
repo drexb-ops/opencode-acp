@@ -3,17 +3,18 @@
 - Task ID: `2026-09-15_opencode-v2`
 - Home Repo: `opencode-acp`
 - Status: InProgress
-- Updated: 2026-09-15 20:42 UTC
+- Updated: 2026-09-15 21:47 UTC
 
 ## 1. Summary
 
 - **What was done**: Investigated the production plugin failure, mapped ACP's V1
-  host dependencies, verified the exact published OpenCode 2.0.3 plugin API, and
-  recorded the approved V1/V2 compatibility design.
+  host dependencies, verified the exact published OpenCode 2.0.3 plugin API,
+  recorded the approved V1/V2 compatibility design, and implemented Phase 2's
+  host-neutral services and shared tool contracts.
 - **Why**: ACP currently fails before initialization on OpenCode V2 because its
   default export and all host integrations use the V1 plugin API.
-- **Behavior / compatibility changes**: None yet. This commit contains planning
-  artifacts only.
+- **Behavior / compatibility changes**: No intentional V1 behavior changes;
+  existing V1 factories now run through the shared definitions and adapters.
 - **Risk level**: High
 
 ## 2. Change Log
@@ -25,9 +26,10 @@
 | `7224ab9`   | Record the approved OpenCode V2 compatibility design          |
 | `3c00b9a`   | Refine concurrency boundaries and add the implementation plan |
 | `b42d827`   | Record the integrated pre-change verification baseline        |
-| This commit | Add the dual V1/V2 entrypoint and dependency foundation       |
+| `b569ccd`   | Add the dual V1/V2 entrypoint and dependency foundation       |
+| This commit | Add shared host services and host-neutral tool definitions    |
 
-### Phase 1 working tree (uncommitted)
+### Phase 1
 
 - Moved the unchanged V1 factory to `lib/v1/plugin.ts` and exposed it through a
   lazy `server()` adapter on the dual default export.
@@ -101,6 +103,44 @@
   and test file.
 - **PRE-EXISTING FAIL**: `npm run format:check` still reports the same 450
   inherited formatting failures; no unrelated files were formatted.
+
+### Phase 2
+
+- Added focused host services for session/history access, parent fork history,
+  model inventories, ACP-owned notices, and notifications under `lib/host/`.
+- Refactored shared compression, command, config, hook, and update paths to use
+  those services. `lib/v1/host.ts` is the V1 client translation and
+  `lib/v1/tools.ts` adapts root-Zod shared definitions to the V1 tool contract.
+- Converted `compress`, `decompress`, `search_context`, `acp_status`, and
+  `acp_context_recap` to shared definitions with complete object schemas while
+  retaining the existing V1 factory wrappers and observable ask/metadata/output
+  behavior.
+- Added `tests/host-tool-contract.test.ts` covering shared schemas, execution,
+  V1 ID/context mapping, model inventory hydration, and V1 notice/notification
+  translation.
+
+### Phase 2 verification
+
+- **PASS**: Targeted tool/contract/update tests — 72/72.
+- **PASS**: Targeted host/config/model/state integration tests — 52/52.
+- **PASS**: `npm test` — 1,294/1,294.
+- **PASS**: Targeted Prettier check for every changed source and test file.
+- **PASS**: `npm run typecheck`.
+- **PASS**: `npm run build`.
+- **PASS**: `npm run verify:package` — 201 tarball entries.
+- **DEFERRED**: Phase 3 session serialization/speculative transactions and all
+  V2 projection, tool registration, commands, proxy, RPC/TUI, lifecycle, and
+  package-export work remain intentionally untouched.
+
+### Lead review follow-up
+
+- Consolidated structural client translation in `lib/host/legacy.ts`; the typed
+  `lib/v1/host.ts` entrypoint now delegates to that single implementation.
+- Removed the runtime V1 `tool()` dependency from `lib/v1/tools.ts`; the adapter
+  now returns the equivalent `{ description, args, execute }` object using
+  type-only V1 imports while retaining root-Zod parsing and context mapping.
+- **PASS**: Focused review verification — five tool suites 58/58, host/tool
+  contract 3/3, V1 integration 4/4, typecheck, build, and targeted formatting.
 
 ## 5. Risk Assessment and Rollback
 

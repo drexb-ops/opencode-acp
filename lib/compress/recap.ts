@@ -1,6 +1,12 @@
-import { tool } from "@opencode-ai/plugin"
+import { z } from "zod"
 import type { CompressionBlock } from "../state/types"
-import { type ToolFactoryContext, resolveToolContext } from "./types"
+import {
+    type SharedToolDefinition,
+    type ToolExecutionContext,
+    type ToolFactoryContext,
+    resolveToolContext,
+} from "./types"
+import { createV1Tool, type V1Tool } from "../v1/tools"
 
 function formatCoverage(block: CompressionBlock): string {
     const count = block.effectiveMessageIds?.length || 0
@@ -14,16 +20,22 @@ Call this tool to re-fetch a specific block's summary without decompressing the 
 Args:
 - blockId: optional block number (e.g., 5). If omitted, lists all active blocks with brief info.`
 
-export function createAcpContextRecapTool(factoryCtx: ToolFactoryContext): ReturnType<typeof tool> {
-    return tool({
+export const acpContextRecapInputSchema = z.object({
+    blockId: z
+        .number()
+        .optional()
+        .describe("Block number to retrieve (e.g., 5). If omitted, lists all active blocks."),
+})
+
+export function createAcpContextRecapToolDefinition(
+    factoryCtx: ToolFactoryContext,
+): SharedToolDefinition<typeof acpContextRecapInputSchema> {
+    return {
+        name: "acp_context_recap",
         description: RECAP_TOOL_DESCRIPTION,
-        args: {
-            blockId: tool.schema
-                .number()
-                .optional()
-                .describe("Block number to retrieve (e.g., 5). If omitted, lists all active blocks."),
-        },
-        async execute(args, toolCtx) {
+        schema: acpContextRecapInputSchema,
+        inputSchema: acpContextRecapInputSchema,
+        async execute(args, toolCtx: ToolExecutionContext) {
             const ctx = resolveToolContext(factoryCtx, toolCtx.sessionID)
             const msgState = ctx.state.prune.messages
             const activeIds = Array.from(msgState.activeBlockIds).sort((a, b) => a - b)
@@ -54,8 +66,15 @@ export function createAcpContextRecapTool(factoryCtx: ToolFactoryContext): Retur
                 lines.push(`\nb${id} | ${range} | "${block.topic || "(none)"}"`)
                 lines.push(`  ${summaryPreview}${block.summary.length > 200 ? "..." : ""}`)
             }
-            lines.push(`\nCall with blockId to get the full summary: acp_context_recap({ blockId: N })`)
+            lines.push(
+                `\nCall with blockId to get the full summary: acp_context_recap({ blockId: N })`,
+            )
             return lines.join("\n")
         },
-    })
+    }
+}
+
+/** V1 compatibility factory; new hosts consume the shared definition directly. */
+export function createAcpContextRecapTool(factoryCtx: ToolFactoryContext): V1Tool {
+    return createV1Tool(createAcpContextRecapToolDefinition(factoryCtx))
 }

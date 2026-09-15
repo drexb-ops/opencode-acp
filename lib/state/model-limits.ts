@@ -1,3 +1,6 @@
+import type { ModelInventory } from "../host"
+import { resolveModelInventory } from "../host/legacy"
+
 /**
  * [FIX #312] Catalog of per-model context limits, keyed `${providerID}/${modelID}`.
  *
@@ -12,7 +15,7 @@
  * named on the request's user message instead of waiting one turn.
  *
  * Entries are recorded live by the system hook every request and seeded once
- * at plugin init from the host's /config/providers catalog.
+ * at plugin init from the host's model inventory.
  *
  * Standalone factory (not embedded in SessionStateRegistry) so the test
  * registry stub can compose the SAME implementation instead of hand-rolling
@@ -25,6 +28,8 @@ export interface ModelLimitCatalog {
         limit: number | undefined,
     ): void
     resolve(providerId: string | undefined, modelId: string | undefined): number | undefined
+    hydrate(inventory: ModelInventory): Promise<number>
+    /** @deprecated Use hydrate() with a host model inventory. */
     hydrateFromClient(client: unknown): Promise<number>
 }
 
@@ -40,39 +45,37 @@ export function createModelLimitCatalog(): ModelLimitCatalog {
             return modelLimits.get(`${providerId}/${modelId}`)
         },
         /**
-         * Best-effort one-time seed from the host's provider catalog
-         * (`client.config.providers()` → GET /config/providers). Never throws;
-         * returns the number of model-limit entries recorded.
+         * Best-effort one-time seed from a host-neutral model inventory. Never
+         * throws; returns the number of model-limit entries recorded.
          */
-        async hydrateFromClient(client: unknown): Promise<number> {
+        async hydrate(inventory: ModelInventory): Promise<number> {
             try {
-                const config = client as {
-                    config?: { providers?: () => Promise<{ data?: unknown }> }
-                }
-                const result = await config.config?.providers?.()
-                const payload = result as { data?: { providers?: unknown } } | undefined
-                const providers = payload?.data?.providers
-                if (!Array.isArray(providers)) return 0
+                const entries = await inventory.list()
                 let recorded = 0
-                for (const provider of providers) {
-                    const { id, models } = (provider ?? {}) as {
-                        id?: unknown
-                        models?: Record<string, unknown>
+                for (const entry of entries) {
+                    if (
+                        typeof entry.providerId !== "string" ||
+                        typeof entry.modelId !== "string" ||
+                        typeof entry.contextLimit !== "number" ||
+                        entry.contextLimit <= 0
+                    ) {
+                        continue
                     }
-                    if (typeof id !== "string" || !models) continue
-                    for (const [modelId, model] of Object.entries(models)) {
-                        const limit = (model as { limit?: { context?: unknown } } | null)?.limit
-                        const context = limit?.context
-                        if (typeof context === "number" && context > 0) {
-                            modelLimits.set(`${id}/${modelId}`, context)
-                            recorded++
-                        }
-                    }
+                    modelLimits.set(`${entry.providerId}/${entry.modelId}`, entry.contextLimit)
+                    recorded++
                 }
                 return recorded
             } catch {
                 return 0
             }
+        },
+        /**
+         * Compatibility bridge for older test/integration callers. The V1
+         * production adapter translates its client in lib/v1/host.ts and calls
+         * hydrate() directly.
+         */
+        async hydrateFromClient(client: unknown): Promise<number> {
+            return this.hydrate(resolveModelInventory(client))
         },
     }
 }

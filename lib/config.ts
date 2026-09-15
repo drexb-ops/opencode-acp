@@ -2,7 +2,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, statSync } from "fs
 import { join, dirname } from "path"
 import { homedir } from "os"
 import { parse } from "jsonc-parser/lib/esm/main.js"
-import type { PluginInput } from "@opencode-ai/plugin"
+import type { NotificationSink } from "./host"
 import {
     VALID_CONFIG_KEYS,
     getInvalidConfigKeys,
@@ -258,7 +258,7 @@ export {
 } from "./config-validation"
 
 function showConfigWarnings(
-    ctx: PluginInput,
+    notifications: NotificationSink | undefined,
     configPath: string,
     configData: Record<string, any>,
     isProject: boolean,
@@ -288,16 +288,18 @@ function showConfigWarnings(
         }
     }
 
+    if (!notifications) return
+
     setTimeout(() => {
         try {
-            ctx.client.tui.showToast({
-                body: {
+            void Promise.resolve(
+                notifications.notify({
                     title: `ACP: ${configType} warning`,
                     message: `${configPath}\n${messages.join("\n")}`,
                     variant: "warning",
                     duration: 7000,
-                },
-            })
+                }),
+            ).catch(() => {})
         } catch {}
     }, 7000)
 }
@@ -408,7 +410,12 @@ function findOpencodeDir(startDir: string): string | null {
     return null
 }
 
-function getConfigPaths(ctx?: PluginInput): {
+export interface ConfigHostInput {
+    directory?: string
+    notifications?: NotificationSink
+}
+
+function getConfigPaths(ctx?: ConfigHostInput): {
     global: string | null
     configDir: string | null
     project: string | null
@@ -745,24 +752,26 @@ function mergeLayer(config: PluginConfig, data: Record<string, any>): PluginConf
     }
 }
 
-function scheduleParseWarning(ctx: PluginInput, title: string, message: string): void {
+function scheduleParseWarning(
+    notifications: NotificationSink | undefined,
+    title: string,
+    message: string,
+): void {
+    if (!notifications) return
+
     setTimeout(() => {
         try {
-            ctx.client.tui.showToast({
-                body: {
-                    title,
-                    message,
-                    variant: "warning",
-                    duration: 7000,
-                },
-            })
+            void Promise.resolve(
+                notifications.notify({ title, message, variant: "warning", duration: 7000 }),
+            ).catch(() => {})
         } catch {}
     }, 7000)
 }
 
-export function getConfig(ctx: PluginInput): PluginConfig {
+export function getConfig(ctx: ConfigHostInput): PluginConfig {
     let config = deepCloneConfig(defaultConfig)
     const configPaths = getConfigPaths(ctx)
+    const notifications = ctx.notifications
 
     if (!configPaths.global && !existsSync(GLOBAL_CONFIG_PATH_JSONC)) {
         createDefaultConfig()
@@ -782,7 +791,7 @@ export function getConfig(ctx: PluginInput): PluginConfig {
         const result = loadConfigFile(layer.path)
         if (result.parseError) {
             scheduleParseWarning(
-                ctx,
+                notifications,
                 `ACP: Invalid ${layer.name}`,
                 `${layer.path}\n${result.parseError}\nUsing previous/default values`,
             )
@@ -793,7 +802,7 @@ export function getConfig(ctx: PluginInput): PluginConfig {
             continue
         }
 
-        showConfigWarnings(ctx, layer.path, result.data, layer.isProject)
+        showConfigWarnings(notifications, layer.path, result.data, layer.isProject)
         config = mergeLayer(config, result.data)
     }
 

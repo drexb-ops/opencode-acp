@@ -2,7 +2,7 @@ import type { Logger } from "./logger"
 import { readFile, rm } from "node:fs/promises"
 import { basename, dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
-import type { PluginInput } from "@opencode-ai/plugin"
+import type { NotificationSink } from "./host"
 
 type PackageJson = {
     name?: string
@@ -17,13 +17,16 @@ type UpdateResult =
 
 const PACKAGE_NAME = "opencode-acp"
 
-export function startAutoUpdate(ctx: PluginInput, enabled: boolean, logger?: Logger): void {
+export function startAutoUpdate(
+    notifications: NotificationSink,
+    enabled: boolean,
+    logger?: Logger,
+): void {
     if (!enabled) {
         logger?.info("Auto-update disabled by config")
         return
     }
     logger?.info("Auto-update check starting")
-
 
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), 10_000)
@@ -46,13 +49,11 @@ export function startAutoUpdate(ctx: PluginInput, enabled: boolean, logger?: Log
                 to: result.latest,
             })
             setTimeout(() => {
-                ctx.client.tui.showToast({
-                    body: {
-                        title: "ACP update ready",
-                        message: `Updated ${result.name} from ${result.current} to ${result.latest}. Restart OpenCode to finish.`,
-                        variant: "info",
-                        duration: 7000,
-                    },
+                void notifications.notify({
+                    title: "ACP update ready",
+                    message: `Updated ${result.name} from ${result.current} to ${result.latest}. Restart OpenCode to finish.`,
+                    variant: "info",
+                    duration: 7000,
                 })
             }, 5000)
         })
@@ -66,37 +67,50 @@ async function checkAutoUpdate(signal: AbortSignal, logger?: Logger): Promise<Up
         logger?.info("Auto-update skipped: package dir not found")
         return { updated: false }
     }
- 
+
     const pkg = await readPackageJson(join(packageDir, "package.json"))
     if (!pkg?.name || !pkg.version) {
         logger?.info("Auto-update skipped: package.json unreadable", { packageDir })
         return { updated: false }
     }
- 
+
     const target = await updateTarget(packageDir, pkg.name)
     if (!target) {
-        logger?.info("Auto-update skipped: no update target", { name: pkg.name, version: pkg.version })
+        logger?.info("Auto-update skipped: no update target", {
+            name: pkg.name,
+            version: pkg.version,
+        })
         return { updated: false }
     }
- 
-     // Update within the channel the user installed from (dist-tag), not the
-     // global `latest` dist-tag: an @stable install must follow `stable`.
+
+    // Update within the channel the user installed from (dist-tag), not the
+    // global `latest` dist-tag: an @stable install must follow `stable`.
     const tag = specUpdateTag(target.spec)
     if (!tag) {
         logger?.info("Auto-update skipped: spec not auto-updatable", { spec: target.spec })
         return { updated: false }
     }
- 
+
     const latest = await fetchLatestVersion(pkg.name, tag, signal)
     if (!latest) {
         logger?.info("Auto-update skipped: no version published for tag", { name: pkg.name, tag })
         return { updated: false }
     }
     if (!isVersionNewer(latest, pkg.version)) {
-        logger?.info("Auto-update: already up to date", { name: pkg.name, tag, current: pkg.version, latest })
+        logger?.info("Auto-update: already up to date", {
+            name: pkg.name,
+            tag,
+            current: pkg.version,
+            latest,
+        })
         return { updated: false }
     }
-    logger?.info("Auto-update: newer version available", { name: pkg.name, tag, current: pkg.version, latest })
+    logger?.info("Auto-update: newer version available", {
+        name: pkg.name,
+        tag,
+        current: pkg.version,
+        latest,
+    })
 
     try {
         await rm(target.removeDir, { recursive: true, force: true })
@@ -132,7 +146,10 @@ export type UpdateTarget = {
     spec: string
 }
 
-export async function updateTarget(packageDir: string, name: string): Promise<UpdateTarget | undefined> {
+export async function updateTarget(
+    packageDir: string,
+    name: string,
+): Promise<UpdateTarget | undefined> {
     const packageParent = dirname(packageDir)
     const nodeModulesDir = basename(packageParent).startsWith("@")
         ? dirname(packageParent)
