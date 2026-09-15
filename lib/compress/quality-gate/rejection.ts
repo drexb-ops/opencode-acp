@@ -63,7 +63,7 @@ export function buildQualityRejectionError(
 Range: ${plan.startId}–${plan.endId}
 ${metrics.join("\n")}
 
-Retry: rewrite a more complete summary that preserves critical details (file paths, decisions, exact values, errors) and call compress again on the same range — the gate re-evaluates automatically. Full compression rules are already in your system prompt. If you are confident the summary is correct despite the metrics, add "acknowledgeRisk": true to bypass this rejection once.`
+Retry: rewrite a more complete summary that preserves critical details (file paths, decisions, exact values, errors) and call compress again on the same range — the gate re-evaluates automatically. Full compression rules are already in your system prompt. If you are confident the summary is correct despite the metrics, add "acknowledgeRisk": true to bypass the quality gate on your next compress call.`
 
     return new Error(message)
 }
