@@ -238,14 +238,14 @@ function enqueuePersistedSessionState(
     })
 }
 
-// [FIX Bug 6] Removed try/catch — errors now propagate to callers so they know save failed
+// [FIX Bug 6] Errors propagate to callers so they know a save failed.
 export async function saveSessionState(
     sessionState: SessionState,
     logger: Logger,
     sessionName?: string,
 ): Promise<void> {
     if (!sessionState.sessionId) {
-        return
+        return Promise.resolve()
     }
 
     const state: PersistedSessionState = {
@@ -303,13 +303,7 @@ export async function loadSessionState(
 
         const hasPruneMessages = state?.prune?.messages && typeof state.prune.messages === "object"
         const hasNudgeFormat = state?.nudges && typeof state.nudges === "object"
-        if (
-            !state ||
-            !state.prune ||
-            !hasPruneMessages ||
-            !state.stats ||
-            !hasNudgeFormat
-        ) {
+        if (!state || !state.prune || !hasPruneMessages || !state.stats || !hasNudgeFormat) {
             logger.warn("Invalid session state file, ignoring", {
                 sessionId: sessionId,
             })

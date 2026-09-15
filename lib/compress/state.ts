@@ -1,4 +1,5 @@
 import type { CompressionBlock, CompressionTier, PruneMessagesState, SessionState } from "../state"
+import { bumpPruneStructureVersion } from "../state/utils"
 import { formatBlockRef, formatMessageIdTag } from "../message-ids"
 import type { AppliedCompressionResult, CompressionStateInput, SelectionResolution } from "./types"
 import type { GCConfig } from "../config"
@@ -191,7 +192,7 @@ export function applyCompressionState(
     }
 
     messagesState.blocksById.set(blockId, block)
-    messagesState.blockStructureVersion++
+    bumpPruneStructureVersion(messagesState)
     messagesState.activeBlockIds.add(blockId)
     messagesState.activeByAnchorMessageId.set(anchorMessageId, blockId)
 
@@ -335,6 +336,10 @@ export function applyCompressionState(
     state.stats.pruneTokenCounter += compressedTokens
     state.stats.totalPruneTokens += state.stats.pruneTokenCounter
     state.stats.pruneTokenCounter = 0
+
+    // [Issue #384] Block structure/liveness changed — invalidate sync +
+    // hide-consumed caches derived from previous versions.
+    bumpPruneStructureVersion(messagesState)
 
     return {
         compressedTokens,

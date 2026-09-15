@@ -1,5 +1,49 @@
 # 更新日志
 
+### v1.18.1 — 论文预印本 v0.2 入库（纯文档）
+
+**PR #394。** 无运行时代码变更 —— 本次发布将 ACP 的研究预印本及其配图收入仓库，并在两个 README 中加链接。
+
+- **论文**：`paper/model-driven-incremental-hierarchical-compression-training-free-multi-generational-context-management-for-long-lived-coding-agents.md`（英文）+ `paper/模型驱动的增量分层压缩-免训练多代上下文管理.md`（中文），预印本 v0.2 —— 生产规模纵向研究：4.5 个月、三台主机、174,327 次模型调用、累计输入 18.76B tokens（全部主机合计约 24.7B）、204,800-token 模型零窗口违规、马拉松会话 8,584–12,049 次调用。
+- **配图**：`paper/figures/fig1-fold-layout.png` … `fig6-capacity-sim.png`，由 `paper/figures/make-figures.py` 生成。
+- **开放获取**：论文以 MIT 许可收录在仓库内（活文档 —— 欢迎通过 PR 改进）；两个 README 均有醒目标注并链接到各自语言版本。
+
+**安装**：`opencode plugin opencode-acp@latest --global`
+
+### v1.18.0 — 自适应压缩候选（opt-in）：MICRO/EPISODE 目标，执行同构校验
+
+**PR #341 + 后续修复。** 在既有范围 nudge 之上加了一层候选规划 —— 默认关闭，未开启时与 v1.17.1 行为逐字节一致。
+
+**开启后**（`{"compress": {"candidates": true}}`）：
+- nudge 与 `acp_status` 展示预先校验、可批量提交的压缩目标，而非原始范围：**MICRO** = 单条大消息或完整工具事务（call+result 闭包）；**EPISODE** = 相邻小单元构成的历史片段（≥ `minCompressRange`）。
+- 执行同构：候选通过与 `compress` 工具相同的 `prepareExecutableRangePlans` 路径校验 —— 列表中的目标均可直接提交（工具对闭合、保护同等、Bug 39 语义保留）。规划 fail-closed，开销限制在可见上下文内（v1.17.1 #385 保证 ~1.2 ms）。
+- 解决过度压缩问题：模型面对 "compress m00150–m00220" 时不再为了省一个大工具输出而整段压掉。
+
+**默认 OFF = 精确还原 v1.17.1**：基础 nudge 模板、breakdown 文案、`acp_status` 概览、debug 日志均恢复原文；候选规划不执行（零开销）。合并后评审确认：`compress.candidates` 不可按模型覆盖（仅全局/项目层）—— 类型、校验白名单、文档三处已对齐。一个有意保留的 PR 分支变更：transform 管道重排（工具输出截断与预算守卫移到 nudge 注入之后）在两种模式下均生效；e2e 场景 01–12 全部在 OFF 模式下通过。
+
+**同版本包含**：system prompt 与 compress-range prompt 的候选指导同样受开关门控（a1a2f23）；e2e 场景 13 显式开启；新增 12 个测试（含 §5.7 四轮 growth-cycle、生产配置 `preserveRecentMessages: 20`、#207 baseline 保留断言）。全量 1263/1263。
+
+**安装**：`opencode plugin opencode-acp@latest --global`
+
+### v1.17.1 — transform 开销不再随压缩历史增长（13.6 s → 1.2 ms）+ 配置/CI 修复
+
+捆绑三项修复 —— 主打 #385，消除 #384 报告的长会话卡顿：
+
+**1. transform 成本收敛到可见上下文 + 活跃块**（#385，修复 #384）：
+每次 transform 的工作量随**总压缩历史**而非可见上下文增长。候选规划在 1000 条消息下实测 **13.6 s**，修复后 **~1.2 ms**（验收目标 ≤20 ms，余量 ~17×；同基准前后对比，`scripts/bench-candidate-planning.ts`）。
+- **RC1** `resolveBoundaryIds()` 每个候选草稿都重建全局边界索引 → 请求级 `SearchContext.boundaryLookup` 记忆化，每次 compress 调用只建一次。
+- **RC1b** `resolveSelection()` 每条消息跑真实 Anthropic BPE 分词器（实测 ~27 ms/KB）→ 新 `estimateAllMessageTokensFast()`（字符/4，既有估算惯例）；对正确性有要求的位置保留精确 BPE。
+- **RC2** T1 nudge 分析（上下文构成 / 保护引用 / 可压缩范围）在无 nudge 可触发时也每次全量计算 → 改为 `nudgeAllowed || emergencyOverride || tierTriggerPossible` 时才计算，所有消费方空值守卫。
+- **RC3** `syncCompressionBlocks()` 每次重放全部块（含失活），`hideConsumedCompressCalls()` 每次重建不变索引 → 瞬态 `structureVersion` 在三处块变更点递增；结构未变时 sync 跳过全量重放；hide-consumed 按版本缓存派生索引。
+- **RC4** 发后即忘的状态保存可能竞态（旧快照覆盖新）→ 有序合并的每会话保存队列（入队时快照、`setImmediate` 排空、批内只写最新、FIFO、失败隔离）。
+- 持久化格式**不变** —— 新字段全部瞬态；候选执行校验、Bug 39 保护语义、decompression、fork 恢复未动。新增 20 个测试（sync 等价性、缓存失效、记忆化、保存合并、§5.7 多轮增长周期）。
+
+**2. `qualityGate.algorithms` 误报 "Unknown keys"**（#389，修复 #329）：按算法名配置参数（`qualityGate.algorithms.rouge-recall-v1.*`）是合法的动态键映射，但键白名单递归进了它 —— 每次启动都对合法配置告警。已加入递归跳过列表（与 `compress.providers` / `messageFilters.filters` 同惯例）。注意：`rouge-recall-v1` 的真实参数名是 `layer1MinChars`、`layer1MinRetentionPct`、`layer2MaxRougeF1`、`layer2MaxTop20Recall` —— 未知内层键会被静默忽略，请检查参数是否真正生效。
+
+**3. fork PR 构建恢复绿色**（#390，修复 #366）：`build-artifact` 对每个 PR 都跑 `npm publish`，但 fork PR 拿不到 `NPM_TOKEN` → ENEEDAUTH 干掉整个任务。发布步骤现在仅限同仓库头分支；fork PR 仍会构建、打包、上传构件，安装指引评论也不再对 fork 宣传不存在的 npm 标签和主仓库引用。仅 CI 改动，无运行时代码。
+
+文件：`lib/compress/search.ts`、`lib/messages/sync.ts`、`lib/messages/utils.ts`、`lib/token-utils.ts`、`lib/state/persistence.ts`、`lib/state/types.ts`、`lib/config-validation.ts`、`scripts/bench-candidate-planning.ts`（新增）、`.github/workflows/pr-artifact.yml`。发布分支全量 1209/1209；typecheck + build 干净。
+
 ### v1.17.0 — 上下文窗口安全网 + 预算守卫：终结静默 400 死循环
 
 捆绑六项修复，其中两项是针对“窗口未知/超出窗口”会话的新保护子系统：

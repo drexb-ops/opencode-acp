@@ -360,7 +360,9 @@ export function createChatMessageTransformHandler(
         // Keep the full post-filter projection for candidate planning. The
         // nudge receives a pruned view, while range validation still needs the
         // original ordering to prove tool-pair and protection parity.
-        const candidateMessages = output.messages.slice()
+        // Skip the copy entirely when candidates are disabled (default).
+        const candidateMessages =
+            config.compress.candidates === true ? output.messages.slice() : undefined
         prune(state, logger, config, output.messages)
         hideConsumedCompressCalls(state, output.messages)
         assignMessageRefs(state, output.messages)
@@ -507,10 +509,18 @@ export function createCommandExecuteHandler(
                 workingDirectory,
             }
 
+            // [FIX #398] Every handled /acp branch MUST abort the command by throwing
+            // __DCP_CONTEXT_HANDLED__. A normal return does NOT stop execution:
+            // opencode's Plugin.trigger only aborts on hook errors, and the command is
+            // registered with template: "" (no $ARGUMENTS), so opencode appends the raw
+            // arguments to the empty template and sends them to the model as a user
+            // message ("/acp status" leaked "status" to the model in v1.17.0+). The
+            // resulting level=ERROR log line on opencode >= 1.18.18 is the known cost
+            // of this mechanism (#296) — do NOT replace these throws with returns.
             const sub = input.arguments?.trim().toLowerCase()
             if (sub === "stats" || sub === "status" || sub === "") {
                 await handleStatsCommand(commandCtx)
-                return
+                throw new Error("__DCP_CONTEXT_HANDLED__")
             }
 
             if (sub === "export" || sub.startsWith("export ")) {
@@ -525,6 +535,7 @@ export function createCommandExecuteHandler(
             }
 
             await handleContextCommand(commandCtx)
+            throw new Error("__DCP_CONTEXT_HANDLED__")
         }
     }
 }

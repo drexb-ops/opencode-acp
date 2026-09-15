@@ -23,10 +23,7 @@ export interface ToolFactoryContext {
 // [FIX #33] Resolve the caller's per-session state at tool-call time and build a
 // ToolContext bound to it. A compress tool can only run after messages.transform
 // initialized the session, so the state is guaranteed present.
-export function resolveToolContext(
-    factoryCtx: ToolFactoryContext,
-    sessionID: string,
-): ToolContext {
+export function resolveToolContext(factoryCtx: ToolFactoryContext, sessionID: string): ToolContext {
     const state = factoryCtx.registry.get(sessionID)
     if (!state) {
         throw new Error(
@@ -87,7 +84,11 @@ export interface SearchContext {
     rawMessagesById: Map<string, WithParts>
     rawIndexById: Map<string, number>
     summaryByBlockId: Map<number, CompressionBlock>
-    /** Request-scoped boundary references for visible messages and active blocks. */
+    /**
+     * [Issue #384] Request-scoped boundary lookup (mNNNNN/bN → BoundaryReference),
+     * built once per SearchContext instead of once per boundary pair. Optional so
+     * hand-built contexts (tests) keep working; resolveBoundaryIds memoizes it lazily.
+     */
     boundaryLookup?: Map<string, BoundaryReference>
     /** Active blocks grouped by their raw anchor message for range selection. */
     summariesByAnchorMessageId?: Map<string, CompressionBlock[]>

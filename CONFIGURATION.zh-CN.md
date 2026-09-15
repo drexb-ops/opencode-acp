@@ -180,6 +180,13 @@ ACP 从最多三层配置文件中读取（后加载的覆盖先加载的）：
 - **状态：** ACTIVE
 - **说明：** 将摘要缓冲区指引注入系统 prompt，帮助模型了解现有块及其覆盖范围。
 
+#### `compress.candidates`
+
+- **类型：** `boolean`
+- **默认值：** `false`
+- **状态：** ACTIVE（可选开启）
+- **说明：** 启用 MICRO/EPISODE 压缩候选。为 `true` 时，nudge 与 `acp_status` 显示预先校验、可批量提交的压缩候选（MICRO = 单条大消息或完整工具事务；EPISODE = 相邻小单元构成的历史片段），而非原始可压缩范围。候选通过与 `compress` 工具相同的执行校验路径，列表中的目标均可直接提交。为 `false`（默认）时保持传统的范围列表行为。
+
 #### `compress.maxContextLimit`
 
 - **类型：** `number | \`${number}%\``

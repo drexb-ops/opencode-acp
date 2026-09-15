@@ -4,34 +4,6 @@ import { hasMeaningfulContent } from "./parts"
 
 const KEEP_LAST_ORPHANED = 2
 
-interface HistoricalCallIdIndex {
-    blockStructureVersion: number
-    callIds: ReadonlySet<string>
-}
-
-// Block call IDs are immutable historical data. Keep this derived index out of
-// persisted session state; block-graph mutations advance a transient version.
-const historicalCallIdsByState = new WeakMap<object, HistoricalCallIdIndex>()
-
-function getHistoricalCallIds(state: SessionState): ReadonlySet<string> {
-    const messagesState = state.prune.messages
-    const blockStructureVersion =
-        messagesState.blockStructureVersion ?? messagesState.blocksById.size
-    const cached = historicalCallIdsByState.get(messagesState)
-    if (cached?.blockStructureVersion === blockStructureVersion) {
-        return cached.callIds
-    }
-
-    const callIds = new Set<string>()
-    for (const block of messagesState.blocksById.values()) {
-        if (block.compressCallId) {
-            callIds.add(block.compressCallId)
-        }
-    }
-    historicalCallIdsByState.set(messagesState, { blockStructureVersion, callIds })
-    return callIds
-}
-
 function isLiveBlock(block: CompressionBlock): boolean {
     return block.active && !block.deactivatedByUser && !block.deactivatedByUserDeep
 }
@@ -88,18 +60,37 @@ function rewriteCompressInput(part: Part, liveKeys: Set<string>): Part | null {
  * in the default protected-tools list. See upstream issue #288.
  */
 export function hideConsumedCompressCalls(state: SessionState, messages: WithParts[]): number {
-    const allBlockCallIds = getHistoricalCallIds(state)
+    // Historical call IDs are immutable after a block-structure change, so
+    // cache that unbounded scan by structureVersion. Liveness can change before
+    // a caller has bumped the version (notably during decompression), so active
+    // calls and range keys stay per-transform and are derived from the current
+    // active block projection.
+    const messagesState = state.prune.messages
+    const version = messagesState.structureVersion ?? 0
+    let cached = messagesState.hideConsumedIndex
+    if (!cached || cached.version !== version) {
+        const allBlockCallIds = new Set<string>()
+        for (const block of messagesState.blocksById.values()) {
+            if (!block.compressCallId) continue
+            allBlockCallIds.add(block.compressCallId)
+        }
+        cached = {
+            version,
+            allBlockCallIds,
+            liveRangeKeysByCallId: new Map<string, Set<string>>(),
+            activeCallIds: new Set<string>(),
+        }
+        messagesState.hideConsumedIndex = cached
+    }
     const liveRangeKeysByCallId = new Map<string, Set<string>>()
     const activeCallIds = new Set<string>()
-    const liveBlocks = state.prune.messages.membershipsVerified
-        ? [...state.prune.messages.activeBlockIds]
-              .map((blockId) => state.prune.messages.blocksById.get(blockId))
+    const liveBlocks = messagesState.membershipsVerified
+        ? [...messagesState.activeBlockIds]
+              .map((blockId) => messagesState.blocksById.get(blockId))
               .filter((block): block is CompressionBlock => block !== undefined)
-        : state.prune.messages.blocksById.values()
-
+        : messagesState.blocksById.values()
     for (const block of liveBlocks) {
-        if (!block?.compressCallId) continue
-        if (!isLiveBlock(block)) continue
+        if (!block.compressCallId || !isLiveBlock(block)) continue
         activeCallIds.add(block.compressCallId)
         let keys = liveRangeKeysByCallId.get(block.compressCallId)
         if (!keys) {
@@ -108,6 +99,7 @@ export function hideConsumedCompressCalls(state: SessionState, messages: WithPar
         }
         keys.add(rangeKey(block.startId, block.endId))
     }
+    const { allBlockCallIds } = cached
 
     const lastOrphanedCallIds: string[] = []
     const orphanedCallIds = new Set<string>()

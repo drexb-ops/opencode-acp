@@ -48,3 +48,6 @@ SCHEMA_NOTES.md
 repomix-output.xml
 results.txt
 symbols.txt
+
+# Local scratch (agent temp files) — never commit
+tmp/

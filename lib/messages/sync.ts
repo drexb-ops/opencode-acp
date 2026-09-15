@@ -1,4 +1,4 @@
-import type { SessionState, WithParts } from "../state"
+import type { CompressionBlock, SessionState, WithParts } from "../state"
 import type { Logger } from "../logger"
 
 function sortBlocksByCreation(
@@ -10,6 +10,11 @@ function sortBlocksByCreation(
         return createdAtDiff
     }
     return a.blockId - b.blockId
+}
+
+function sameBlockIds(left: Set<number>, right: Set<number>): boolean {
+    if (left.size !== right.size) return false
+    return Array.from(left).every((id) => right.has(id))
 }
 
 export const syncCompressionBlocks = (
@@ -34,32 +39,45 @@ export const syncCompressionBlocks = (
         return false
     }
 
-    // Block membership indexes are maintained by compression mutators. Once
-    // one complete sync has verified them, avoid replaying historical blocks
-    // on every transform. Keep the cheap anchor projection current because
-    // the message list can lose anchors during host compaction.
-    if (messagesState.membershipsVerified) {
-        const messageIds = new Set(messages.map((msg) => msg.info.id))
-        for (const [anchorMessageId, blockId] of messagesState.activeByAnchorMessageId) {
-            if (!messagesState.activeBlockIds.has(blockId) || !messageIds.has(anchorMessageId)) {
-                messagesState.activeByAnchorMessageId.delete(anchorMessageId)
-            }
+    const messageIds = new Set(messages.map((msg) => msg.info.id))
+
+    // [Issue #384] Verified-state synchronization: the full replay below walks
+    // EVERY historical block (unbounded growth with session length). Block
+    // liveness only changes through structureVersion-bumped mutations, so when
+    // the version matches the last sync, liveness is already at its fixed
+    // point. The only thing that can drift between transforms is the anchor
+    // map — opencode may have removed or added messages since — so rebuild it
+    // from ACTIVE blocks only (bounded) and skip the rest.
+    const structureVersion = messagesState.structureVersion ?? 0
+    if (messagesState.lastSyncedStructureVersion === structureVersion) {
+        const activeBlocks = [...messagesState.activeBlockIds]
+            .map((id) => messagesState.blocksById.get(id))
+            .filter((b): b is CompressionBlock => b !== undefined)
+            .sort(sortBlocksByCreation)
+        const nextAnchorMap = new Map<string, number>()
+        for (const block of activeBlocks) {
+            if (!messageIds.has(block.anchorMessageId)) continue
+            nextAnchorMap.set(block.anchorMessageId, block.blockId)
         }
-        for (const blockId of messagesState.activeBlockIds) {
-            const block = messagesState.blocksById.get(blockId)
-            if (block && messageIds.has(block.anchorMessageId)) {
-                messagesState.activeByAnchorMessageId.set(block.anchorMessageId, blockId)
+        const previous = messagesState.activeByAnchorMessageId
+        if (
+            previous.size !== nextAnchorMap.size ||
+            ![...nextAnchorMap.entries()].every(([anchor, id]) => previous.get(anchor) === id)
+        ) {
+            previous.clear()
+            for (const [anchor, id] of nextAnchorMap) {
+                previous.set(anchor, id)
             }
         }
         return false
     }
 
-    const messageIds = new Set(messages.map((msg) => msg.info.id))
     const previousActiveBlockIds = new Set<number>(
         Array.from(messagesState.blocksById.values())
             .filter((block) => block.active)
             .map((block) => block.blockId),
     )
+    const indexedActiveBlockIds = new Set(messagesState.activeBlockIds)
     messagesState.activeBlockIds.clear()
     messagesState.activeByAnchorMessageId.clear()
 
@@ -111,15 +129,20 @@ export const syncCompressionBlocks = (
         }
     }
 
-    for (const entry of messagesState.byMessageId.values()) {
-        const allBlockIds = Array.isArray(entry.allBlockIds)
-            ? [...new Set(entry.allBlockIds.filter((id) => Number.isInteger(id) && id > 0))]
-            : []
+    const membershipsRebuilt =
+        !messagesState.membershipsVerified ||
+        !sameBlockIds(indexedActiveBlockIds, messagesState.activeBlockIds)
+    if (membershipsRebuilt) {
+        for (const entry of messagesState.byMessageId.values()) {
+            const allBlockIds = Array.isArray(entry.allBlockIds)
+                ? [...new Set(entry.allBlockIds.filter((id) => Number.isInteger(id) && id > 0))]
+                : []
 
-        entry.allBlockIds = allBlockIds
-        entry.activeBlockIds = allBlockIds.filter((id) => messagesState.activeBlockIds.has(id))
+            entry.allBlockIds = allBlockIds
+            entry.activeBlockIds = allBlockIds.filter((id) => messagesState.activeBlockIds.has(id))
+        }
+        messagesState.membershipsVerified = true
     }
-    messagesState.membershipsVerified = true
 
     const nextActiveBlockIds = messagesState.activeBlockIds
     let deactivatedCount = 0
@@ -143,5 +166,6 @@ export const syncCompressionBlocks = (
         })
     }
 
-    return true
+    messagesState.lastSyncedStructureVersion = structureVersion
+    return membershipsRebuilt || deactivatedCount > 0 || reactivatedCount > 0
 }

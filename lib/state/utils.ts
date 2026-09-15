@@ -40,6 +40,16 @@ interface PersistedPruneMessagesState {
     markedForCleanup?: number[]
 }
 
+/**
+ * [Issue #384] Bump the transient block-structure version so consumers
+ * (syncCompressionBlocks, hideConsumedCompressCalls) can detect that cached
+ * liveness-derived data is stale. Call once after every mutation of block
+ * structure or liveness (new blocks, deactivation, user decompress, merge).
+ */
+export function bumpPruneStructureVersion(messagesState: PruneMessagesState): void {
+    messagesState.structureVersion = (messagesState.structureVersion ?? 0) + 1
+}
+
 export function serializePruneMessagesState(
     messagesState: PruneMessagesState,
 ): PersistedPruneMessagesState {
@@ -117,7 +127,6 @@ export function createPruneMessagesState(): PruneMessagesState {
         nextRunId: 1,
         markedForCleanup: new Set<number>(),
         membershipsVerified: false,
-        blockStructureVersion: 0,
     }
 }
 

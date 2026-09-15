@@ -235,3 +235,14 @@ export function countMessageCharacters(msg: WithParts): number {
     }
     return total
 }
+
+/**
+ * [Issue #384] Fast per-message token estimate using the chars/4 convention
+ * already used across the codebase for token statistics (tool-cache.ts,
+ * pipeline.ts, inject/utils.ts). The BPE-exact countAllMessageTokens costs
+ * ~25ms/message on this runtime and dominated candidate planning on wide
+ * draft ranges; these counters feed heuristic stats/gates, not billing.
+ */
+export function estimateAllMessageTokensFast(msg: WithParts): number {
+    return Math.round(countMessageCharacters(msg) / 4)
+}

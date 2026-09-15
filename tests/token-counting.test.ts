@@ -5,6 +5,7 @@ import {
     COMPACTED_TOOL_OUTPUT_PLACEHOLDER,
     countAllMessageTokens,
     countToolTokens,
+    estimateAllMessageTokensFast,
     estimateTokensBatch,
     extractCompletedToolOutput,
     extractToolContent,
@@ -171,4 +172,28 @@ test("counting uses the compacted tool placeholder for completed outputs", () =>
 
     assert.equal(extractCompletedToolOutput(part), COMPACTED_TOOL_OUTPUT_PLACEHOLDER)
     assertCounted(part, [JSON.stringify(input), COMPACTED_TOOL_OUTPUT_PLACEHOLDER])
+})
+
+test("estimateAllMessageTokensFast uses chars/4 for text parts (Issue #384)", () => {
+    const msg = {
+        info: { id: "msg-text", role: "assistant" } as any,
+        parts: [{ type: "text", text: "a".repeat(1000) }],
+    } as unknown as WithParts
+
+    assert.equal(estimateAllMessageTokensFast(msg), 250)
+})
+
+test("estimateAllMessageTokensFast counts tool input/output characters like extractToolContent (Issue #384)", () => {
+    const input = { command: "npm test", workdir: "/tmp/project" }
+    const output = "x".repeat(800)
+    const part = buildToolPart("bash", { status: "completed", input, output })
+
+    const expectedChars = JSON.stringify(input).length + output.length
+    assert.equal(estimateAllMessageTokensFast(buildToolMessage(part)), Math.round(expectedChars / 4))
+})
+
+test("estimateAllMessageTokensFast returns 0 for empty messages", () => {
+    const msg = { info: { id: "msg-empty", role: "assistant" } as any, parts: [] } as unknown as WithParts
+
+    assert.equal(estimateAllMessageTokensFast(msg), 0)
 })

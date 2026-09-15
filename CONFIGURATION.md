@@ -180,6 +180,13 @@ Core compression behavior.
 - **Status:** ACTIVE
 - **Description:** Inject summary buffer guidance into the system prompt, helping the model understand which blocks exist and their coverage.
 
+#### `compress.candidates`
+
+- **Type:** `boolean`
+- **Default:** `false`
+- **Status:** ACTIVE (opt-in)
+- **Description:** Enable MICRO/EPISODE compression candidates. When `true`, nudges and `acp_status` show pre-validated, batchable compression candidates (MICRO = one large message or a complete tool transaction; EPISODE = a contiguous historical segment of smaller units) instead of raw compressible ranges. Candidates are validated through the same execution path as the `compress` tool, so every listed target is submittable. When `false` (default), legacy range-list behavior is kept.
+
 #### `compress.maxContextLimit`
 
 - **Type:** `number | \`${number}%\``
