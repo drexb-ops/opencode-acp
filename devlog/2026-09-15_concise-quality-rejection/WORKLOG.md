@@ -2,7 +2,7 @@
 
 - Task ID: `2026-09-15_concise-quality-rejection`
 - Home Repo: `opencode-acp`
-- Status: InProgress
+- Status: Done
 - Updated: 2026-09-15
 
 ## 1. Summary
@@ -29,7 +29,9 @@
 
 | Commit | Description |
 |--------|-------------|
-| _(pending)_ | fix: concise quality-gate rejection message (no rules re-injection) |
+| `3d8688f` | fix: concise quality-gate rejection message (no rules re-injection) |
+| `6dd1860` | test: address round-1 review finding (assert retry directive) |
+| `a242578` | fix: precise acknowledgeRisk window wording (next compress call) |
 
 ### Key Files
 
@@ -53,12 +55,16 @@
   rougeF1, top20Recall) + one retry paragraph. Pre-fix payload ≈ 5.4K chars
   (≈1.4K tokens); post-fix ≈ 600 chars (≈150 tokens) for a standard rejection
   — ~85% smaller.
-- **acknowledgeRisk wording fix**: the old text claimed "Without
-  acknowledgeRisk: true, the compression will be rejected again", which is
-  false under #301/#303 semantics — a rewritten summary that passes the gate
-  is accepted without the flag; the flag only bypasses when
-  `qualityGateRetryPending` is set (i.e., after a prior rejection). New text
-  matches actual behavior. (Full interaction redesign remains open in #339.)
+ - **acknowledgeRisk wording fix**: the old text claimed "Without
+   acknowledgeRisk: true, the compression will be rejected again", which is
+   false under #301/#303 semantics — a rewritten summary that passes the gate
+   is accepted without the flag; the flag only bypasses when
+   `qualityGateRetryPending` is set (i.e., after a prior rejection). Round-1
+   code review further refined the window: `qualityGateRetryPending` is cleared
+   at the start of *every* compress call (`lib/compress/range.ts:338`), so the
+   bypass window is exactly the next compress call — final text says "bypass
+   the quality gate on your next compress call" (commit `a242578`). (Full
+   interaction redesign remains open in #339.)
 
 ## 4. Testing & Verification
 
@@ -87,7 +93,19 @@ npm run test
 
 ### Dual-Agent Review (AGENTS.md §5.3 / §5.6)
 
-- _(pending — see PR)_
+- **Code review (independent agent)**: APPROVE. Verified typecheck clean,
+  15/15 + full 1133/1133 green, backward-compat (signature/interface/barrel,
+  E2E marker strings intact, no other module imports the removed constant),
+  no state mutation, diff clean. One NIT: `acknowledgeRisk` bypass window is
+  exactly the next compress call (`qualityGateRetryPending` cleared at
+  `range.ts:338`) → wording fixed in `a242578`.
+- **Test review (independent agent)**: APPROVE. Import correctness, name
+  fidelity, fixture completeness, input validity all pass; no tautologies or
+  local reimplementation. Mutation check performed: swapped in `master`'s
+  rejection.ts → the 3 new/changed tests FAILED as expected (missing reason,
+  rules re-embedded, 5811 chars > budget); restored → 15/15 pass, tree clean.
+  Two NITs: added `Retry:` assertion (`6dd1860`); size-budget magic number kept
+  with an explanatory comment (acceptable regression guard).
 
 ### Results
 
@@ -98,7 +116,8 @@ npm run test
 
 - **Risk points**: none identified — text-only change; single call site; E2E
   markers preserved.
-- **Rollback method**: revert the fix commit; no state or API impact.
+- **Rollback method**: revert commit(s) `3d8688f`, `6dd1860`, `a242578`; no
+  state or API impact (text-only change).
 - **Compatibility notes** (data format, config schema): None.
 
 ## 6. Lessons Learned (optional)
