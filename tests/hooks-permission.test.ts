@@ -161,26 +161,31 @@ test("command execute works even when effective permission resolves to deny (inf
         { global: undefined, agents: {} },
     )
 
-    // /acp (no args) now shows compression status — works regardless of compress permission
-    try {
-        await handler({ command: "dcp", sessionID: "session-1", arguments: "" }, output)
-    } catch (e: any) {
-        if (e?.message !== "__DCP_CONTEXT_HANDLED__") throw e
-    }
+    // /acp (no args) now shows compression status — works regardless of compress permission.
+    // Since #398 the abort is deterministic: only a throw stops opencode from sending
+    // the arguments to the model, so the hook MUST reject with the sentinel.
+    await expectAbortedAfterNotification(handler, "", "dcp")
 
     assert.equal(sessionMessagesCalls, 1)
 })
 
+// Minimal shape of the session.prompt call ACP sends for ignored notifications
+// (see sendIgnoredMessage in lib/ui/notification.ts).
+type IgnoredPromptCall = {
+    path: { id: string }
+    body: { noReply?: boolean; parts?: Array<{ type: string; text: string; ignored?: boolean }> }
+}
+
 function createCommandHarness(permission: string = "allow") {
     let sessionMessagesCalls = 0
-    const prompts: any[] = []
+    const prompts: IgnoredPromptCall[] = []
     const client = {
         session: {
             messages: async () => {
                 sessionMessagesCalls += 1
                 return { data: [] }
             },
-            prompt: async (args: any) => {
+            prompt: async (args: IgnoredPromptCall) => {
                 prompts.push(args)
                 return {}
             },
@@ -204,12 +209,13 @@ function createCommandHarness(permission: string = "allow") {
 // model call). Every handled /acp branch MUST reject with
 // __DCP_CONTEXT_HANDLED__ after delivering its ignored notification.
 async function expectAbortedAfterNotification(
-    handler: (input: any, output: any) => Promise<any>,
+    handler: ReturnType<typeof createCommandExecuteHandler>,
     args: string,
+    command: string = "acp",
 ): Promise<void> {
     await assert.rejects(
-        () => handler({ command: "acp", sessionID: "session-1", arguments: args }, { parts: [] }),
-        (e: any) => e instanceof Error && e.message === "__DCP_CONTEXT_HANDLED__",
+        () => handler({ command, sessionID: "session-1", arguments: args }, { parts: [] }),
+        (e: unknown) => e instanceof Error && e.message === "__DCP_CONTEXT_HANDLED__",
     )
 }
 
