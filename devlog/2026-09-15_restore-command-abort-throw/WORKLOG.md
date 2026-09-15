@@ -18,7 +18,7 @@
 
 | Commit | Description |
 |--------|-------------|
-| `d628f43` | fix: restore throw-based abort for /acp subcommands (regression guard #398) |
+| `2c59c07` | fix: restore throw-based abort for /acp subcommands (regression guard #398) |
 
 ### Key Files
 
@@ -61,7 +61,7 @@ node --import tsx --test tests/hooks-permission.test.ts
 
 - **Risk points**: opencode ≥ 1.18.18 logs one `level=ERROR` line per `/acp` invocation (accepted trade-off, see REQ.md). No other behavior change; export/help branches untouched.
 - **Rollback method**:
-  - Revert commit(s): `d628f43`
+  - Revert commit(s): `2c59c07`
   - Rollback impact: returns to the v1.17.0+ leak behavior (subcommand words sent to the model).
 - **Compatibility notes** (data format, config schema): No changes.
 
