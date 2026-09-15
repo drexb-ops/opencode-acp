@@ -1,5 +1,15 @@
 # 更新日志
 
+### v1.18.1 — 论文预印本 v0.2 入库（纯文档）
+
+**PR #394。** 无运行时代码变更 —— 本次发布将 ACP 的研究预印本及其配图收入仓库，并在两个 README 中加链接。
+
+- **论文**：`paper/model-driven-incremental-hierarchical-compression-training-free-multi-generational-context-management-for-long-lived-coding-agents.md`（英文）+ `paper/模型驱动的增量分层压缩-免训练多代上下文管理.md`（中文），预印本 v0.2 —— 生产规模纵向研究：4.5 个月、三台主机、174,327 次模型调用、累计输入 18.76B tokens（全部主机合计约 24.7B）、204,800-token 模型零窗口违规、马拉松会话 8,584–12,049 次调用。
+- **配图**：`paper/figures/fig1-fold-layout.png` … `fig6-capacity-sim.png`，由 `paper/figures/make-figures.py` 生成。
+- **开放获取**：论文以 MIT 许可收录在仓库内（活文档 —— 欢迎通过 PR 改进）；两个 README 均有醒目标注并链接到各自语言版本。
+
+**安装**：`opencode plugin opencode-acp@latest --global`
+
 ### v1.18.0 — 自适应压缩候选（opt-in）：MICRO/EPISODE 目标，执行同构校验
 
 **PR #341 + 后续修复。** 在既有范围 nudge 之上加了一层候选规划 —— 默认关闭，未开启时与 v1.17.1 行为逐字节一致。
