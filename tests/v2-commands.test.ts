@@ -1,3 +1,4 @@
+import "./test-env"
 import assert from "node:assert/strict"
 import test from "node:test"
 import type { CommandDefinition } from "@opencode/plugin/promise/command"
@@ -8,13 +9,13 @@ import { createV2CommandTransform, type V2CommandEditor } from "../lib/v2/comman
 import { Logger } from "../lib/logger"
 import { SessionStateRegistry, type WithParts } from "../lib/state"
 
-function config(): PluginConfig {
+function config(allowSubAgents = true): PluginConfig {
     return {
         enabled: true,
         autoUpdate: false,
         debug: false,
         logLevel: "silent",
-        allowSubAgents: true,
+        allowSubAgents,
         pruneNotification: "off",
         pruneNotificationType: "toast",
         commands: { enabled: true, protectedTools: [] },
@@ -79,11 +80,21 @@ function message(id: string, text: string): WithParts {
     }
 }
 
-function commandHost(notices: string[]): V2HostAdapter {
+function commandHost(
+    notices: string[],
+    parentID: string | null | undefined = undefined,
+    counters: { get: number; messages: number } = { get: 0, messages: 0 },
+): V2HostAdapter {
     return {
         sessions: {
-            get: async () => ({ id: "command-session", agent: "code" }),
-            messages: async () => [message("user-1", "request")],
+            get: async () => {
+                counters.get++
+                return { id: "command-session", agent: "code", parentID }
+            },
+            messages: async () => {
+                counters.messages++
+                return [message("user-1", "request")]
+            },
             parentMessages: async () => [],
         },
         models: { list: async () => [] },
@@ -172,6 +183,65 @@ test("V2 default and unknown subcommands use the shared dispatcher", async () =>
     assert.equal(notices.length, 2)
     assert.match(notices[0] ?? "", /ACP Status|COMPRESSION|COMPRESSED BLOCKS/i)
     assert.match(notices[1] ?? "", /ACP Context Analysis/)
+})
+
+test("V2 commands fail closed for child sessions before loading history", async () => {
+    const notices: string[] = []
+    const counters = { get: 0, messages: 0 }
+    const host = commandHost(notices, "parent-session", counters)
+    const logger = new Logger(false, "silent")
+    const registry = new SessionStateRegistry(logger, "/tmp/v2-command")
+    const added: CommandDefinition[] = []
+    createV2CommandTransform(
+        host,
+        registry,
+        logger,
+        config(false),
+        { global: undefined, agents: {} },
+        "/tmp/v2-command",
+    )({ add: (definition) => added.push(definition) } as V2CommandEditor)
+
+    await added[0]!.execute({
+        sessionID: "command-session",
+        prompt: { text: "acp status" },
+        delivery: "queue",
+    })
+    assert.equal(counters.get, 1)
+    assert.equal(counters.messages, 0)
+    assert.equal(registry.get("command-session"), undefined)
+    assert.equal(notices.length, 1)
+    assert.match(notices[0]!, /child sessions/i)
+})
+
+test("V2 command execution has no model-resubmission path", async () => {
+    const notices: string[] = []
+    const host = commandHost(notices)
+    let modelPathReads = 0
+    Object.defineProperty(host, "generate", {
+        get() {
+            modelPathReads++
+            throw new Error("commands must not access a model API")
+        },
+    })
+    const logger = new Logger(false, "silent")
+    const registry = new SessionStateRegistry(logger, "/tmp/v2-command")
+    const added: CommandDefinition[] = []
+    createV2CommandTransform(
+        host,
+        registry,
+        logger,
+        config(),
+        { global: undefined, agents: {} },
+        "/tmp/v2-command",
+    )({ add: (definition) => added.push(definition) } as V2CommandEditor)
+
+    await added[0]!.execute({
+        sessionID: "command-session",
+        prompt: { text: "acp help" },
+        delivery: "steer",
+    })
+    assert.equal(notices.length, 1)
+    assert.equal(modelPathReads, 0)
 })
 
 test("V2 notices use unique ACP-owned non-resuming synthetic messages", async () => {

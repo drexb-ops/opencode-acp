@@ -105,8 +105,8 @@ export function getModelInfo(messages: WithParts[]): LastUserModelContext {
 
     const userInfo = lastUserMessage.info as UserMessage
     return {
-        providerId: userInfo.model?.providerID,
-        modelId: userInfo.model?.modelID,
+        providerId: userInfo.model?.providerID?.trim() || undefined,
+        modelId: userInfo.model?.modelID?.trim() || undefined,
     }
 }
 

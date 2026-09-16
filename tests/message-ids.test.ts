@@ -81,7 +81,7 @@ function makeState(overrides: Partial<SessionState> = {}): SessionState {
         stats: { pruneTokenCounter: 0, totalPruneTokens: 0 },
         compressionTiming: {} as any,
         toolParameters: new Map(),
-            toolIdList: [],
+        toolIdList: [],
         messageIds: { byRawId: new Map(), byRef: new Map(), nextRef: 1 },
         lastCompaction: 0,
         currentTurn: 0,
@@ -283,18 +283,22 @@ test("assignMessageRefs skips messages with empty or missing IDs", () => {
     assert.equal(state.messageIds.byRawId.get("raw-good"), "m00001")
 })
 
-test("assignMessageRefs skips DCP synthetic message IDs", () => {
+test("assignMessageRefs skips every ACP/DCP synthetic message ID", () => {
     const state = makeState()
     const msg1 = makeMessage({ id: "msg_dcp_summary_123" })
     const msg2 = makeMessage({ id: "msg_dcp_text_456" })
-    const msg3 = makeMessage({ id: "raw-normal" })
+    const msg3 = makeMessage({ id: "msg_acp_recap_789" })
+    const msg4 = makeMessage({ id: "msg_acp_notice_abcdef" })
+    const msg5 = makeMessage({ id: "raw-normal" })
 
-    const count = assignMessageRefs(state, [msg1, msg2, msg3])
+    const count = assignMessageRefs(state, [msg1, msg2, msg3, msg4, msg5])
 
     assert.equal(count, 1)
     assert.equal(state.messageIds.byRawId.get("raw-normal"), "m00001")
     assert.ok(!state.messageIds.byRawId.has("msg_dcp_summary_123"))
     assert.ok(!state.messageIds.byRawId.has("msg_dcp_text_456"))
+    assert.ok(!state.messageIds.byRawId.has("msg_acp_recap_789"))
+    assert.ok(!state.messageIds.byRawId.has("msg_acp_notice_abcdef"))
 })
 
 test("assignMessageRefs skips ignored user messages", () => {

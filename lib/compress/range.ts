@@ -133,7 +133,12 @@ export function createCompressRangeToolDefinition(
                 // loaded, swap in the effective compress config for the active
                 // provider/model so every ctx.config.compress.X read below picks up
                 // per-model > per-provider > global resolution.
-                const { providerId, modelId } = getModelInfo(rawMessages)
+                const modelInfo = getModelInfo(rawMessages)
+                // V2 projected tool history can omit user model metadata even
+                // though the context transaction already resolved the active
+                // model. Keep provider/model overrides effective in that case.
+                const providerId = modelInfo.providerId ?? ctx0.state.modelProviderID
+                const modelId = modelInfo.modelId ?? ctx0.state.modelID
                 const ctx: typeof ctx0 = {
                     ...ctx0,
                     config: applyCompressOverrides(ctx0.config, providerId, modelId),

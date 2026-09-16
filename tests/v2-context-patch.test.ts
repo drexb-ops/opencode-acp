@@ -1,3 +1,4 @@
+import "./test-env"
 import assert from "node:assert/strict"
 import test from "node:test"
 import { Message } from "@opencode/ai"
@@ -17,6 +18,7 @@ function sourceMessages() {
             type: "assistant",
             id: "a-1",
             time: { created: 2 },
+            agent: "code",
             model,
             content: [
                 { type: "reasoning", text: "old reasoning" },
@@ -30,6 +32,8 @@ function sourceMessages() {
                         status: "completed",
                         input: { path: "a.ts" },
                         content: [{ type: "text", text: "tool output" }],
+                        time: { start: 2, end: 3 },
+                        metadata: { source: "fixture" },
                     },
                 },
             ],
@@ -336,4 +340,71 @@ test("repeated patching is idempotent and preserves empty uncorrelated messages"
         second.messages.some((message) => message.id === "host-extra"),
         true,
     )
+})
+
+test("rejects a same-ID replacement of patchable lowered content", () => {
+    const { projection, outgoing } = buildProjection()
+    const transformed = clonedMessages(projection)
+    transformed.find((message) => message.info.id === "u-2")!.parts[0].text = "edited request"
+
+    const replaced = outgoing.map((message) => {
+        if (message.id !== "u-2") return message
+        return Message.make({ id: "u-2", role: "user", content: "provider replaced text" })
+    })
+    const result = applyV2ContextPatch(projection, transformed, replaced)
+    assert.equal(result.accepted, false)
+    if (!result.accepted) assert.equal(result.rejection.code, "fingerprint-mismatch")
+})
+
+test("rejects same-ID replacement of an uncorrelated provider message", () => {
+    const { projection, outgoing } = buildProjection()
+    const replacement = [...outgoing]
+    replacement[4] = Message.make({ id: "host-extra", role: "user", content: "replaced host" })
+    const result = applyV2ContextPatch(projection, projection.messages, replacement)
+    assert.equal(result.accepted, false)
+    if (!result.accepted) assert.equal(result.rejection.code, "opaque-origin")
+})
+
+test("repeated patching accepts ACP-owned output objects after an insertion", () => {
+    const { projection } = buildProjection()
+    const transformed = clonedMessages(projection)
+    const assistant = transformed.find((message) => message.info.id === "a-1")!
+    assistant.parts = assistant.parts.filter((part) => part.type !== "tool")
+    const synthetic = structuredClone(transformed[0])
+    synthetic.info.id = "msg_dcp_summary_abcdefabcdefabcd"
+    synthetic.parts = [
+        {
+            id: "prt_dcp_summary_abcdefabcdefabcd",
+            sessionID: "s",
+            messageID: synthetic.info.id,
+            type: "text",
+            text: "ACP summary",
+        },
+    ]
+    transformed.push(synthetic)
+
+    const first = applyV2ContextPatch(projection, transformed)
+    assert.equal(first.accepted, true)
+    if (!first.accepted) return
+    const second = applyV2ContextPatch(projection, transformed, first.messages)
+    assert.equal(second.accepted, true)
+})
+
+test("repeated removal remains idempotent after tool-pair deletion", () => {
+    const { projection } = buildProjection()
+    const transformed = clonedMessages(projection)
+    const assistant = transformed.find((message) => message.info.id === "a-1")!
+    assistant.parts = assistant.parts.filter((part) => part.type !== "tool")
+
+    const first = applyV2ContextPatch(projection, transformed)
+    assert.equal(first.accepted, true)
+    if (!first.accepted) return
+    const second = applyV2ContextPatch(projection, transformed, first.messages)
+    assert.equal(second.accepted, true)
+    if (!second.accepted) return
+    assert.deepEqual(second.messages, first.messages)
+
+    const copiedArray = [...first.messages]
+    const third = applyV2ContextPatch(projection, transformed, copiedArray)
+    assert.equal(third.accepted, true)
 })

@@ -22,6 +22,7 @@ import {
     type HostPermissionSnapshot,
 } from "../host-permissions"
 import type { V2HostAdapter } from "./host"
+import type { V2OperationTracker } from "./lifecycle"
 
 type V2Context = Parameters<V2Api.Plugin["setup"]>[0]
 export type V2ToolEditor = Parameters<Parameters<V2Context["tool"]["transform"]>[0]>[0]
@@ -40,6 +41,9 @@ const PERMISSION_ASK_MESSAGE =
     "ACP cannot request an interactive permission on OpenCode V2.0.3. Set the active agent's `compress` permission to `allow` or `deny`, then retry."
 const PERMISSION_DENY_MESSAGE =
     "ACP tool execution is disabled by the active agent or ACP configuration. Choose `allow` for the `compress` permission to enable it."
+const SUBAGENT_DENY_MESSAGE =
+    "ACP direct tools are disabled for child sessions when `allowSubAgents` is false."
+const LIFECYCLE_DENY_MESSAGE = "ACP is shutting down; this operation was not executed."
 
 function errorMessage(error: unknown): string {
     return error instanceof Error ? error.message : String(error)
@@ -119,16 +123,41 @@ async function resolveToolPermission(
     }
 }
 
+async function resolveSubAgentPermission(
+    config: ToolFactoryContext["config"],
+    host: V2HostAdapter,
+    sessionID: string,
+): Promise<{ allowed: true } | { allowed: false; message: string }> {
+    if (config.allowSubAgents !== false) return { allowed: true }
+    try {
+        const session = await host.sessions.get(sessionID)
+        if (!session) return { allowed: false, message: SUBAGENT_DENY_MESSAGE }
+        if (session.parentID !== undefined && session.parentID !== null) {
+            return { allowed: false, message: SUBAGENT_DENY_MESSAGE }
+        }
+        return { allowed: true }
+    } catch {
+        // A failed parent lookup is ambiguous and must not be used to bypass
+        // the child-session restriction.
+        return {
+            allowed: false,
+            message: "ACP could not verify the session parent; direct tool execution was blocked.",
+        }
+    }
+}
+
 function toSharedContext(
     context: V2ToolContext,
     permission: "ask" | "allow" | "deny",
     progressTasks: Promise<void>[],
+    isActive: () => boolean = () => true,
 ): ToolExecutionContext {
     const progress = (update: {
         title?: string
         status?: string
         metadata?: Record<string, unknown>
     }) => {
+        if (!isActive()) return
         const task = context.progress({
             ...(update.metadata ?? {}),
             ...(update.title ? { title: update.title } : {}),
@@ -163,6 +192,7 @@ export function createV2Tool<Schema extends AnyToolSchema>(
     host: V2HostAdapter,
     hostPermissions: HostPermissionSnapshot,
     isEnabled: () => boolean = () => true,
+    operations?: V2OperationTracker,
 ): V2ToolInfo {
     return {
         name: definition.name,
@@ -170,72 +200,104 @@ export function createV2Tool<Schema extends AnyToolSchema>(
         input: definition.schema,
         options: { codemode: false, permission: "compress" },
         execute: async (rawInput, context) => {
-            if (!isEnabled()) {
-                return errorResult("ACP is currently disabled because a /bili/ proxy is active.", {
-                    acpDisabled: true,
-                    reason: "bili-proxy",
-                })
-            }
-
-            let permissionResult: "ask" | "allow" | "deny"
-            try {
-                permissionResult = await resolveToolPermission(
-                    factoryCtx,
-                    host,
-                    hostPermissions,
-                    context,
-                )
-            } catch (error) {
-                return errorResult(
-                    "ACP could not resolve the active agent permission; execution was blocked.",
-                    {
-                        acpPermission: "deny",
-                        permission: "compress",
-                        actionable: "choose allow or deny",
-                        error: errorMessage(error),
-                    },
-                )
-            }
-            if (permissionResult === "deny") {
-                return errorResult(PERMISSION_DENY_MESSAGE, {
-                    acpPermission: "deny",
-                    permission: "compress",
-                    actionable: "choose allow or deny",
-                })
-            }
-            if (permissionResult === "ask") {
-                return errorResult(PERMISSION_ASK_MESSAGE, {
-                    acpPermission: "ask",
-                    permission: "compress",
-                    actionable: "choose allow or deny",
-                })
-            }
-
-            const progressTasks: Promise<void>[] = []
-            try {
-                const parsed = definition.schema.safeParse(rawInput)
-                if (!parsed.success) {
+            const executeBody = async (isActive: () => boolean = () => true) => {
+                if (!isActive())
+                    return errorResult(LIFECYCLE_DENY_MESSAGE, { acpError: "inactive" })
+                if (!isEnabled()) {
                     return errorResult(
-                        `Invalid ${definition.name} input: ${parsed.error.message}`,
+                        "ACP is currently disabled because a /bili/ proxy is active.",
                         {
-                            acpError: "invalid-input",
-                            tool: definition.name,
+                            acpDisabled: true,
+                            reason: "bili-proxy",
                         },
                     )
                 }
-                const result = await definition.execute(
-                    parsed.data,
-                    toSharedContext(context, "allow", progressTasks),
+
+                const subAgent = await resolveSubAgentPermission(
+                    factoryCtx.config,
+                    host,
+                    context.sessionID,
                 )
-                if (progressTasks.length > 0) await Promise.allSettled(progressTasks)
-                return toV2Result(result)
-            } catch (error) {
-                if (progressTasks.length > 0) await Promise.allSettled(progressTasks)
-                return errorResult(`ACP ${definition.name} failed: ${errorMessage(error)}`, {
-                    acpError: "execution",
-                    tool: definition.name,
-                })
+                if (!subAgent.allowed) {
+                    return errorResult(subAgent.message, {
+                        acpPermission: "deny",
+                        acpSubAgent: "deny",
+                    })
+                }
+                if (!isActive())
+                    return errorResult(LIFECYCLE_DENY_MESSAGE, { acpError: "inactive" })
+
+                let permissionResult: "ask" | "allow" | "deny"
+                try {
+                    permissionResult = await resolveToolPermission(
+                        factoryCtx,
+                        host,
+                        hostPermissions,
+                        context,
+                    )
+                } catch (error) {
+                    return errorResult(
+                        "ACP could not resolve the active agent permission; execution was blocked.",
+                        {
+                            acpPermission: "deny",
+                            permission: "compress",
+                            actionable: "choose allow or deny",
+                            error: errorMessage(error),
+                        },
+                    )
+                }
+                if (!isActive())
+                    return errorResult(LIFECYCLE_DENY_MESSAGE, { acpError: "inactive" })
+                if (permissionResult === "deny") {
+                    return errorResult(PERMISSION_DENY_MESSAGE, {
+                        acpPermission: "deny",
+                        permission: "compress",
+                        actionable: "choose allow or deny",
+                    })
+                }
+                if (permissionResult === "ask") {
+                    return errorResult(PERMISSION_ASK_MESSAGE, {
+                        acpPermission: "ask",
+                        permission: "compress",
+                        actionable: "choose allow or deny",
+                    })
+                }
+
+                const progressTasks: Promise<void>[] = []
+                try {
+                    const parsed = definition.schema.safeParse(rawInput)
+                    if (!parsed.success) {
+                        return errorResult(
+                            `Invalid ${definition.name} input: ${parsed.error.message}`,
+                            {
+                                acpError: "invalid-input",
+                                tool: definition.name,
+                            },
+                        )
+                    }
+                    const result = await definition.execute(
+                        parsed.data,
+                        toSharedContext(context, "allow", progressTasks, isActive),
+                    )
+                    if (progressTasks.length > 0) await Promise.allSettled(progressTasks)
+                    if (!isActive()) {
+                        return errorResult(LIFECYCLE_DENY_MESSAGE, { acpError: "inactive" })
+                    }
+                    return toV2Result(result)
+                } catch (error) {
+                    if (progressTasks.length > 0) await Promise.allSettled(progressTasks)
+                    return errorResult(`ACP ${definition.name} failed: ${errorMessage(error)}`, {
+                        acpError: "execution",
+                        tool: definition.name,
+                    })
+                }
             }
+
+            if (operations) {
+                const result = await operations.run("tool", (lease) => executeBody(lease.isActive))
+                return result ?? errorResult(LIFECYCLE_DENY_MESSAGE, { acpError: "inactive" })
+            }
+            return executeBody()
         },
     }
 }
@@ -246,6 +308,7 @@ export function createV2ToolTransform(
     host: V2HostAdapter,
     hostPermissions: HostPermissionSnapshot,
     isEnabled: () => boolean = () => true,
+    operations?: V2OperationTracker,
 ): (editor: V2ToolEditor) => void {
     return (editor) => {
         if (!isEnabled() || factoryCtx.config.compress.permission === "deny") return
@@ -257,6 +320,7 @@ export function createV2ToolTransform(
                 host,
                 hostPermissions,
                 isEnabled,
+                operations,
             ),
         )
         editor.add(
@@ -266,6 +330,7 @@ export function createV2ToolTransform(
                 host,
                 hostPermissions,
                 isEnabled,
+                operations,
             ),
         )
         editor.add(
@@ -275,6 +340,7 @@ export function createV2ToolTransform(
                 host,
                 hostPermissions,
                 isEnabled,
+                operations,
             ),
         )
         editor.add(
@@ -284,6 +350,7 @@ export function createV2ToolTransform(
                 host,
                 hostPermissions,
                 isEnabled,
+                operations,
             ),
         )
         editor.add(
@@ -293,6 +360,7 @@ export function createV2ToolTransform(
                 host,
                 hostPermissions,
                 isEnabled,
+                operations,
             ),
         )
     }

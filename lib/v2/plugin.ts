@@ -14,6 +14,7 @@ import { createV2NotificationBridge } from "./notifications"
 import { createV2ToolTransform } from "./tools"
 import { createV2CompressionTimingHandlers } from "./timing"
 import { initializeV2ProxyState, startV2ProxyMonitor, type V2ProxyState } from "./proxy"
+import { V2OperationTracker } from "./lifecycle"
 
 type Cleanup = () => Promise<void> | void
 type Registration = { dispose(): Promise<void> }
@@ -44,7 +45,10 @@ async function disposeAll(resources: Cleanup[], logger?: Logger): Promise<void> 
  */
 export const setup: V2Api.Plugin["setup"] = async (context) => {
     const resources: Cleanup[] = []
+    const operations = new V2OperationTracker()
     let disposed = false
+    let stopProxyMonitor: Cleanup | undefined
+    let stopAutoUpdate: Cleanup | undefined
 
     const bridge = createV2NotificationBridge()
     const notifications = createManagedNotificationSink(bridge.sink)
@@ -55,7 +59,26 @@ export const setup: V2Api.Plugin["setup"] = async (context) => {
     const dispose = async (): Promise<void> => {
         if (disposePromise) return disposePromise
         disposed = true
-        disposePromise = disposeAll(resources, logger)
+        operations.deactivate()
+        disposePromise = (async () => {
+            // Source producers must be stopped before waiting for adapters. This
+            // prevents a catalog/update callback from entering the in-flight set
+            // after the idle check and before registrations are disposed.
+            for (const cleanup of [stopAutoUpdate, stopProxyMonitor]) {
+                if (!cleanup) continue
+                try {
+                    await cleanup()
+                } catch (error) {
+                    try {
+                        void logger?.warn("V2 ACP source cleanup failed", {
+                            error: error instanceof Error ? error.message : String(error),
+                        })
+                    } catch {}
+                }
+            }
+            await operations.waitForIdle()
+            await disposeAll(resources, logger)
+        })()
         return disposePromise
     }
 
@@ -119,7 +142,7 @@ export const setup: V2Api.Plugin["setup"] = async (context) => {
         ownRegistration(
             resources,
             await context.tool.transform(
-                createV2ToolTransform(factoryContext, host, hostPermissions, isEnabled),
+                createV2ToolTransform(factoryContext, host, hostPermissions, isEnabled, operations),
             ),
         )
         ownRegistration(
@@ -133,6 +156,7 @@ export const setup: V2Api.Plugin["setup"] = async (context) => {
                     hostPermissions,
                     context.location.directory,
                     isEnabled,
+                    operations,
                 ),
             ),
         )
@@ -144,16 +168,19 @@ export const setup: V2Api.Plugin["setup"] = async (context) => {
             config,
             prompts,
             hostPermissions,
+            () => operations.isActive,
         )
         ownRegistration(
             resources,
             await context.session.hook("context", async (event) => {
-                if (!isEnabled()) return
-                await contextHandler(event)
+                await operations.run("context", async () => {
+                    if (!isEnabled()) return
+                    await contextHandler(event)
+                })
             }),
         )
 
-        const timing = createV2CompressionTimingHandlers(registry, logger)
+        const timing = createV2CompressionTimingHandlers(registry, logger, operations)
         ownRegistration(
             resources,
             await context.tool.hook("execute.before", async (event) => {
@@ -171,12 +198,14 @@ export const setup: V2Api.Plugin["setup"] = async (context) => {
 
         const monitor = startV2ProxyMonitor(context, proxyState, logger, async () => {
             if (disposed) return
-            await Promise.all([context.tool.reload(), context.command.reload()])
+            await operations.run("proxy", async () => {
+                if (disposed) return
+                await Promise.all([context.tool.reload(), context.command.reload()])
+            })
         })
-        resources.push(() => monitor.stop())
+        stopProxyMonitor = () => monitor.stop()
 
-        const updateCleanup = startAutoUpdate(notifications, config.autoUpdate, logger)
-        resources.push(updateCleanup)
+        stopAutoUpdate = startAutoUpdate(notifications, config.autoUpdate, logger)
 
         return dispose
     } catch (error) {

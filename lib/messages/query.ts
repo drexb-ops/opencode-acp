@@ -1,16 +1,11 @@
 import type { PluginConfig } from "../config"
 import type { WithParts } from "../state"
 import { isMessageWithInfo } from "./shape"
+import { isAcpSyntheticId } from "../synthetic-ids"
 
 export function isSyntheticMessage(message: WithParts): boolean {
     const id = message?.info?.id
-    return (
-        typeof id === "string" &&
-        (id.startsWith("msg_dcp_summary_") ||
-            id.startsWith("msg_dcp_text_") ||
-            id.startsWith("msg_acp_recap_") ||
-            id.startsWith("msg_acp_notice_"))
-    )
+    return typeof id === "string" && isAcpSyntheticId(id)
 }
 
 export const getLastUserMessage = (

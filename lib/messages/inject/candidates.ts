@@ -158,17 +158,16 @@ function buildAtomicUnits(
         const refs = source.map((message) => state.messageIds.byRawId.get(message.info.id))
         const startRef = refs[0]
         const endRef = refs[refs.length - 1]
-
-        if (!startRef || !endRef) {
-            omissions.push({ kind: "micro", startRef, endRef, reason: "missing-reference" })
-            continue
-        }
-
         const invalidShape = source.some(
             (message) => isSyntheticMessage(message) || isIgnoredUserMessage(message),
         )
         if (invalidShape) {
             omissions.push({ kind: "micro", startRef, endRef, reason: "synthetic-or-ignored" })
+            continue
+        }
+
+        if (!startRef || !endRef) {
+            omissions.push({ kind: "micro", startRef, endRef, reason: "missing-reference" })
             continue
         }
 

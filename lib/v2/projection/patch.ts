@@ -28,6 +28,118 @@ import {
     stringValue,
 } from "./shared"
 
+interface AppliedPatchState {
+    /** Arrays returned by ACP's own successful patches. */
+    outputs: WeakSet<object>
+    /** Latest ACP-created content object for each original pointer. */
+    parts: Map<PointerKey, AiContentPart>
+    /** Original pointers intentionally removed by an ACP patch. */
+    removed: Set<PointerKey>
+    /** Provider-owned message objects retained by an ACP patch. */
+    opaqueMessages: Set<object>
+}
+
+const appliedPatchStates = new WeakMap<object, AppliedPatchState>()
+
+function pointerKey(pointer: V2OutgoingPointer): PointerKey | undefined {
+    return pointer.contentIndex === undefined
+        ? undefined
+        : `${pointer.messageIndex}:${pointer.contentIndex}`
+}
+
+function currentContainsPart(
+    messages: readonly AiMessageValue[],
+    expected: AiContentPart,
+): boolean {
+    return messages.some((message) => aiContent(message).some((part) => part === expected))
+}
+
+function finalPartForReference(
+    projection: V2Projection,
+    messages: readonly AiMessageValue[],
+    reference: { pointer: V2OutgoingPointer; part: AiContentPart },
+): AiContentPart | undefined {
+    const originalMessage = projection.originalMessages[reference.pointer.messageIndex]
+    const originalMessageID = aiMessageId(originalMessage)
+    let message = originalMessageID
+        ? messages.find((candidate) => aiMessageId(candidate) === originalMessageID)
+        : undefined
+
+    const originalType = contentType(reference.part)
+    const originalPartID = contentId(reference.part)
+    if (!message && originalPartID) {
+        message = messages.find((candidate) =>
+            aiContent(candidate).some(
+                (part) => contentType(part) === originalType && contentId(part) === originalPartID,
+            ),
+        )
+    }
+    if (!message) message = messages[reference.pointer.messageIndex]
+    if (!message) return undefined
+
+    const indexed =
+        reference.pointer.contentIndex === undefined
+            ? undefined
+            : aiContent(message)[reference.pointer.contentIndex]
+    if (indexed && (indexed === reference.part || contentType(indexed) === originalType)) {
+        if (!originalPartID || contentId(indexed) === originalPartID) return indexed
+    }
+    if (originalPartID) {
+        return aiContent(message).find(
+            (part) => contentType(part) === originalType && contentId(part) === originalPartID,
+        )
+    }
+    return indexed
+}
+
+function currentPointerForProjection(
+    projection: V2Projection,
+    messages: readonly AiMessageValue[],
+    pointer: V2OutgoingPointer,
+): V2OutgoingPointer {
+    const originalMessage = projection.originalMessages[pointer.messageIndex]
+    const originalMessageID = aiMessageId(originalMessage)
+    let messageIndex = originalMessageID
+        ? messages.findIndex((message) => aiMessageId(message) === originalMessageID)
+        : -1
+    const originalPart =
+        pointer.contentIndex === undefined
+            ? undefined
+            : aiContent(originalMessage)[pointer.contentIndex]
+    if (messageIndex < 0 && originalPart) {
+        const originalPartType = contentType(originalPart)
+        const originalPartID = contentId(originalPart)
+        if (originalPartID) {
+            messageIndex = messages.findIndex((message) =>
+                aiContent(message).some(
+                    (part) =>
+                        contentType(part) === originalPartType &&
+                        contentId(part) === originalPartID,
+                ),
+            )
+        }
+    }
+    return {
+        messageIndex: messageIndex >= 0 ? messageIndex : pointer.messageIndex,
+        contentIndex: pointer.contentIndex,
+    }
+}
+
+function originalPartsForOrigin(
+    projection: V2Projection,
+    origin: V2ContentOrigin,
+): AiContentPart[] {
+    const references = origin.originalContent ?? []
+    if (references.length > 0) return references.map((reference) => reference.part)
+    return origin.outgoing.flatMap((pointer) => {
+        if (pointer.contentIndex === undefined) return []
+        const part = aiContent(projection.originalMessages[pointer.messageIndex])[
+            pointer.contentIndex
+        ]
+        return part ? [part] : []
+    })
+}
+
 function reject(code: V2PatchRejection["code"], message: string): V2PatchRejected {
     return { accepted: false, ok: false, rejection: { code, message } }
 }
@@ -187,12 +299,59 @@ function validateBaseline(
             "V2 projection fingerprint was changed after normalization",
         )
     }
+    const applied = appliedPatchStates.get(projection)
+    const isOwnAppliedOutput = applied?.outputs.has(messages as object) === true
+    const appliedContentMatches =
+        applied !== undefined &&
+        [...applied.parts.values()].every((part) => currentContainsPart(messages, part)) &&
+        [...applied.opaqueMessages].every((message) => messages.includes(message as AiMessageValue))
     const currentFingerprint = fingerprintOutgoing(messages)
-    if (currentFingerprint !== projection.outgoingFingerprint) {
+    if (
+        currentFingerprint !== projection.outgoingFingerprint &&
+        !isOwnAppliedOutput &&
+        !appliedContentMatches
+    ) {
         return reject(
             "fingerprint-mismatch",
             "Lowered V2 message identities no longer match the projection",
         )
+    }
+    for (const entry of projection.entries) {
+        for (const origin of entry.origins) {
+            for (const reference of origin.originalContent ?? []) {
+                const key = pointerKey(reference.pointer)
+                if (key === undefined) continue
+                if (isOwnAppliedOutput || appliedContentMatches) {
+                    const patchedPart = applied.parts.get(key)
+                    if (patchedPart !== undefined) {
+                        if (!currentContainsPart(messages, patchedPart)) {
+                            return reject(
+                                origin.opaque ? "opaque-origin" : "fingerprint-mismatch",
+                                origin.opaque
+                                    ? "Provider-owned opaque content changed before patching"
+                                    : "Lowered patchable content changed before patching",
+                            )
+                        }
+                        continue
+                    }
+                    if (applied.removed.has(key)) continue
+                }
+
+                const message = messages[reference.pointer.messageIndex]
+                const part =
+                    reference.pointer.contentIndex === undefined
+                        ? undefined
+                        : aiContent(message)[reference.pointer.contentIndex]
+                if (part !== reference.part) {
+                    return reject(
+                        origin.opaque ? "opaque-origin" : "fingerprint-mismatch",
+                        origin.opaque
+                            ? "Provider-owned opaque content changed before patching"
+                            : "Lowered patchable content changed before patching",
+                    )
+                }
+            }
+        }
     }
     const ids = new Set<string>()
     const calls = new Set<string>()
@@ -223,18 +382,36 @@ function validateBaseline(
     }
     for (const origin of projection.outgoing) {
         if (!origin.opaque && (origin.opaqueContent?.size ?? 0) === 0) continue
-        const message = messages[origin.messageIndex]
-        if (!message) return reject("opaque-origin", "An opaque outgoing message disappeared")
-        if (origin.opaqueMessage !== undefined && message !== origin.opaqueMessage) {
-            return reject("opaque-origin", "Provider-owned opaque message changed before patching")
-        }
-        for (const [contentIndex, originalPart] of origin.opaqueContent ?? []) {
-            const part = aiContent(message)[contentIndex]
-            if (!part || part !== originalPart) {
+        if (isOwnAppliedOutput || appliedContentMatches) {
+            if (
+                origin.opaqueMessage !== undefined &&
+                !applied.opaqueMessages.has(origin.opaqueMessage as object)
+            ) {
                 return reject(
                     "opaque-origin",
-                    "Provider-owned opaque content changed before patching",
+                    "Provider-owned opaque message changed before patching",
                 )
+            }
+        } else {
+            const message = messages[origin.messageIndex]
+            if (!message) return reject("opaque-origin", "An opaque outgoing message disappeared")
+            if (origin.opaqueMessage !== undefined && message !== origin.opaqueMessage) {
+                return reject(
+                    "opaque-origin",
+                    "Provider-owned opaque message changed before patching",
+                )
+            }
+        }
+        for (const [contentIndex, originalPart] of origin.opaqueContent ?? []) {
+            if (!isOwnAppliedOutput && !appliedContentMatches) {
+                const message = messages[origin.messageIndex]
+                const part = aiContent(message)[contentIndex]
+                if (!part || part !== originalPart) {
+                    return reject(
+                        "opaque-origin",
+                        "Provider-owned opaque content changed before patching",
+                    )
+                }
             }
         }
     }
@@ -420,6 +597,7 @@ export function applyV2ContextPatch(
         const knownSourceIds = new Set(sourceEntries.map((entry) => entry.normalizedMessageId!))
         const removedMessages = new Set<number>()
         const removedContent = new Set<PointerKey>()
+        const removedContentParts = new Set<AiContentPart>()
         const replacements = new Map<number, AiMessageValue>()
         const removedMessageIds: string[] = []
         const removedCallIds: string[] = []
@@ -442,6 +620,11 @@ export function applyV2ContextPatch(
                 for (const messageIndex of entry.outgoingMessageIndices)
                     removedMessages.add(messageIndex)
                 removedMessageIds.push(entry.sourceMessageId ?? normalizedId)
+                for (const origin of entry.origins) {
+                    for (const part of originalPartsForOrigin(projection, origin)) {
+                        removedContentParts.add(part)
+                    }
+                }
                 for (const callID of entry.toolCallIds) removedCallIds.push(callID)
                 continue
             }
@@ -470,6 +653,9 @@ export function applyV2ContextPatch(
                 if (!transformedPart) {
                     if (origin.kind === "tool" && origin.callId) {
                         removeContentPointers(removedContent, origin.outgoing)
+                        for (const part of originalPartsForOrigin(projection, origin)) {
+                            removedContentParts.add(part)
+                        }
                         removedCallIds.push(origin.callId)
                         continue
                     }
@@ -477,6 +663,9 @@ export function applyV2ContextPatch(
                         return reject("opaque-origin", `Opaque origin ${origin.key} was removed`)
                     }
                     removeContentPointers(removedContent, origin.outgoing)
+                    for (const part of originalPartsForOrigin(projection, origin)) {
+                        removedContentParts.add(part)
+                    }
                     continue
                 }
                 if (origin.kind === "tool") {
@@ -527,9 +716,14 @@ export function applyV2ContextPatch(
                         )
                     }
                     if (origin.call && canonical(input) !== origin.normalizedInput) {
-                        setContentPart(currentMessages, replacements, origin.call, {
-                            input: isRecord(input) ? input : {},
-                        })
+                        setContentPart(
+                            currentMessages,
+                            replacements,
+                            currentPointerForProjection(projection, currentMessages, origin.call),
+                            {
+                                input: isRecord(input) ? input : {},
+                            },
+                        )
                         editedCallIds.add(origin.callId ?? "")
                     }
                     const output = stateOutput(transformedPart)
@@ -543,13 +737,18 @@ export function applyV2ContextPatch(
                                 `Tool result ${origin.callId ?? "unknown"} is opaque`,
                             )
                         }
+                        const resultPointer = currentPointerForProjection(
+                            projection,
+                            currentMessages,
+                            origin.result,
+                        )
                         const resultMessage =
-                            replacements.get(origin.result.messageIndex) ??
-                            currentMessages[origin.result.messageIndex]
+                            replacements.get(resultPointer.messageIndex) ??
+                            currentMessages[resultPointer.messageIndex]
                         const resultPart =
-                            origin.result.contentIndex === undefined
+                            resultPointer.contentIndex === undefined
                                 ? undefined
-                                : aiContent(resultMessage)[origin.result.contentIndex]
+                                : aiContent(resultMessage)[resultPointer.contentIndex]
                         const resultValue =
                             resultPart === undefined
                                 ? undefined
@@ -560,7 +759,7 @@ export function applyV2ContextPatch(
                                 `Tool result ${origin.callId ?? "unknown"} is unavailable`,
                             )
                         }
-                        setContentPart(currentMessages, replacements, origin.result, {
+                        setContentPart(currentMessages, replacements, resultPointer, {
                             result: { ...resultValue, value: output ?? "" },
                         })
                         editedCallIds.add(origin.callId ?? "")
@@ -596,9 +795,12 @@ export function applyV2ContextPatch(
                         `Text origin ${origin.key} has no unique lowered part`,
                     )
                 }
-                setContentPart(currentMessages, replacements, origin.outgoing[0], {
-                    text: transformedText,
-                })
+                setContentPart(
+                    currentMessages,
+                    replacements,
+                    currentPointerForProjection(projection, currentMessages, origin.outgoing[0]),
+                    { text: transformedText },
+                )
                 editedMessageIds.add(normalizedId)
             }
 
@@ -681,7 +883,7 @@ export function applyV2ContextPatch(
             )
             if (existingIndex >= 0) {
                 const existingOwner = projection.outgoing[existingIndex]
-                if (!existingOwner?.owned) {
+                if (!existingOwner?.owned && !isAcpOwnedId(id)) {
                     return reject(
                         "invalid-insertion",
                         `ACP insertion ID ${id} collides with host content`,
@@ -703,6 +905,11 @@ export function applyV2ContextPatch(
 
         for (const [messageIndex, message] of replacements) {
             if (removedMessages.has(messageIndex)) continue
+            // In a repeated patch an ACP insertion can occupy an index that
+            // belonged to a host message in the original lowered array after
+            // an earlier source removal. It is still safe to replace that
+            // position because the insertion ID is ACP-owned.
+            if (isAcpOwnedId(aiMessageId(message))) continue
             const opaqueOrigin = projection.outgoing[messageIndex]
             if (
                 opaqueOrigin?.opaqueMessage !== undefined &&
@@ -731,11 +938,25 @@ export function applyV2ContextPatch(
             removeContentPointers(removedContent, pointers)
         }
         for (const [messageIndex, message] of currentMessages.entries()) {
-            if (removedMessages.has(messageIndex)) continue
+            const messageID = aiMessageId(message)
+            const removedSourceMessage =
+                removedMessages.has(messageIndex) &&
+                (currentMessages === projection.originalMessages ||
+                    projection.originalMessages.includes(message))
+            if (
+                removedSourceMessage ||
+                (messageID !== undefined && removedMessageIds.includes(messageID))
+            )
+                continue
             const baseMessage = replacements.get(messageIndex) ?? message
             const content = aiContent(baseMessage)
             const kept = content.filter(
-                (_, contentIndex) => !removedContent.has(`${messageIndex}:${contentIndex}`),
+                (part, contentIndex) =>
+                    !removedContentParts.has(part) &&
+                    !(
+                        currentMessages === projection.originalMessages &&
+                        removedContent.has(`${messageIndex}:${contentIndex}`)
+                    ),
             )
             if (kept.length !== content.length)
                 replacements.set(messageIndex, cloneAiMessage(baseMessage, kept))
@@ -766,9 +987,9 @@ export function applyV2ContextPatch(
         for (let index = 0; index < currentMessages.length; index++) {
             if (!removedMessages.has(index)) {
                 const message = replacements.get(index) ?? currentMessages[index]
-                const hadRemovedContent = [...removedContent].some((key) =>
-                    key.startsWith(`${index}:`),
-                )
+                const hadRemovedContent =
+                    [...removedContent].some((key) => key.startsWith(`${index}:`)) ||
+                    aiContent(message).some((part) => removedContentParts.has(part))
                 // Empty uncorrelated host messages are outside ACP ownership and
                 // must survive. A mapped message emptied by an explicit ACP
                 // call/content removal can be omitted safely.
@@ -783,6 +1004,42 @@ export function applyV2ContextPatch(
             new Set(removedCallIds),
         )
         if (finalError) return finalError
+        const nextApplied: AppliedPatchState = appliedPatchStates.get(projection) ?? {
+            outputs: new WeakSet<object>(),
+            parts: new Map(),
+            removed: new Set(),
+            opaqueMessages: new Set<object>(),
+        }
+        for (const entry of projection.entries) {
+            for (const origin of entry.origins) {
+                for (const reference of origin.originalContent ?? []) {
+                    const key = pointerKey(reference.pointer)
+                    if (key === undefined) continue
+                    if (
+                        removedContent.has(key) ||
+                        removedMessages.has(reference.pointer.messageIndex) ||
+                        (origin.kind === "tool" &&
+                            origin.callId !== undefined &&
+                            removedCallIds.includes(origin.callId))
+                    ) {
+                        nextApplied.removed.add(key)
+                        continue
+                    }
+                    const part = finalPartForReference(projection, finalMessages, reference)
+                    if (part !== undefined) nextApplied.parts.set(key, part)
+                }
+            }
+        }
+        for (const origin of projection.outgoing) {
+            if (origin.opaqueMessage !== undefined) {
+                nextApplied.opaqueMessages.add(origin.opaqueMessage as object)
+            }
+            for (const [contentIndex, part] of origin.opaqueContent ?? []) {
+                nextApplied.parts.set(`${origin.messageIndex}:${contentIndex}`, part)
+            }
+        }
+        nextApplied.outputs.add(finalMessages as object)
+        appliedPatchStates.set(projection, nextApplied)
         return {
             accepted: true,
             ok: true,

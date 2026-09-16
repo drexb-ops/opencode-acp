@@ -75,26 +75,14 @@ export function createV2ContextHandler(
     config: PluginConfig,
     prompts: PromptStore,
     hostPermissions: HostPermissionSnapshot,
+    isActive: () => boolean = () => true,
 ): (event: V2ContextEvent) => Promise<void> {
     return async (event) => {
         try {
             if (!Array.isArray(event.messages) || !Array.isArray(event.system)) return
             if (AUXILIARY_AGENT_NAMES.has(event.agent)) return
+            if (!isActive()) return
             await refreshV2AgentPermissions(host, hostPermissions, event.agent, logger)
-            const projected = await host.projectedContext(event.sessionID)
-            const projection = normalizeV2ProjectedHistory(projected, event.messages, {
-                sessionID: event.sessionID,
-                agent: event.agent,
-                directory: host.directory,
-                currentModel: event.model,
-            })
-            if (!projection.valid) {
-                logger.warn("V2 context projection rejected", {
-                    sessionId: event.sessionID,
-                    reason: projection.rejection?.message,
-                })
-                return
-            }
 
             let requestModelLimit: number | undefined
             let modelLimitKnown = false
@@ -129,9 +117,31 @@ export function createV2ContextHandler(
             }
             modelLimitKnown = requestModelLimit !== undefined
 
-            await registry.getOrCreate(host.sessions, event.sessionID, projection.messages, config)
+            const loadProjection = async () => {
+                // The registry reservation is installed before this callback is
+                // invoked. Reading projected history outside that reservation
+                // would allow an older snapshot to commit after a newer request.
+                const projected = await host.projectedContext(event.sessionID)
+                const projection = normalizeV2ProjectedHistory(projected, event.messages, {
+                    sessionID: event.sessionID,
+                    agent: event.agent,
+                    directory: host.directory,
+                    currentModel: event.model,
+                })
+                if (!projection.valid) {
+                    logger.warn("V2 context projection rejected", {
+                        sessionId: event.sessionID,
+                        reason: projection.rejection?.message,
+                    })
+                }
+                return projection
+            }
 
-            const run = async (state: SessionState) => {
+            const run = async (
+                state: SessionState,
+                projection: Awaited<ReturnType<typeof loadProjection>>,
+            ) => {
+                if (!projection.valid || !isActive()) return
                 const prepared = await prepareMessageTransformTransaction(
                     projection.messages,
                     state,
@@ -173,6 +183,8 @@ export function createV2ContextHandler(
                     return
                 }
 
+                if (!isActive()) return
+
                 let systemPrompt: string | undefined
                 if (
                     !(prepared.workingState.isSubAgent && !config.allowSubAgents) &&
@@ -187,18 +199,44 @@ export function createV2ContextHandler(
 
                 // No event/state/effect mutation occurs until the projection,
                 // patch, final schemas, and system text have all succeeded.
+                if (!isActive()) return
                 event.messages = patch.messages
                 if (systemPrompt) event.system.push(SystemPartSchema.make(systemPrompt))
-                await commitPreparedMessageTransformTransaction(prepared, state, logger)
+                await commitPreparedMessageTransformTransaction(
+                    prepared,
+                    state,
+                    logger,
+                    undefined,
+                    isActive,
+                )
             }
 
-            // `withSessionMutation` is present in the Phase 3 registry. Keep the
-            // fallback for lightweight test registries used by V1-era fixtures.
-            if (registry.withSessionMutation) {
-                await registry.withSessionMutation(event.sessionID, run)
+            // Reserve before projected history is fetched/normalized, then keep
+            // initialization, transformation, patch validation, and commit in
+            // that one reservation.
+            if (registry.withSessionMutationAndInitialize) {
+                await registry.withSessionMutationAndInitialize(
+                    host.sessions,
+                    event.sessionID,
+                    loadProjection,
+                    (projection) =>
+                        isActive() && projection.valid ? projection.messages : undefined,
+                    config,
+                    run,
+                )
             } else {
+                // Compatibility for lightweight registry doubles from older
+                // V2 fixtures. Real registries always use the atomic path.
+                const projection = await loadProjection()
+                if (!projection.valid) return
+                await registry.getOrCreate(
+                    host.sessions,
+                    event.sessionID,
+                    projection.messages,
+                    config,
+                )
                 const state = registry.get(event.sessionID)
-                if (state) await run(state)
+                if (state) await run(state, projection)
             }
         } catch (error) {
             logger.warn("V2 context hook failed closed", {

@@ -1,3 +1,4 @@
+import "./test-env"
 import assert from "node:assert/strict"
 import test from "node:test"
 import { z } from "zod"
@@ -14,18 +15,26 @@ import type { V2HostAdapter } from "../lib/v2/host"
 import { createV2Tool, createV2ToolTransform, type V2ToolEditor } from "../lib/v2/tools"
 import { Logger } from "../lib/logger"
 import { PromptStore } from "../lib/prompts/store"
-import { createSessionState, type SessionState } from "../lib/state"
+import {
+    cloneSessionState,
+    createSessionState,
+    type SessionState,
+    type WithParts,
+} from "../lib/state"
 import type { PluginConfig } from "../lib/config"
 
 const sessionID = "v2-tools-session"
 
-function config(permission: "allow" | "ask" | "deny" = "allow"): PluginConfig {
+function config(
+    permission: "allow" | "ask" | "deny" = "allow",
+    allowSubAgents = true,
+): PluginConfig {
     return {
         enabled: true,
         autoUpdate: false,
         debug: false,
         logLevel: "silent",
-        allowSubAgents: true,
+        allowSubAgents,
         pruneNotification: "off",
         pruneNotificationType: "toast",
         commands: { enabled: true, protectedTools: [] },
@@ -94,6 +103,8 @@ function factory(
     state: SessionState,
     rules: readonly HostPermissionRule[] = [],
     permission: "allow" | "ask" | "deny" = "allow",
+    allowSubAgents = true,
+    compressOverrides: Record<string, unknown> = {},
 ) {
     const logger = new Logger(false, "silent")
     const adapter = host(rules)
@@ -109,7 +120,13 @@ function factory(
         host: adapter,
         registry,
         logger,
-        config: config(permission),
+        config: {
+            ...config(permission, allowSubAgents),
+            compress: {
+                ...config(permission, allowSubAgents).compress,
+                ...compressOverrides,
+            },
+        },
         prompts: new PromptStore(logger, "/tmp/v2-tools", false, false),
     } satisfies ToolFactoryContext
     return {
@@ -222,6 +239,7 @@ test("V2 deny and ask return safe results before state acquisition or mutation",
         ["ask", [], /allow.*deny/i],
     ] as const) {
         const run = factory(state, rules, permission)
+        const before = cloneSessionState(state)
         const result = await createV2Tool(
             definition,
             run.context,
@@ -230,8 +248,67 @@ test("V2 deny and ask return safe results before state acquisition or mutation",
         ).execute({}, v2Context())
         assert.match(String(result.content), expected)
         assert.equal(run.guarded(), 0)
+        assert.deepEqual(cloneSessionState(state), before)
     }
     assert.equal(executed, 0)
+})
+
+test("V2 direct tools fail closed for child sessions before acquiring state", async () => {
+    let executed = 0
+    const state = createSessionState()
+    state.sessionId = sessionID
+    const run = factory(state, [], "allow", false)
+    run.adapter.sessions.get = async () => ({ id: sessionID, parentID: "parent-session" })
+    const schema = z.object({})
+    const definition: SharedToolDefinition<typeof schema> = {
+        name: "test",
+        description: "test",
+        schema,
+        inputSchema: schema,
+        async execute() {
+            executed++
+            return "unexpected"
+        },
+    }
+    const before = cloneSessionState(state)
+    const result = await createV2Tool(
+        definition,
+        run.context,
+        run.adapter,
+        run.hostPermissions,
+    ).execute({}, v2Context())
+
+    assert.match(String(result.content), /child session/i)
+    assert.equal(executed, 0)
+    assert.equal(run.guarded(), 0)
+    assert.deepEqual(cloneSessionState(state), before)
+})
+
+test("V2 direct tools fail closed when parent lookup errors", async () => {
+    const state = createSessionState()
+    state.sessionId = sessionID
+    const run = factory(state, [], "allow", false)
+    run.adapter.sessions.get = async () => {
+        throw new Error("session lookup unavailable")
+    }
+    const schema = z.object({})
+    const definition: SharedToolDefinition<typeof schema> = {
+        name: "test",
+        description: "test",
+        schema,
+        inputSchema: schema,
+        async execute() {
+            return "unexpected"
+        },
+    }
+    const result = await createV2Tool(
+        definition,
+        run.context,
+        run.adapter,
+        run.hostPermissions,
+    ).execute({}, v2Context())
+    assert.match(String(result.content), /verify the session parent/i)
+    assert.equal(run.guarded(), 0)
 })
 
 test("V2 ordered agent rules let a later allow override only a matching deny", async () => {
@@ -313,6 +390,70 @@ test("actual ACP definitions retain their exact V2 names", () => {
             createAcpContextRecapToolDefinition(run.context),
         ].map((definition) => definition.name),
         ["compress", "decompress", "search_context", "acp_status", "acp_context_recap"],
+    )
+})
+
+test("V2 compress applies model overrides from state when tool history lacks user metadata", async () => {
+    const state = createSessionState()
+    state.sessionId = sessionID
+    state.modelProviderID = "provider"
+    state.modelID = "model"
+    const run = factory(state, [], "allow", true, {
+        providers: {
+            provider: {
+                models: {
+                    model: { minCompressRange: 1000 },
+                },
+            },
+        },
+        preserveLastUserMessage: false,
+        preserveRecentMessages: 0,
+        preserveRecentTokens: 0,
+    })
+    const history: WithParts = {
+        info: {
+            id: "history-user",
+            sessionID,
+            role: "user",
+            agent: "code",
+            time: { created: 1 },
+        } as WithParts["info"],
+        parts: [
+            {
+                type: "text",
+                id: "history-user-part",
+                sessionID,
+                messageID: "history-user",
+                text: "short",
+            },
+        ],
+    }
+    run.adapter.sessions.messages = async () => [history]
+    const definition = createCompressRangeToolDefinition(run.context)
+
+    await assert.rejects(
+        () =>
+            definition.execute(
+                {
+                    topic: "short range",
+                    content: [
+                        {
+                            startId: "m00001",
+                            endId: "m00001",
+                            summary: "summary",
+                        },
+                    ],
+                },
+                {
+                    sessionID,
+                    messageID: "message-1",
+                    callID: "call-1",
+                    ask: async () => {},
+                    metadata: () => {},
+                    permission: "allow",
+                },
+            ),
+        /Range too small/,
     )
 })
 

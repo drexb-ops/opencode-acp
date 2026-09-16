@@ -61,10 +61,16 @@ export function startV2ProxyMonitor(
                     continue
                 }
                 if (nextDisabled === state.disabled) continue
+                const previousDisabled = state.disabled
+                // Publish the new state before reload so replayed transforms see
+                // the transition immediately. If either domain cannot reload,
+                // restore the last valid state; the identical catalog event can
+                // then retry instead of being swallowed as a no-op.
                 state.disabled = nextDisabled
                 try {
                     await onChanged(nextDisabled)
                 } catch (error) {
+                    state.disabled = previousDisabled
                     logger.warn("V2 ACP catalog reload failed", {
                         error: error instanceof Error ? error.message : String(error),
                     })

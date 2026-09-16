@@ -105,10 +105,16 @@ export async function commitPreparedMessageTransformTransaction(
     state: SessionState,
     logger: Logger,
     messages?: WithParts[],
+    isActive?: () => boolean,
 ): Promise<void> {
+    if (isActive && !isActive()) return
     commitSessionState(state, prepared.workingState)
     if (messages) messages.splice(0, messages.length, ...prepared.workingMessages)
 
+    // Disposal can begin while a host persistence write is in flight. The
+    // state/event commit above is already atomic; do not start any deferred
+    // host-facing work after the lifecycle fence is crossed.
+    if (isActive && !isActive()) return
     if (prepared.effects.persistenceRequested) {
         try {
             await saveSessionState(state, logger)
@@ -119,6 +125,7 @@ export async function commitPreparedMessageTransformTransaction(
             })
         }
     }
+    if (isActive && !isActive()) return
     try {
         await prepared.effects.run()
     } catch (error) {
@@ -324,7 +331,6 @@ export function createChatMessageTransformHandler(
             )
         }
 
-        await registry.getOrCreate(services.sessions, sessionId, messages, config)
         const run = (state: SessionState) =>
             runMessageTransformTransaction(
                 messages,
@@ -337,9 +343,18 @@ export function createChatMessageTransformHandler(
                 requestModelLimit !== undefined,
                 debugNotify,
             )
-        if (registry.withSessionMutation) {
-            await registry.withSessionMutation(sessionId, run)
+        if (registry.withSessionMutationAndInitialize) {
+            await registry.withSessionMutationAndInitialize(
+                services.sessions,
+                sessionId,
+                () => messages,
+                (history) => history,
+                config,
+                async (state) => run(state),
+            )
         } else {
+            // Compatibility for lightweight registry doubles from older tests.
+            await registry.getOrCreate(services.sessions, sessionId, messages, config)
             const state = registry.get(sessionId)
             if (state) await run(state)
         }
@@ -364,16 +379,7 @@ export function createCommandExecuteHandler(
         }
 
         if (input.command === "acp" || input.command === "dcp") {
-            const messages = await services.sessions.messages(input.sessionID)
-
-            const state = await registry.getOrCreate(
-                services.sessions,
-                input.sessionID,
-                messages,
-                config,
-            )
-
-            const runCommand = async (state: SessionState) => {
+            const runCommand = async (state: SessionState, messages: WithParts[]) => {
                 syncCompressPermissionState(state, config, hostPermissions, messages)
 
                 const commandCtx = {
@@ -398,10 +404,31 @@ export function createCommandExecuteHandler(
                 throw new Error("__DCP_CONTEXT_HANDLED__")
             }
 
+            if (registry.withSessionMutationAndInitialize) {
+                await registry.withSessionMutationAndInitialize(
+                    services.sessions,
+                    input.sessionID,
+                    () => services.sessions.messages(input.sessionID),
+                    (history) => history,
+                    config,
+                    runCommand,
+                )
+                return
+            }
+
+            const messages = await services.sessions.messages(input.sessionID)
+            const state = await registry.getOrCreate(
+                services.sessions,
+                input.sessionID,
+                messages,
+                config,
+            )
             if (registry.withSessionMutation) {
-                await registry.withSessionMutation(input.sessionID, runCommand)
+                await registry.withSessionMutation(input.sessionID, (guardedState) =>
+                    runCommand(guardedState, messages),
+                )
             } else {
-                await runCommand(state)
+                await runCommand(state, messages)
             }
         }
     }

@@ -38,6 +38,12 @@ export interface V2OutgoingPointer {
     contentIndex?: number
 }
 
+export interface V2OriginalContentReference {
+    pointer: V2OutgoingPointer
+    /** Exact lowered content object observed during normalization. */
+    part: AiContentPart
+}
+
 export interface V2ContentOrigin {
     key: string
     normalizedMessageId: string
@@ -49,6 +55,8 @@ export interface V2ContentOrigin {
     outputSpans: V2OutgoingPointer[]
     /** Provider/cache fields retained verbatim by a patch. */
     protectedFields: string[]
+    /** References for every lowered patchable or opaque content origin. */
+    originalContent: V2OriginalContentReference[]
     call?: V2OutgoingPointer
     result?: V2OutgoingPointer
     opaque: boolean

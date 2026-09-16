@@ -1,3 +1,4 @@
+import "./test-env"
 import assert from "node:assert/strict"
 import test from "node:test"
 import { findV2BiliProxyProviders } from "../lib/bili-proxy"
@@ -162,4 +163,53 @@ test("V2 proxy monitor disables/re-enables on catalog changes without duplicate 
     assert.equal(queue.abortSeen, true)
     assert.equal(queue.closed, true)
     assert.equal(subscriptions, 1)
+})
+
+test("V2 proxy monitor rolls back failed reloads so the same catalog event retries", async () => {
+    let providerBaseURL = "https://direct.example/v1"
+    const queue = eventQueue()
+    const context = {
+        catalog: {
+            provider: {
+                list: async () => ({
+                    data: [{ id: "provider", settings: { baseURL: providerBaseURL } }],
+                }),
+            },
+            model: {
+                list: async () => ({ data: [] }),
+            },
+        },
+        event: {
+            subscribe: ({ signal }: { signal?: AbortSignal } = {}) => {
+                signal?.addEventListener("abort", queue.markAbort, { once: true })
+                return queue.source
+            },
+        },
+    }
+    const state: V2ProxyState = { disabled: true }
+    const logger = new Logger(false, "silent")
+    let failures = 1
+    let reloads = 0
+    const monitor = startV2ProxyMonitor(context as unknown as V2Context, state, logger, () => {
+        reloads++
+        if (failures > 0) {
+            failures--
+            throw new Error("reload failed")
+        }
+    })
+
+    try {
+        queue.push({ type: "catalog.updated", data: {} })
+        await new Promise((resolve) => setImmediate(resolve))
+        assert.equal(state.disabled, true)
+        assert.equal(reloads, 1)
+
+        queue.push({ type: "catalog.updated", data: {} })
+        await new Promise((resolve) => setImmediate(resolve))
+        assert.equal(state.disabled, false)
+        assert.equal(reloads, 2)
+    } finally {
+        providerBaseURL = "https://direct.example/v1"
+        await monitor.stop()
+    }
 })

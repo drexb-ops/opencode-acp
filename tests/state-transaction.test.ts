@@ -6,6 +6,7 @@ import {
     cloneSessionState,
     commitSessionState,
     createSessionState,
+    cloneRuntimeValue,
     type WithParts,
 } from "../lib/state"
 import { Logger } from "../lib/logger"
@@ -61,6 +62,8 @@ test("cloneSessionState clones every owned mutable field and preserves shared ti
         effectiveMessageIds: ["m1"],
         effectiveToolIds: ["tool"],
         createdAt: 1,
+        deactivatedAt: 9,
+        deactivatedByBlockId: 3,
         summary: "summary",
         survivedCount: 1,
         generation: "young",
@@ -118,6 +121,8 @@ test("cloneSessionState clones every owned mutable field and preserves shared ti
     assert.equal(clone.compressionTiming, state.compressionTiming)
     assert.notEqual(clone.prune, state.prune)
     assert.notEqual(clone.prune.messages.blocksById.get(1), state.prune.messages.blocksById.get(1))
+    assert.equal(clone.prune.messages.blocksById.get(1)?.deactivatedAt, 9)
+    assert.equal(clone.prune.messages.blocksById.get(1)?.deactivatedByBlockId, 3)
     assert.notEqual(clone.nudges.contextLimitAnchors, state.nudges.contextLimitAnchors)
     assert.notEqual(clone.toolParameters.get("call"), state.toolParameters.get("call"))
     assert.deepEqual(clone.messageIds, state.messageIds)
@@ -166,6 +171,35 @@ test("commitSessionState copies all working fields without replacing shared timi
     working.nudges.contextLimitAnchors.add("working-only")
     assert.deepEqual(live.toolIdList, ["tool"])
     assert.equal(live.nudges.contextLimitAnchors.has("working-only"), false)
+})
+
+test("runtime cloning isolates binary views and real Error values in tool parameters", () => {
+    const buffer = new ArrayBuffer(8)
+    const bytes = new Uint8Array(buffer)
+    bytes.set([1, 2, 3, 4])
+    const typed = new Uint16Array(buffer, 2, 2)
+    const view = new DataView(buffer, 1, 4)
+    const error = new Error("tool failed")
+    ;(error as Error & { details?: { code: string } }).details = { code: "E_TOOL" }
+
+    const value = cloneRuntimeValue({ buffer, bytes, typed, view, error })
+    assert.notStrictEqual(value.buffer, buffer)
+    assert.notStrictEqual(value.bytes, bytes)
+    assert.notStrictEqual(value.typed, typed)
+    assert.notStrictEqual(value.view, view)
+    assert.notStrictEqual(value.error, error)
+    assert.ok(value.error instanceof Error)
+    assert.equal(value.error.message, "tool failed")
+    assert.deepEqual(value.error.details, { code: "E_TOOL" })
+
+    value.bytes[0] = 99
+    value.typed[0] = 0xffff
+    value.view.setUint8(0, 88)
+    value.error.details.code = "CHANGED"
+    assert.equal(bytes[0], 1)
+    assert.equal(typed[0], 0x0403)
+    assert.equal(view.getUint8(0), 2)
+    assert.equal(error.details?.code, "E_TOOL")
 })
 
 test("concurrent getOrCreate callers await one complete initialization", async () => {
@@ -266,4 +300,59 @@ test("soft-cap eviction skips initializing and executing sessions", async () => 
     assert.equal(registry.get("initializing"), initialized)
     releaseWork()
     await guarded
+})
+
+test("atomic session work serializes history loading before ordered commits", async () => {
+    const registry = new SessionStateRegistry(logger)
+    const events: string[] = []
+    let releaseOld!: () => void
+    const oldHistoryBlocked = new Promise<void>((resolve) => {
+        releaseOld = resolve
+    })
+
+    const first = registry.withSessionMutationAndInitialize(
+        noParentSessions(),
+        "atomic-history",
+        async () => {
+            events.push("old-history-start")
+            await oldHistoryBlocked
+            events.push("old-history-end")
+            return "old"
+        },
+        () => messages,
+        undefined,
+        async (state, history) => {
+            events.push(`commit-${history}`)
+            state.currentTurn = 1
+        },
+    )
+    await Promise.resolve()
+
+    const second = registry.withSessionMutationAndInitialize(
+        noParentSessions(),
+        "atomic-history",
+        async () => {
+            events.push("new-history")
+            return "new"
+        },
+        () => messages,
+        undefined,
+        async (state, history) => {
+            events.push(`commit-${history}`)
+            state.currentTurn = 2
+        },
+    )
+    await Promise.resolve()
+    assert.deepEqual(events, ["old-history-start"])
+
+    releaseOld()
+    await Promise.all([first, second])
+    assert.deepEqual(events, [
+        "old-history-start",
+        "old-history-end",
+        "commit-old",
+        "new-history",
+        "commit-new",
+    ])
+    assert.equal(registry.get("atomic-history")?.currentTurn, 2)
 })

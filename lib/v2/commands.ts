@@ -6,8 +6,9 @@ import { syncCompressPermissionState } from "../compress-permission"
 import type { HostPermissionSnapshot } from "../host-permissions"
 import type { Logger } from "../logger"
 import { sendIgnoredMessage } from "../ui/notification"
-import type { SessionStateRegistry } from "../state"
+import type { SessionState, SessionStateRegistry, WithParts } from "../state"
 import type { V2HostAdapter } from "./host"
+import type { V2OperationTracker } from "./lifecycle"
 
 type V2Context = Parameters<V2Api.Plugin["setup"]>[0]
 export type V2CommandEditor = Parameters<Parameters<V2Context["command"]["transform"]>[0]>[0]
@@ -33,9 +34,39 @@ async function executeCommand(
     hostPermissions: HostPermissionSnapshot,
     workingDirectory: string,
     isEnabled: () => boolean,
+    operations?: V2OperationTracker,
+    isActive: () => boolean = () => true,
 ): Promise<void> {
+    if (operations) {
+        await operations.run("command", (lease) =>
+            executeCommand(
+                input,
+                name,
+                host,
+                registry,
+                logger,
+                config,
+                hostPermissions,
+                workingDirectory,
+                isEnabled,
+                undefined,
+                lease.isActive,
+            ),
+        )
+        return
+    }
     if (!isEnabled() || !config.commands.enabled) return
+    if (!isActive()) return
     try {
+        if (config.allowSubAgents === false) {
+            const session = await host.sessions.get(input.sessionID)
+            if (!session || (session.parentID !== undefined && session.parentID !== null)) {
+                throw new Error(
+                    "ACP commands are disabled for child sessions when `allowSubAgents` is false.",
+                )
+            }
+        }
+        if (!isActive()) return
         let agent: string | undefined
         try {
             agent = host.sessionAgent ? await host.sessionAgent(input.sessionID) : undefined
@@ -64,10 +95,11 @@ async function executeCommand(
                 }
             }
         }
-        const messages = await host.sessions.messages(input.sessionID)
-        const state = await registry.getOrCreate(host.sessions, input.sessionID, messages, config)
-        const run = async (guardedState: typeof state) => {
+        if (!isActive()) return
+        const run = async (guardedState: SessionState, messages: WithParts[]) => {
+            if (!isActive()) return
             syncCompressPermissionState(guardedState, config, hostPermissions, messages)
+            if (!isActive()) return
             await dispatchAcpCommand(
                 {
                     notices: host.notices,
@@ -81,14 +113,37 @@ async function executeCommand(
                 argumentsForCommand(input.prompt.text, name),
             )
         }
-        if (registry.withSessionMutation) await registry.withSessionMutation(input.sessionID, run)
-        else await run(state)
+        if (registry.withSessionMutationAndInitialize) {
+            await registry.withSessionMutationAndInitialize(
+                host.sessions,
+                input.sessionID,
+                () => host.sessions.messages(input.sessionID),
+                (history) => history,
+                config,
+                run,
+            )
+        } else {
+            const messages = await host.sessions.messages(input.sessionID)
+            if (!isActive()) return
+            const state = await registry.getOrCreate(
+                host.sessions,
+                input.sessionID,
+                messages,
+                config,
+            )
+            if (registry.withSessionMutation) {
+                await registry.withSessionMutation(input.sessionID, (guardedState) =>
+                    run(guardedState, messages),
+                )
+            } else await run(state, messages)
+        }
     } catch (error) {
         logger.warn("V2 ACP command failed", {
             command: name,
             sessionId: input.sessionID,
             error: error instanceof Error ? error.message : String(error),
         })
+        if (!isActive()) return
         await sendIgnoredMessage(
             host.notices,
             input.sessionID,
@@ -108,6 +163,7 @@ export function createV2CommandTransform(
     hostPermissions: HostPermissionSnapshot,
     workingDirectory: string,
     isEnabled: () => boolean = () => true,
+    operations?: V2OperationTracker,
 ): (editor: V2CommandEditor) => void {
     return (editor) => {
         if (!isEnabled() || !config.commands.enabled || config.compress.permission === "deny")
@@ -127,6 +183,7 @@ export function createV2CommandTransform(
                         hostPermissions,
                         workingDirectory,
                         isEnabled,
+                        operations,
                     ),
             }
             editor.add(definition)

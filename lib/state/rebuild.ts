@@ -37,7 +37,7 @@ import {
 } from "../compress/state"
 import { countTokens } from "../token-utils"
 import { createHash } from "node:crypto"
-import type { PersistedSessionState } from "./persistence"
+import { normalizePersistedMessageIds, type PersistedSessionState } from "./persistence"
 import { createPruneMessagesState } from "./utils"
 import type {
     BoundaryReference,
@@ -210,13 +210,14 @@ export function restoreForkCompressionState(
     parentMessages: WithParts[],
     logger: Logger,
 ): number {
-    if (!parent.prune.messages || !parent.messageIds) return 0
+    const normalizedParent = normalizePersistedMessageIds(parent)
+    if (!normalizedParent.prune.messages || !normalizedParent.messageIds) return 0
 
     assignMessageRefs(state, forkMessages)
-    const mapped = mapForkIds(state, parent, parentMessages, forkMessages)
+    const mapped = mapForkIds(state, normalizedParent, parentMessages, forkMessages)
     if (!mapped) return 0
 
-    const parentBlocks = Object.values(parent.prune.messages.blocksById)
+    const parentBlocks = Object.values(normalizedParent.prune.messages.blocksById)
     const translatedBlocks = new Map<number, (typeof parentBlocks)[number]>()
     for (const block of parentBlocks) {
         const anchorMessageId = mapped.messages.get(block.anchorMessageId)
@@ -251,7 +252,7 @@ export function restoreForkCompressionState(
         })
     }
 
-    const activeParentIds = new Set(parent.prune.messages.activeBlockIds)
+    const activeParentIds = new Set(normalizedParent.prune.messages.activeBlockIds)
     if (
         activeParentIds.size === 0 ||
         Array.from(activeParentIds).some((blockId) => !translatedBlocks.has(blockId))
@@ -279,7 +280,9 @@ export function restoreForkCompressionState(
             messagesState.activeByAnchorMessageId.set(block.anchorMessageId, block.blockId)
         }
     }
-    for (const [parentMessageId, entry] of Object.entries(parent.prune.messages.byMessageId)) {
+    for (const [parentMessageId, entry] of Object.entries(
+        normalizedParent.prune.messages.byMessageId,
+    )) {
         const forkMessageId = mapped.messages.get(parentMessageId)
         if (!forkMessageId) continue
         const allBlockIds = entry.allBlockIds.filter((blockId) => copiedBlockIds.has(blockId))
@@ -292,8 +295,9 @@ export function restoreForkCompressionState(
             ),
         })
     }
-    messagesState.nextBlockId = Math.max(parent.prune.messages.nextBlockId, ...copiedBlockIds) + 1
-    messagesState.nextRunId = parent.prune.messages.nextRunId
+    messagesState.nextBlockId =
+        Math.max(normalizedParent.prune.messages.nextBlockId, ...copiedBlockIds) + 1
+    messagesState.nextRunId = normalizedParent.prune.messages.nextRunId
     messagesState.membershipsVerified = true
     state.prune.messages = messagesState
 

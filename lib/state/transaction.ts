@@ -59,7 +59,7 @@ export class DeferredMutationEffects {
  * defensive recursive clone keeps function-bearing test/host values usable by
  * retaining functions by reference instead of failing a transaction.
  */
-function cloneRuntimeValue<T>(value: T, seen = new WeakMap<object, unknown>()): T {
+export function cloneRuntimeValue<T>(value: T, seen = new WeakMap<object, unknown>()): T {
     if (value === null || typeof value !== "object") {
         return value
     }
@@ -74,6 +74,67 @@ function cloneRuntimeValue<T>(value: T, seen = new WeakMap<object, unknown>()): 
     }
     if (value instanceof RegExp) {
         return new RegExp(value.source, value.flags) as T
+    }
+    if (value instanceof ArrayBuffer) {
+        const clone = value.slice(0)
+        seen.set(value, clone)
+        return clone as T
+    }
+    if (typeof SharedArrayBuffer !== "undefined" && value instanceof SharedArrayBuffer) {
+        const clone = value.slice(0)
+        seen.set(value, clone)
+        return clone as T
+    }
+    if (ArrayBuffer.isView(value)) {
+        // Buffer is a Uint8Array subclass whose constructor has legacy
+        // overloads; Buffer.from is the only portable way to preserve a real
+        // Buffer rather than manufacturing an invalid pseudo-instance.
+        if (typeof Buffer !== "undefined" && Buffer.isBuffer(value)) {
+            const clone = Buffer.from(value)
+            seen.set(value, clone)
+            return clone as T
+        }
+
+        const sourceBuffer = value.buffer
+        const clonedBuffer = cloneRuntimeValue(sourceBuffer, seen)
+        let clone: ArrayBufferView
+        if (value instanceof DataView) {
+            clone = new DataView(clonedBuffer as ArrayBuffer, value.byteOffset, value.byteLength)
+        } else {
+            const Constructor = value.constructor as new (
+                buffer: ArrayBuffer,
+                byteOffset: number,
+                length: number,
+            ) => ArrayBufferView
+            clone = new Constructor(
+                clonedBuffer as ArrayBuffer,
+                value.byteOffset,
+                (value as unknown as { length: number }).length,
+            )
+        }
+        seen.set(value, clone)
+        return clone as T
+    }
+    if (value instanceof Error) {
+        // `Object.create(Error.prototype)` passes a shallow prototype check but
+        // is not a valid Error value for runtimes inspecting internal slots.
+        // Start with a genuine Error, then restore custom subclass prototypes
+        // and clone all own (including non-enumerable) fields.
+        const clone = new Error(value.message)
+        seen.set(value, clone)
+        Object.setPrototypeOf(clone, Object.getPrototypeOf(value))
+        for (const key of Reflect.ownKeys(value)) {
+            const descriptor = Object.getOwnPropertyDescriptor(value, key)
+            if (!descriptor) continue
+            if ("value" in descriptor) descriptor.value = cloneRuntimeValue(descriptor.value, seen)
+            try {
+                Object.defineProperty(clone, key, descriptor)
+            } catch {
+                // Built-in Error fields can be non-configurable on a custom
+                // subclass. The genuine Error already carries a valid value.
+            }
+        }
+        return clone as T
     }
     if (value instanceof Map) {
         const clone = new Map<unknown, unknown>()

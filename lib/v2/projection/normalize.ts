@@ -752,13 +752,43 @@ export function normalizeV2ProjectedHistory(
                     }
                 }
             }
+            // A provider may add content that has no lossless projected origin
+            // (for example a file result extension). Keep those non-text parts
+            // opaque without making ordinary patchable text in the same
+            // message opaque as well.
+            if (!owner.opaque) {
+                const referenced = new Set(
+                    owner.origins.flatMap((origin) =>
+                        origin.outgoing
+                            .filter((pointer) => pointer.messageIndex === messageIndex)
+                            .map((pointer) => pointer.contentIndex),
+                    ),
+                )
+                for (
+                    let contentIndex = 0;
+                    contentIndex < aiContent(message).length;
+                    contentIndex++
+                ) {
+                    if (referenced.has(contentIndex)) continue
+                    const part = aiContent(message)[contentIndex]
+                    if (part && contentType(part) !== "text") opaqueContent.set(contentIndex, part)
+                }
+            }
+        } else {
+            // Uncorrelated host messages are provider-owned by definition. The
+            // prior structural fingerprint only compared their shape, allowing
+            // a same-ID replacement to slip through before patching.
+            opaqueMessage = message
+            aiContent(message).forEach((part, contentIndex) => {
+                opaqueContent.set(contentIndex, part)
+            })
         }
         return {
             messageIndex,
             message,
             sourceMessageId: owner?.sourceMessageId,
             normalizedMessageId: owner?.normalizedMessageId,
-            opaque: owner?.opaque === true,
+            opaque: owner?.opaque === true || owner === undefined,
             owned: owner?.owned === true || isAcpOwnedId(aiMessageId(message)),
             opaqueMessage,
             opaqueContent,

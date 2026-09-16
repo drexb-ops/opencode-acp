@@ -1,5 +1,8 @@
 import type { SessionState, WithParts } from "./state"
 import { isIgnoredUserMessage } from "./messages/query"
+import { isAcpSyntheticId } from "./synthetic-ids"
+
+export { isAcpOwnedId, isAcpOwnedNoticeId, isAcpSyntheticId } from "./synthetic-ids"
 
 const MESSAGE_REF_REGEX = /^m(\d{4,5})$/
 const BLOCK_REF_REGEX = /^b([1-9]\d*)$/
@@ -166,8 +169,10 @@ export function assignMessageRefs(state: SessionState, messages: WithParts[]): n
         if (typeof rawMessageId !== "string" || rawMessageId.length === 0) {
             continue
         }
-        // [FIX Bug 29] Skip synthetic messages created by DCP
-        if (rawMessageId.startsWith("msg_dcp_summary_") || rawMessageId.startsWith("msg_dcp_text_")) {
+        // ACP-owned synthetic messages are user-visible implementation details,
+        // not model-addressable history. In particular, V2 command notices must
+        // never consume the finite message-ref namespace.
+        if (isAcpSyntheticId(rawMessageId)) {
             continue
         }
 

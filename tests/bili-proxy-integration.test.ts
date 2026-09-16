@@ -12,15 +12,24 @@
  */
 
 import assert from "node:assert/strict"
-import test from "node:test"
+import test, { after } from "node:test"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
-import { mkdirSync, writeFileSync } from "node:fs"
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs"
 import type { PluginInput, Hooks, Config } from "@opencode-ai/plugin"
 import type { WithParts } from "../lib/state"
 
-const testDataHome = join(tmpdir(), `opencode-acp-bili-data-${process.pid}`)
-const testConfigHome = join(tmpdir(), `opencode-acp-bili-config-${process.pid}`)
+const previousEnv = new Map(
+    [
+        "XDG_DATA_HOME",
+        "XDG_CONFIG_HOME",
+        "BILLION_CONTEXT_PROXY",
+        "OPENCODE_CONFIG_DIR",
+        "OPENCODE_SERVER_PASSWORD",
+    ].map((key) => [key, process.env[key]] as const),
+)
+const testDataHome = mkdtempSync(join(tmpdir(), "opencode-acp-bili-data-"))
+const testConfigHome = mkdtempSync(join(tmpdir(), "opencode-acp-bili-config-"))
 
 // Must be set BEFORE importing ../index: lib/config.ts captures
 // XDG_CONFIG_HOME into a module-level constant at import time.
@@ -37,6 +46,15 @@ writeFileSync(
     "utf-8",
 )
 mkdirSync(testDataHome, { recursive: true })
+
+after(() => {
+    for (const [key, value] of previousEnv) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+    }
+    rmSync(testDataHome, { recursive: true, force: true })
+    rmSync(testConfigHome, { recursive: true, force: true })
+})
 
 const { default: plugin } = await import("../index")
 

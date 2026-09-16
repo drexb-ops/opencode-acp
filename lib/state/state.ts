@@ -16,6 +16,7 @@ import {
     loadSessionState,
     resolveStorageDir,
     saveSessionState,
+    normalizePersistedMessageIds,
 } from "./persistence"
 import type { DeferredMutationEffects } from "./transaction"
 import { createModelLimitCatalog } from "./model-limits"
@@ -30,6 +31,7 @@ import {
     collectTurnNudgeAnchors,
 } from "./utils"
 import { parseMessageRef, formatMessageRef } from "../message-ids"
+import { isAcpSyntheticId } from "../synthetic-ids"
 
 /**
  * Per-turn state update (compaction detection + turn count). Extracted from the
@@ -59,6 +61,29 @@ export async function updatePerTurnState(
 // from unbounded growth. Evicted sessions reload from persisted JSON on next
 // access; modelContextLimit and all persisted fields survive eviction.
 const REGISTRY_SOFT_CAP = 32
+
+interface DeferredValue<T> {
+    promise: Promise<T>
+    resolve(value: T): void
+    reject(error: unknown): void
+}
+
+function createDeferred<T>(): DeferredValue<T> {
+    let resolve!: (value: T) => void
+    let reject!: (error: unknown) => void
+    const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+        resolve = resolvePromise
+        reject = rejectPromise
+    })
+    return { promise, resolve, reject }
+}
+
+type SessionHistoryLoader<History> = () => History | Promise<History>
+type SessionHistoryMessages<History> = (history: History) => WithParts[] | undefined
+type SessionMutation<History, Result> = (
+    state: SessionState,
+    history: History,
+) => Result | Promise<Result>
 
 // [FIX #33] Per-session state. Replaces the single shared SessionState singleton
 // whose resetSessionState-on-switch wiped modelContextLimit (set only by
@@ -169,47 +194,105 @@ export class SessionStateRegistry {
         messages: WithParts[],
         config?: PluginConfig,
     ): Promise<SessionState> {
-        let state = this.states.get(sessionId)
-        let initialization = this.initializations.get(sessionId)
-        if (!state) {
-            state = createSessionState()
-            // Assign shared compressionTiming BEFORE ensureSessionInitialized so
-            // its init-time applyPendingCompressionDurations reads the shared map.
-            state.compressionTiming = this.compressionTiming
-            this.states.set(sessionId, state)
-            initialization = this.initializeState(sessions, state, sessionId, messages, config)
-            this.initializations.set(sessionId, initialization)
-            this.enforceSoftCap()
-            void initialization.then(
-                () => this.finishInitialization(sessionId, initialization!),
-                (error) => {
-                    if (this.states.get(sessionId)?.sessionId === sessionId) {
-                        this.states.delete(sessionId)
-                    }
-                    this.logger.error("Failed to initialize session state", {
-                        sessionId,
-                        error: error instanceof Error ? error.message : String(error),
-                    })
-                    this.finishInitialization(sessionId, initialization!)
-                },
-            )
-        }
-        if (initialization) {
-            await initialization
-        } else {
-            // Existing, fully initialized states remain idempotent. Keep this
-            // call for callers that seeded a registry state directly in tests.
-            await ensureSessionInitialized(
-                resolveSessionService(sessions),
-                state,
-                sessionId,
-                this.logger,
-                messages,
-                config,
-                this.projectDir,
-            )
-        }
+        const state = await this.withSessionMutationAndInitialize(
+            sessions,
+            sessionId,
+            () => messages,
+            (history) => history,
+            config,
+            async (state) => state,
+        )
+        if (!state) throw new Error(`ACP: session ${sessionId} has no initialized state`)
         return state
+    }
+
+    /**
+     * Reserve a session before loading history, then initialize and mutate it
+     * while the same reservation is held. This is the atomic entry point for
+     * adapters whose history must be read as part of the transaction (notably
+     * the V2 context hook).
+     *
+     * `historyToMessages` may return undefined to reject/skip a history
+     * projection without creating a new persisted session state.
+     */
+    async withSessionMutationAndInitialize<History, Result>(
+        sessions: SessionService,
+        sessionId: string,
+        loadHistory: SessionHistoryLoader<History>,
+        historyToMessages: SessionHistoryMessages<History>,
+        config: PluginConfig | undefined,
+        operation: SessionMutation<History, Result>,
+    ): Promise<Result | undefined> {
+        return this.withReservedSessionWork(sessionId, async () => {
+            let state = this.states.get(sessionId)
+            let initialization = this.initializations.get(sessionId)
+            let createdInitialization: DeferredValue<SessionState> | undefined
+
+            if (!state) {
+                state = createSessionState()
+                // Assign shared compressionTiming before any initialization
+                // await so init-time pending durations use the shared map.
+                state.compressionTiming = this.compressionTiming
+                this.states.set(sessionId, state)
+                createdInitialization = this.beginInitialization(sessionId)
+                initialization = createdInitialization.promise
+            } else if (!initialization && state.sessionId !== sessionId) {
+                // A few lightweight test registries seed a raw state directly.
+                // Bring that state through the same visible initialization
+                // barrier instead of exposing it during an await.
+                state.compressionTiming = this.compressionTiming
+                createdInitialization = this.beginInitialization(sessionId)
+                initialization = createdInitialization.promise
+            }
+
+            try {
+                // The reservation was installed synchronously before this
+                // history load. A concurrent caller can queue, but cannot read
+                // or commit a stale snapshot for this session.
+                const history = await loadHistory()
+                const messages = historyToMessages(history)
+                if (messages === undefined) {
+                    if (createdInitialization && state.sessionId !== sessionId) {
+                        this.discardInitialization(sessionId, createdInitialization)
+                    }
+                    return undefined
+                }
+
+                if (initialization && state.sessionId !== sessionId) {
+                    try {
+                        await ensureSessionInitialized(
+                            resolveSessionService(sessions),
+                            state,
+                            sessionId,
+                            this.logger,
+                            messages,
+                            config,
+                            this.projectDir,
+                        )
+                        createdInitialization?.resolve(state)
+                        this.finishInitialization(sessionId, initialization)
+                    } catch (error) {
+                        createdInitialization?.reject(error)
+                        throw error
+                    }
+                } else if (initialization) {
+                    // If another compatible initializer was already queued,
+                    // wait for its complete state rather than observing its
+                    // synchronously inserted placeholder.
+                    await initialization
+                }
+
+                if (state.sessionId !== sessionId) {
+                    throw new Error(`ACP: session ${sessionId} is not initialized`)
+                }
+                return await operation(state, history)
+            } catch (error) {
+                if (createdInitialization && this.states.get(sessionId) === state) {
+                    this.discardInitialization(sessionId, createdInitialization)
+                }
+                throw error
+            }
+        })
     }
 
     /**
@@ -220,58 +303,69 @@ export class SessionStateRegistry {
         sessionId: string,
         operation: (state: SessionState) => Promise<T> | T,
     ): Promise<T> {
-        const initialization = this.initializations.get(sessionId)
-        if (initialization) {
-            await initialization
-        }
+        return this.withReservedSessionWork(sessionId, async () => {
+            const initialization = this.initializations.get(sessionId)
+            if (initialization) await initialization
+            const state = this.states.get(sessionId)
+            if (!state || this.initializations.has(sessionId)) {
+                throw new Error(`ACP: session ${sessionId} has no initialized state`)
+            }
+            return await operation(state)
+        })
+    }
 
-        if (!this.states.has(sessionId)) {
-            throw new Error(`ACP: session ${sessionId} has no initialized state`)
-        }
-
+    /** Install a reservation synchronously, before the first awaited operation. */
+    private withReservedSessionWork<T>(
+        sessionId: string,
+        operation: () => Promise<T> | T,
+    ): Promise<T> {
         const previous = this.mutationTails.get(sessionId) ?? Promise.resolve()
         let release!: () => void
         const current = new Promise<void>((resolve) => {
             release = resolve
         })
         this.mutationTails.set(sessionId, current)
+        // Count queued work immediately. Soft-cap eviction must not remove a
+        // state while its initialization/history/operation is merely queued.
         this.guardedWork.set(sessionId, (this.guardedWork.get(sessionId) ?? 0) + 1)
+        this.enforceSoftCap()
 
-        await previous
-        try {
-            const state = this.states.get(sessionId)
-            if (!state || this.initializations.has(sessionId)) {
-                throw new Error(`ACP: session ${sessionId} is not initialized`)
+        return (async () => {
+            try {
+                await previous
+                return await operation()
+            } finally {
+                const count = (this.guardedWork.get(sessionId) ?? 1) - 1
+                if (count > 0) this.guardedWork.set(sessionId, count)
+                else this.guardedWork.delete(sessionId)
+                release()
+                if (this.mutationTails.get(sessionId) === current) {
+                    this.mutationTails.delete(sessionId)
+                }
+                this.enforceSoftCap()
             }
-            return await operation(state)
-        } finally {
-            const count = (this.guardedWork.get(sessionId) ?? 1) - 1
-            if (count > 0) this.guardedWork.set(sessionId, count)
-            else this.guardedWork.delete(sessionId)
-            release()
-            if (this.mutationTails.get(sessionId) === current) {
-                this.mutationTails.delete(sessionId)
-            }
-            this.enforceSoftCap()
-        }
+        })()
     }
 
-    private initializeState(
-        sessions: SessionService,
-        state: SessionState,
+    private beginInitialization(sessionId: string): DeferredValue<SessionState> {
+        const initialization = createDeferred<SessionState>()
+        this.initializations.set(sessionId, initialization.promise)
+        // A failed initialization is also observed by callers that only see
+        // the registry barrier, preventing an unhandled rejection.
+        void initialization.promise.catch(() => {})
+        this.enforceSoftCap()
+        return initialization
+    }
+
+    private discardInitialization(
         sessionId: string,
-        messages: WithParts[],
-        config?: PluginConfig,
-    ): Promise<SessionState> {
-        return ensureSessionInitialized(
-            resolveSessionService(sessions),
-            state,
-            sessionId,
-            this.logger,
-            messages,
-            config,
-            this.projectDir,
-        ).then(() => state)
+        initialization: DeferredValue<SessionState> | undefined,
+    ): void {
+        if (initialization) initialization.reject(new Error("ACP session initialization cancelled"))
+        if (initialization && this.initializations.get(sessionId) === initialization.promise) {
+            this.initializations.delete(sessionId)
+            this.states.delete(sessionId)
+        }
     }
 
     private finishInitialization(sessionId: string, initialization: Promise<SessionState>): void {
@@ -284,16 +378,16 @@ export class SessionStateRegistry {
     }
 
     private enforceSoftCap(): void {
-        if (this.states.size <= REGISTRY_SOFT_CAP) return
-        let oldest: string | undefined
-        for (const sessionId of this.states.keys()) {
-            if (!this.initializations.has(sessionId) && !this.guardedWork.has(sessionId)) {
-                oldest = sessionId
-                break
+        while (this.states.size > REGISTRY_SOFT_CAP) {
+            let oldest: string | undefined
+            for (const sessionId of this.states.keys()) {
+                if (!this.initializations.has(sessionId) && !this.guardedWork.has(sessionId)) {
+                    oldest = sessionId
+                    break
+                }
             }
-        }
-        if (oldest !== undefined) {
-            this.states.delete(oldest as string)
+            if (oldest === undefined) return
+            this.states.delete(oldest)
             this.logger.info("SessionStateRegistry evicted session (soft cap)", {
                 sessionId: oldest,
                 remaining: this.states.size,
@@ -421,12 +515,16 @@ export async function ensureSessionInitialized(
     const isChildSession = parentSessionId !== undefined
     state.isSubAgent = isChildSession
 
-    state.lastCompaction = findLastCompactionTimestamp(messages)
+    const currentCompactionTimestamp = findLastCompactionTimestamp(messages)
     state.currentTurn = countTurns(state, messages)
     state.nudges.turnNudgeAnchors = collectTurnNudgeAnchors(messages)
 
     const persisted = await loadSessionState(sessionId, logger, state.storageDir)
     if (persisted === null) {
+        // No persisted boundary exists on this branch, so the current history
+        // boundary is safe to carry into fork/replay persistence.
+        state.lastCompaction = currentCompactionTimestamp
+        state.currentTurn = countTurns(state, messages)
         // Fork recovery: a fork gets new raw IDs and may omit historical
         // compress inputs. Prefer translating the parent state; replay remains
         // the cross-machine and legacy fallback.
@@ -449,7 +547,12 @@ export async function ensureSessionInitialized(
             let restored = 0
             if (parentSessionId) {
                 try {
-                    const parent = await loadSessionState(parentSessionId, logger)
+                    const parentState = await loadSessionState(
+                        parentSessionId,
+                        logger,
+                        state.storageDir,
+                    )
+                    const parent = parentState ? normalizePersistedMessageIds(parentState) : null
                     const parentMessages = parent
                         ? await sessionService.parentMessages(parentSessionId)
                         : []
@@ -518,12 +621,32 @@ export async function ensureSessionInitialized(
             byRef: new Map(Object.entries(persistedAny._persistedMessageIds.byRef || {})),
             nextRef: persistedAny._persistedMessageIds.nextRef || 1,
         }
-        // [FIX Bug 29] Auto-cleanup stale synthetic message refs from persistence
+        // [FIX Bug 29] Auto-cleanup stale synthetic message refs from persistence.
+        // This includes ACP-owned V2 command notices, which otherwise consume
+        // aliases on every repeated command until the finite ref namespace is
+        // exhausted. Check both directions because older snapshots may contain
+        // only one side of a partially written mapping.
+        let removedSyntheticRef = false
         for (const [rawId, ref] of state.messageIds.byRawId) {
-            if (rawId.startsWith("msg_dcp_summary_") || rawId.startsWith("msg_dcp_text_")) {
+            if (isAcpSyntheticId(rawId)) {
+                removedSyntheticRef = true
                 state.messageIds.byRawId.delete(rawId)
                 state.messageIds.byRef.delete(ref)
             }
+        }
+        for (const [ref, rawId] of state.messageIds.byRef) {
+            if (isAcpSyntheticId(rawId)) {
+                removedSyntheticRef = true
+                state.messageIds.byRef.delete(ref)
+                state.messageIds.byRawId.delete(rawId)
+            }
+        }
+        if (removedSyntheticRef) {
+            let candidate = 1
+            while (candidate <= 99999 && state.messageIds.byRef.has(formatMessageRef(candidate))) {
+                candidate++
+            }
+            state.messageIds.nextRef = candidate
         }
         // Migrate 4-digit refs (m0001) to 5-digit (m00001) for msgid expansion
         for (const [rawId, oldRef] of state.messageIds.byRawId) {
@@ -538,8 +661,22 @@ export async function ensureSessionInitialized(
             }
         }
     }
-    if (persistedAny._persistedLastCompaction !== undefined) {
-        state.lastCompaction = Math.max(state.lastCompaction, persistedAny._persistedLastCompaction)
+    const persistedCompaction =
+        typeof persistedAny._persistedLastCompaction === "number" &&
+        Number.isFinite(persistedAny._persistedLastCompaction)
+            ? persistedAny._persistedLastCompaction
+            : 0
+    if (currentCompactionTimestamp > persistedCompaction) {
+        // Compare only after loading the persisted transient state. Assigning
+        // the current boundary before this point makes a restart immediately
+        // after native compaction look already reconciled and preserves stale
+        // refs/nudges/tool caches.
+        resetOnCompaction(state)
+        state.lastCompaction = currentCompactionTimestamp
+        state.currentTurn = countTurns(state, messages)
+    } else {
+        state.lastCompaction = Math.max(currentCompactionTimestamp, persistedCompaction)
+        state.currentTurn = countTurns(state, messages)
     }
     if (typeof persisted.modelContextLimit === "number" && persisted.modelContextLimit > 0) {
         state.modelContextLimit = persisted.modelContextLimit

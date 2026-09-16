@@ -1,3 +1,4 @@
+import "./test-env"
 import assert from "node:assert/strict"
 import test from "node:test"
 import { mkdtempSync, readFileSync, rmSync } from "node:fs"
@@ -149,13 +150,19 @@ test("V2 host uses direct Promise session/catalog response shapes for child and 
                     type: "assistant",
                     id: "parent-assistant",
                     time: { created: 2 },
+                    agent: "code",
                     model: modelA,
                     content: [
                         {
                             type: "tool",
                             id: "parent-call",
                             name: "read",
-                            state: { status: "running", input: { path: "a.ts" } },
+                            state: {
+                                status: "running",
+                                input: { path: "a.ts" },
+                                time: { start: 2 },
+                                metadata: { source: "fixture" },
+                            },
                         },
                     ],
                 },
@@ -230,6 +237,7 @@ test("primary V2 context hook patches messages then appends a structured system 
             type: "assistant",
             id: "assistant-1",
             time: { created: 2 },
+            agent: "code",
             model: modelA,
             content: [{ type: "text", text: "answer" }],
         },
@@ -251,6 +259,59 @@ test("primary V2 context hook patches messages then appends a structured system 
         assert.equal(run.registry.get("session")?.modelContextLimit, 100_000)
     } finally {
         rmSync(run.storage, { recursive: true, force: true })
+    }
+})
+
+test("V2 context serializes history projection and commit order per session", async () => {
+    const storage = mkdtempSync(join(tmpdir(), "acp-v2-context-atomic-"))
+    const logger = new Logger(false, "silent")
+    const cfg = config(storage)
+    const registry = new SessionStateRegistry(logger, "/tmp/opencode-v2-context")
+    const prompts = new PromptStore(logger, "/tmp/opencode-v2-context")
+    let calls = 0
+    let historyStarted!: () => void
+    const firstHistoryStarted = new Promise<void>((resolve) => {
+        historyStarted = resolve
+    })
+    let releaseFirst!: () => void
+    const firstBlocked = new Promise<void>((resolve) => {
+        releaseFirst = resolve
+    })
+    const adapter = host(new Map(), [
+        { providerId: "provider-a", modelId: "model-a", contextLimit: 100_000 },
+    ])
+    adapter.projectedContext = async () => {
+        calls++
+        if (calls === 1) {
+            historyStarted()
+            await firstBlocked
+            return [{ type: "user", id: "atomic-user", time: { created: 1 }, text: "old history" }]
+        }
+        return [{ type: "user", id: "atomic-user", time: { created: 2 }, text: "new history" }]
+    }
+    const handler = createV2ContextHandler(adapter, registry, logger, cfg, prompts, {
+        global: undefined,
+        agents: {},
+    })
+    const firstEvent = context("atomic-session", modelA, [
+        Message.make({ id: "atomic-user", role: "user", content: "old history" }),
+    ])
+    const secondEvent = context("atomic-session", modelA, [
+        Message.make({ id: "atomic-user", role: "user", content: "new history" }),
+    ])
+
+    try {
+        const firstRequest = handler(firstEvent)
+        await firstHistoryStarted
+        const secondRequest = handler(secondEvent)
+        await Promise.resolve()
+        assert.equal(calls, 1)
+        releaseFirst()
+        await Promise.all([firstRequest, secondRequest])
+        assert.equal(calls, 2)
+        assert.match(String(secondEvent.messages[0]?.content[0]?.text), /new history/)
+    } finally {
+        rmSync(storage, { recursive: true, force: true })
     }
 })
 
@@ -375,6 +436,7 @@ test("V2 sanitation is outbound-only for historical assistant text", async () =>
             type: "assistant",
             id: "sanitize-assistant",
             time: { created: 2 },
+            agent: "code",
             model: modelA,
             content: [{ type: "text", text: stale }],
         },

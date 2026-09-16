@@ -13,10 +13,7 @@ import type {
     V2ProjectionModel,
     V2ProjectionOptions,
 } from "./types"
-
-const ACP_OWNED_ID_PATTERN =
-    /^(?:msg_dcp_summary_|msg_dcp_text_|msg_acp_recap_|msg_acp_notice_)[0-9a-f]{16}$/
-const ACP_OWNED_NOTICE_ID_PATTERN = /^msg_acp_notice_[0-9a-f]{16}$/
+import { isAcpOwnedId, isAcpOwnedNoticeId, isAcpSyntheticId } from "../../synthetic-ids"
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
     return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -107,13 +104,7 @@ export function hash(value: unknown): string {
     return createHash("sha256").update(canonical(value)).digest("hex")
 }
 
-export function isAcpOwnedId(value: string | undefined): boolean {
-    return value !== undefined && ACP_OWNED_ID_PATTERN.test(value)
-}
-
-export function isAcpOwnedNoticeId(value: string | undefined): boolean {
-    return value !== undefined && ACP_OWNED_NOTICE_ID_PATTERN.test(value)
-}
+export { isAcpOwnedId, isAcpOwnedNoticeId, isAcpSyntheticId }
 
 export function aiMessageId(message: unknown): string | undefined {
     return isRecord(message) ? stringValue(message.id) : undefined
@@ -406,6 +397,9 @@ export function addPointer(
     const message = messages[pointer.messageIndex]
     const part =
         pointer.contentIndex === undefined ? undefined : aiContent(message)[pointer.contentIndex]
+    if (part !== undefined) {
+        origin.originalContent.push({ pointer, part })
+    }
     const protectedFields = ["cache", "providerMetadata", "metadata", "native", "encrypted"]
     const partRecord: Record<string, unknown> | undefined = isRecord(part)
         ? (part as unknown as Record<string, unknown>)
@@ -435,6 +429,7 @@ export function newOrigin(
         outgoing: [],
         outputSpans: [],
         protectedFields: [],
+        originalContent: [],
         opaque,
     }
 }

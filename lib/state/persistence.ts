@@ -63,6 +63,63 @@ export interface PersistedSessionState {
     modelID?: string
 }
 
+function normalizeMessageRef(value: unknown): string | undefined {
+    if (typeof value !== "string") return undefined
+    const match = value
+        .trim()
+        .toLowerCase()
+        .match(/^m(\d{4,5})$/)
+    if (!match) return undefined
+    const index = Number.parseInt(match[1], 10)
+    if (!Number.isInteger(index) || index < 1 || index > 99999) return undefined
+    return `m${index.toString().padStart(5, "0")}`
+}
+
+/**
+ * Return a copy of persisted IDs with legacy four-digit aliases normalized.
+ * Fork recovery uses this helper for a parent snapshot and must never mutate
+ * the object returned by the persistence layer (it may still be shared by a
+ * caller or diagnostic fixture).
+ */
+export function normalizePersistedMessageIds(
+    persisted: PersistedSessionState,
+): PersistedSessionState {
+    const ids = persisted.messageIds
+    if (!ids || typeof ids !== "object") return persisted
+
+    const byRawId: Record<string, string> = {}
+    const byRef: Record<string, string> = {}
+    let nextRef = Number.isInteger(ids.nextRef) ? Math.max(1, ids.nextRef) : 1
+
+    for (const [rawId, ref] of Object.entries(ids.byRawId ?? {})) {
+        if (typeof ref !== "string") continue
+        const normalized = normalizeMessageRef(ref) ?? ref
+        byRawId[rawId] = normalized
+        const parsed = normalizeMessageRef(normalized)
+        if (parsed) {
+            byRef[parsed] ??= rawId
+            nextRef = Math.max(nextRef, Number.parseInt(parsed.slice(1), 10) + 1)
+        }
+    }
+    for (const [ref, rawId] of Object.entries(ids.byRef ?? {})) {
+        if (typeof rawId !== "string") continue
+        const normalized = normalizeMessageRef(ref) ?? ref
+        byRef[normalized] ??= rawId
+        const parsed = normalizeMessageRef(normalized)
+        if (parsed) nextRef = Math.max(nextRef, Number.parseInt(parsed.slice(1), 10) + 1)
+    }
+
+    return {
+        ...persisted,
+        messageIds: {
+            ...ids,
+            byRawId,
+            byRef,
+            nextRef,
+        },
+    }
+}
+
 /** Default storage directory: $XDG_DATA_HOME/opencode/storage/plugin/acp */
 export function getDefaultStorageDir(): string {
     return join(

@@ -1,3 +1,4 @@
+import "./test-env"
 import assert from "node:assert/strict"
 import test from "node:test"
 import { Message } from "@opencode/ai"
@@ -28,7 +29,7 @@ function assistantSource(
     content: readonly Record<string, unknown>[],
     model = MODEL,
 ): Record<string, unknown> {
-    return { type: "assistant", id, time: { created: 2 }, model, content }
+    return { type: "assistant", id, time: { created: 2 }, agent: "code", model, content }
 }
 
 function normalize(projected: readonly unknown[], outgoing: readonly AiMessage[]): V2Projection {
@@ -213,6 +214,10 @@ test("correlates executed and separate role-tool results by call ID", () => {
                     status: "completed",
                     input: { value: 1 },
                     content: [{ type: "text", text: "provider output" }],
+                    time: { start: 2, end: 3 },
+                    metadata: { source: "provider" },
+                    providerState: { checkpoint: "call" },
+                    providerResultState: { checkpoint: "result" },
                 },
                 time: { created: 2 },
             },
@@ -225,6 +230,10 @@ test("correlates executed and separate role-tool results by call ID", () => {
                     status: "completed",
                     input: { value: 2 },
                     content: [{ type: "text", text: "host output" }],
+                    time: { start: 2, end: 3 },
+                    metadata: { source: "host" },
+                    providerState: { checkpoint: "call" },
+                    providerResultState: { checkpoint: "result" },
                 },
                 time: { created: 2 },
             },
@@ -338,7 +347,17 @@ test("records running, completed, failed, and provider-checkpoint compaction pro
             reason: "auto",
             summary: "summary",
             recent: "recent",
-            providerContext: { version: 1, provenance: {}, messages: [] },
+            providerContext: {
+                providerID: "provider-a",
+                provider: "provider-a",
+                modelID: "model-a",
+                route: "responses",
+                protocol: "openai-responses",
+                endpoint: "https://provider.example/v1/responses",
+                version: 1,
+                provenance: {},
+                messages: [],
+            },
         },
         {
             type: "compaction",
@@ -367,4 +386,205 @@ test("records running, completed, failed, and provider-checkpoint compaction pro
     assert.equal(providerEntry.sourceType, "provider-checkpoint")
     assert.equal(providerEntry.protected, true)
     assert.equal(providerEntry.outgoingMessageIndices[0], 0)
+})
+
+test("normalizes valid tool lifecycle states and preserves provider/file result data", () => {
+    const projected = [
+        userSource("tools-user", "run the tools"),
+        assistantSource("tools-assistant", [
+            {
+                type: "tool",
+                id: "running-call",
+                name: "running",
+                executed: false,
+                state: {
+                    status: "running",
+                    input: { path: "a.ts" },
+                    time: { start: 1 },
+                    metadata: { phase: "running" },
+                    providerState: { cursor: "run" },
+                },
+            },
+            {
+                type: "tool",
+                id: "streaming-call",
+                name: "streaming",
+                executed: false,
+                state: {
+                    status: "streaming",
+                    input: '{"path":"b.ts"}',
+                    time: { start: 2 },
+                    metadata: { phase: "streaming" },
+                    providerState: { cursor: "stream" },
+                },
+            },
+            {
+                type: "tool",
+                id: "error-call",
+                name: "error-tool",
+                executed: false,
+                state: {
+                    status: "error",
+                    input: { path: "c.ts" },
+                    error: { name: "ToolError", message: "provider failed" },
+                    time: { start: 3, end: 4 },
+                    metadata: { phase: "error" },
+                    providerResultState: { retryable: true },
+                },
+            },
+            {
+                type: "tool",
+                id: "file-call",
+                name: "file-tool",
+                executed: false,
+                state: {
+                    status: "completed",
+                    input: { path: "out.txt" },
+                    content: [
+                        {
+                            type: "file",
+                            uri: "file:///tmp/out.txt",
+                            mime: "text/plain",
+                            name: "out.txt",
+                        },
+                    ],
+                    time: { start: 5, end: 6 },
+                    metadata: { phase: "file" },
+                    providerState: { cursor: "file" },
+                    providerResultState: { checksum: "abc" },
+                },
+            },
+        ]),
+    ]
+    const outgoing = [
+        Message.make({ id: "tools-user", role: "user", content: "run the tools" }),
+        Message.make({
+            id: "tools-assistant",
+            role: "assistant",
+            content: [
+                {
+                    type: "tool-call" as const,
+                    id: "running-call",
+                    name: "running",
+                    input: { path: "a.ts" },
+                    providerMetadata: { provider: { state: "running" } },
+                },
+                {
+                    type: "tool-call" as const,
+                    id: "streaming-call",
+                    name: "streaming",
+                    input: { path: "b.ts" },
+                    providerMetadata: { provider: { state: "streaming" } },
+                },
+                {
+                    type: "tool-call" as const,
+                    id: "error-call",
+                    name: "error-tool",
+                    input: { path: "c.ts" },
+                    providerMetadata: { provider: { state: "error" } },
+                },
+                {
+                    type: "tool-call" as const,
+                    id: "file-call",
+                    name: "file-tool",
+                    input: { path: "out.txt" },
+                    providerMetadata: { provider: { state: "file" } },
+                },
+            ],
+        }),
+        Message.make({
+            role: "tool",
+            content: [
+                {
+                    type: "tool-result" as const,
+                    id: "error-call",
+                    name: "error-tool",
+                    result: { type: "error" as const, value: "provider failed" },
+                    providerResultState: { retryable: true },
+                },
+            ],
+        }),
+        Message.make({
+            role: "tool",
+            content: [
+                {
+                    type: "tool-result" as const,
+                    id: "file-call",
+                    name: "file-tool",
+                    result: {
+                        type: "content" as const,
+                        value: [
+                            {
+                                type: "file" as const,
+                                uri: "file:///tmp/out.txt",
+                                mime: "text/plain",
+                                name: "out.txt",
+                            },
+                        ],
+                    },
+                    providerResultState: { checksum: "abc" },
+                },
+            ],
+        }),
+    ]
+
+    const projection = normalize(projected, outgoing)
+    assert.equal(projection.valid, true)
+    const entry = projection.entries.find(
+        (candidate) => candidate.sourceMessageId === "tools-assistant",
+    )
+    assert.ok(entry)
+    assert.deepEqual(entry.toolCallIds, [
+        "running-call",
+        "streaming-call",
+        "error-call",
+        "file-call",
+    ])
+    assert.equal(
+        entry.origins.find((origin) => origin.callId === "running-call")?.normalizedInput,
+        '{"path":"a.ts"}',
+    )
+    assert.equal(entry.origins.find((origin) => origin.callId === "error-call")?.opaque, true)
+    assert.equal(entry.origins.find((origin) => origin.callId === "file-call")?.opaque, true)
+    const normalizedTools = entry.origins
+        .filter((origin) => origin.kind === "tool")
+        .map((origin) =>
+            projection.messages[1]?.parts.find((part) => part.__acpOrigin === origin.key),
+        )
+    assert.deepEqual(
+        normalizedTools.map((part) => part?.state?.status),
+        ["running", "pending", "error", "completed"],
+    )
+
+    const result = applyV2ContextPatch(projection, structuredClone(projection.messages))
+    assert.equal(result.accepted, true)
+    if (!result.accepted) return
+    const errorResult = result.messages
+        .flatMap((message) => message.content)
+        .find((part) => part.type === "tool-result" && part.id === "error-call")
+    const fileResult = result.messages
+        .flatMap((message) => message.content)
+        .find((part) => part.type === "tool-result" && part.id === "file-call")
+    assert.deepEqual(errorResult?.result, {
+        type: "error",
+        value: "provider failed",
+    })
+    assert.deepEqual(fileResult?.result, {
+        type: "content",
+        value: [
+            {
+                type: "file",
+                uri: "file:///tmp/out.txt",
+                mime: "text/plain",
+                name: "out.txt",
+            },
+        ],
+    })
+    assert.deepEqual(
+        result.messages
+            .flatMap((message) => message.content)
+            .find((part) => part.type === "tool-call" && part.id === "running-call")
+            ?.providerMetadata,
+        { provider: { state: "running" } },
+    )
 })
