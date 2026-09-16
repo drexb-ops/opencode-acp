@@ -8,7 +8,7 @@
  * opencode → message transform hooks → compress tool → state persistence.
  *
  * Architecture:
- *   - Listens on PORT (default 8400), responds to /v1/chat/completions
+ *   - Listens on PORT (default 8400), responds to any path ending in /v1/chat/completions
  *   - Reads scenario from SCENARIO env var (JSON file path)
  *   - Tracks turns by counting user messages in each request
  *   - At compress turns: parses <dcp-message-id> tags for mNNNNN refs,
@@ -21,6 +21,14 @@
  */
 
 import { readFileSync, writeFileSync, existsSync } from "fs"
+
+declare const Bun: {
+    serve(options: {
+        port: number
+        hostname: string
+        fetch(request: Request): Response | Promise<Response>
+    }): unknown
+}
 
 const PORT = parseInt(process.env.PORT ?? "8400", 10)
 const HOST = process.env.HOST ?? "127.0.0.1"
@@ -66,10 +74,27 @@ interface ScenarioStep {
     candidateKind?: "micro" | "episode"
 }
 
+interface ToolSequenceStep {
+    /** Tool name to emit after the warm-up requests. */
+    tool: string
+    /** Fully formed arguments for tools whose arguments do not contain message refs. */
+    args?: Record<string, unknown>
+    /** Compression helpers for a dynamic `compress` call. */
+    summary?: string
+    topic?: string
+    range?: "all" | [number, number]
+    acknowledgeRisk?: boolean
+}
+
 interface Scenario {
     name: string
     description: string
     turns: ScenarioStep[]
+    /** Optional installed-artifact flow. Existing turn scenarios remain unchanged. */
+    toolSequence?: ToolSequenceStep[]
+    /** Number of ACP-enabled model requests that should receive text first. */
+    warmupTurns?: number
+    warmupText?: string
 }
 
 const scenario: Scenario = JSON.parse(readFileSync(SCENARIO_PATH, "utf-8"))
@@ -90,17 +115,57 @@ export interface RequestObservation {
     candidateEndId?: string
     isChild: boolean
     isAuxiliary: boolean
+    /** URL path used by the provider request (including any /bili/ prefix). */
+    requestPath: string
+    /** Normalized provider tool names advertised in this request. */
+    advertisedToolNames: string[]
+    /** The five ACP names found in the advertised catalog, in request order. */
+    acpToolNames: string[]
+    /** ACP system prompt/metadata was present in this model request. */
+    systemPromptPresent: boolean
+    /** Message refs observed in dcp-message-id tags (payloads are never recorded). */
+    dcpMessageIdRefs: string[]
+    /** A compressed summary marker was visible in this request. */
+    summaryMarkerPresent: boolean
+    /** Command sentinels or raw command arguments reached this model request. */
+    commandSentinelLeakage: boolean
+    /** An ACP-owned synthetic notice reached this model request. */
+    acpOwnedNoticePresent: boolean
+    /** Tool calls already present in the incoming conversation. */
+    calledToolNames: string[]
+    /** Statuses of tool results present in the incoming conversation. */
+    toolResultStatuses: ToolResultObservation[]
+}
+
+export interface ToolResultObservation {
+    id?: string
+    name?: string
+    status: "completed" | "error"
+    actionable?: boolean
 }
 
 export interface Observations {
     requests: RequestObservation[]
+    emittedTools: string[]
+    toolResults: ToolResultObservation[]
 }
 
-const observations: Observations = { requests: [] }
+const observations: Observations = { requests: [], emittedTools: [], toolResults: [] }
+const observedToolResultIds = new Set<string>()
+
+const ACP_TOOL_NAMES = new Set([
+    "compress",
+    "decompress",
+    "search_context",
+    "acp_status",
+    "acp_context_recap",
+])
 
 let totalCompressionsEmitted = 0
 
 function recordObservation(
+    requestPath: string,
+    body: any,
     turn: number,
     inputTokens: number,
     messageCount: number,
@@ -110,6 +175,9 @@ function recordObservation(
     isChild: boolean,
     isAuxiliary: boolean,
 ): void {
+    const messages = messagesFromBody(body)
+    const advertisedToolNames = advertisedNames(toolsFromBody(body))
+    const toolResultStatuses = inspectToolResults(messages)
     observations.requests.push({
         turn,
         inputTokens,
@@ -119,12 +187,36 @@ function recordObservation(
         nudgeSystemTokens,
         isChild,
         isAuxiliary,
+        requestPath,
+        advertisedToolNames,
+        acpToolNames: advertisedToolNames.filter((name) => ACP_TOOL_NAMES.has(name)),
+        systemPromptPresent: hasAcpSystemPrompt(body),
+        dcpMessageIdRefs: parseDcpMessageRefs(messages),
+        summaryMarkerPresent: hasSummaryMarker(messages),
+        commandSentinelLeakage: hasCommandSentinel(body),
+        acpOwnedNoticePresent: hasAcpOwnedNotice(messages),
+        calledToolNames: calledToolNames(messages),
+        toolResultStatuses,
     })
+    for (const result of toolResultStatuses) {
+        if (result.id && observedToolResultIds.has(result.id)) continue
+        if (result.id) observedToolResultIds.add(result.id)
+        observations.toolResults.push(result)
+    }
+    writeObservations()
+}
+
+function writeObservations(): void {
     try {
         writeFileSync(OBSERVATIONS_FILE, JSON.stringify(observations, null, 2))
     } catch {
         // best-effort — verify.ts treats missing file as "no constraints"
     }
+}
+
+function recordEmittedTool(name: string): void {
+    observations.emittedTools.push(name)
+    writeObservations()
 }
 
 function markLastObservationCandidateSelected(startId: string, endId: string): void {
@@ -133,11 +225,7 @@ function markLastObservationCandidateSelected(startId: string, endId: string): v
     last.candidateSelected = true
     last.candidateStartId = startId
     last.candidateEndId = endId
-    try {
-        writeFileSync(OBSERVATIONS_FILE, JSON.stringify(observations, null, 2))
-    } catch {
-        // best-effort — verification reports missing observation data separately
-    }
+    writeObservations()
 }
 
 const CHILD_TURN_COUNTER = TURN_COUNTER + "-child"
@@ -160,7 +248,7 @@ function incrementChildTurnCounter(): number {
 const server = Bun.serve({
     port: PORT,
     hostname: HOST,
-    fetch(req) {
+    fetch(req: Request) {
         const url = new URL(req.url)
 
         if (req.method === "GET" && url.pathname === "/v1/models") {
@@ -177,7 +265,7 @@ const server = Bun.serve({
             })
         }
 
-        if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
+        if (req.method === "POST" && url.pathname.endsWith("/v1/chat/completions")) {
             return handleChatCompletion(req)
         }
 
@@ -229,6 +317,8 @@ async function handleChatCompletion(req: Request): Promise<Response> {
     const isAuxiliary = tools.length === 0
 
     recordObservation(
+        new URL(req.url).pathname,
+        body,
         readTurnCounter(),
         inputTokens,
         messages.length,
@@ -252,6 +342,16 @@ async function handleChatCompletion(req: Request): Promise<Response> {
     if (isChild) {
         return handleChildRequest(model, messages, lastRole, lastMsg, isStream, inputTokens)
     }
+
+    const sequenceResponse = handleToolSequenceRequest(
+        model,
+        body,
+        messages,
+        lastRole,
+        isStream,
+        inputTokens,
+    )
+    if (sequenceResponse) return sequenceResponse
 
     if (lastRole === "tool" || lastRole === "function") {
         const toolText = extractMessageText(lastMsg)
@@ -332,6 +432,10 @@ async function handleChatCompletion(req: Request): Promise<Response> {
 
     if (step.respond === "autonomous-nudge") {
         return handleAutonomousNudgeStep(model, messages, step, isStream, inputTokens)
+    }
+
+    if (step.respond === "tool") {
+        return handleToolStep(model, step, isStream, inputTokens)
     }
 
     // Text response
@@ -494,6 +598,219 @@ function handleNudgeCompressStep(
         `  → compress: ${startId}..${endId}, summary=${(step.summary ?? "").length} chars${advertised ? " (advertised candidate)" : ""}`,
     )
     return compressResponse(model, { content }, false, isStream, inputTokens)
+}
+
+function messagesFromBody(body: any): any[] {
+    return Array.isArray(body?.messages) ? body.messages : []
+}
+
+function toolsFromBody(body: any): any[] {
+    return Array.isArray(body?.tools) ? body.tools : []
+}
+
+function normalizeToolName(value: unknown): string | undefined {
+    if (typeof value !== "string" || value.trim().length === 0) return undefined
+    return value
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9_]+/g, "_")
+}
+
+function advertisedNames(tools: any[]): string[] {
+    const names: string[] = []
+    for (const tool of tools) {
+        const name = normalizeToolName(
+            tool?.function?.name ?? tool?.name ?? tool?.tool?.name ?? tool?.id,
+        )
+        if (name) names.push(name)
+    }
+    return names
+}
+
+function calledToolNames(messages: any[]): string[] {
+    const names: string[] = []
+    for (const message of messages) {
+        if (!Array.isArray(message?.tool_calls)) continue
+        for (const call of message.tool_calls) {
+            const name = normalizeToolName(call?.function?.name ?? call?.name)
+            if (name) names.push(name)
+        }
+    }
+    return names
+}
+
+function inspectToolResults(messages: any[]): ToolResultObservation[] {
+    const results: ToolResultObservation[] = []
+    const namesByCallId = new Map<string, string>()
+    for (const message of messages) {
+        if (!Array.isArray(message?.tool_calls)) continue
+        for (const call of message.tool_calls) {
+            const id = typeof call?.id === "string" ? call.id : undefined
+            const name = normalizeToolName(call?.function?.name ?? call?.name)
+            if (id && name) namesByCallId.set(id, name)
+        }
+    }
+    for (const message of messages) {
+        if (message?.role !== "tool" && message?.role !== "function") continue
+        const text = extractMessageText(message)
+        const id = typeof message?.tool_call_id === "string" ? message.tool_call_id : undefined
+        const name = normalizeToolName(message?.name) ?? (id ? namesByCallId.get(id) : undefined)
+        const status =
+            /(?:^|\n)\s*(?:error:|ACP cannot request|ACP tool execution is disabled|ACP .* execution failed|permission .* blocked|invalid .* input)/i.test(
+                text,
+            )
+                ? "error"
+                : "completed"
+        const actionable = /permission|allow|deny/i.test(text)
+        results.push({ ...(id ? { id } : {}), ...(name ? { name } : {}), status, actionable })
+    }
+    return results
+}
+
+function systemText(body: any): string {
+    const parts: string[] = []
+    if (typeof body?.system === "string") parts.push(body.system)
+    if (Array.isArray(body?.system)) {
+        for (const part of body.system) {
+            if (typeof part === "string") parts.push(part)
+            else if (part?.text) parts.push(String(part.text))
+            else if (part?.content) parts.push(String(part.content))
+        }
+    }
+    for (const message of messagesFromBody(body)) {
+        if (message?.role === "system") parts.push(extractMessageText(message))
+    }
+    return parts.join("\n")
+}
+
+function hasAcpSystemPrompt(body: any): boolean {
+    const text = systemText(body)
+    return text.includes("ACP TAGS") || text.includes("five context-management tools")
+}
+
+function parseDcpMessageRefs(messages: any[]): string[] {
+    const refs: string[] = []
+    const seen = new Set<string>()
+    const tagRegex = /<dcp-message-id[^>]*>([^<]+)<\/dcp-message-id>/g
+    for (const message of messages) {
+        const text = extractMessageText(message)
+        let match: RegExpExecArray | null
+        while ((match = tagRegex.exec(text)) !== null) {
+            const ref = match[1]
+            if (ref && !seen.has(ref)) {
+                seen.add(ref)
+                refs.push(ref)
+            }
+        }
+    }
+    return refs
+}
+
+function hasSummaryMarker(messages: any[]): boolean {
+    return messages.some((message) => {
+        const text = extractMessageText(message)
+        return (
+            text.includes("[Compressed conversation section]") ||
+            /<dcp-message-id[^>]*>b\d+/.test(text)
+        )
+    })
+}
+
+function hasCommandSentinel(body: any): boolean {
+    return /(?:COMMAND_SENTINEL|ACP_E2E_SENTINEL|DCP_E2E_SENTINEL)/i.test(JSON.stringify(body))
+}
+
+function hasAcpOwnedNotice(messages: any[]): boolean {
+    return messages.some((message) => {
+        const metadata = JSON.stringify(message?.metadata ?? {})
+        return message?.id?.startsWith("msg_acp_notice_") || metadata.includes('"acpOwned":true')
+    })
+}
+
+function hasAdvertisedAcpTools(body: any): boolean {
+    return advertisedNames(toolsFromBody(body)).some((name) => ACP_TOOL_NAMES.has(name))
+}
+
+let installedActionIndex = 0
+let installedWarmupCount = 0
+
+function handleToolSequenceRequest(
+    model: string,
+    body: any,
+    messages: any[],
+    lastRole: string | undefined,
+    isStream: boolean,
+    inputTokens: number,
+): Response | undefined {
+    const sequence = scenario.toolSequence
+    if (!sequence || sequence.length === 0) return undefined
+
+    // A proxy-disabled request deliberately has no ACP tools. Keep the request
+    // useful but do not advance the scripted ACP action sequence.
+    if (!hasAdvertisedAcpTools(body)) {
+        return textResponse(
+            model,
+            scenario.warmupText ?? "ACP-disabled provider request completed.",
+            isStream,
+            inputTokens,
+        )
+    }
+
+    const warmupTurns = scenario.warmupTurns ?? 1
+    if (lastRole !== "tool" && lastRole !== "function" && installedWarmupCount < warmupTurns) {
+        installedWarmupCount++
+        return textResponse(
+            model,
+            scenario.warmupText ?? "Initial context captured before scripted ACP actions.",
+            isStream,
+            inputTokens,
+        )
+    }
+
+    if (installedActionIndex >= sequence.length) {
+        return textResponse(model, "Installed-artifact flow complete.", isStream, inputTokens)
+    }
+
+    const step = sequence[installedActionIndex++]
+    if (!step)
+        return textResponse(model, "Installed-artifact flow complete.", isStream, inputTokens)
+
+    if (step.tool === "compress") {
+        const refs = parseMessageRefs(messages)
+        if (refs.length === 0) {
+            return textResponse(model, "No messages to compress.", isStream, inputTokens)
+        }
+        const [startId, endId] = resolveRange(refs, step.range ?? "all")
+        const content = [
+            {
+                topic: step.topic ?? "Installed ACP compression",
+                startId,
+                endId,
+                summary:
+                    step.summary ??
+                    "Installed-artifact compression summary with enough detail for the quality gate.",
+            },
+        ]
+        return compressResponse(
+            model,
+            { content },
+            step.acknowledgeRisk ?? false,
+            isStream,
+            inputTokens,
+        )
+    }
+
+    return toolUseResponse(model, step.tool, step.args ?? {}, isStream, inputTokens)
+}
+
+function handleToolStep(
+    model: string,
+    step: ScenarioStep,
+    isStream: boolean,
+    inputTokens: number,
+): Response {
+    const toolName = step.tool ?? "bash"
+    return toolUseResponse(model, toolName, step.toolArgs ?? {}, isStream, inputTokens)
 }
 
 function countCompressCalls(messages: any[]): number {
@@ -780,6 +1097,7 @@ function compressResponse(
     inputTokens = 0,
 ): Response {
     totalCompressionsEmitted++
+    recordEmittedTool("compress")
     const fullArgs = { ...args }
     if (acknowledgeRisk) {
         ;(fullArgs as any).acknowledgeRisk = true
@@ -835,6 +1153,7 @@ function toolUseResponse(
     isStream: boolean,
     inputTokens = 0,
 ): Response {
+    recordEmittedTool(toolName)
     const argsJson = JSON.stringify(args)
     const callId = `call_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`
     const outputTokens = Math.max(1, Math.ceil(argsJson.length / 4))

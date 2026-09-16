@@ -21,6 +21,16 @@ interface VerifyExpectations {
     nudgeSystemTokensStable?: boolean
     candidateSelected?: boolean
     candidateBoundaryMatches?: boolean
+    /** Require one request with each direct ACP tool name exactly once. */
+    advertisedAcpToolNames?: string[]
+    /** Require each listed tool to be emitted by the fake model at least once. */
+    requiredEmittedTools?: string[]
+    systemPromptObserved?: boolean
+    dcpRefsObserved?: boolean
+    summaryMarkerObserved?: boolean
+    commandSentinelLeakFree?: boolean
+    acpOwnedNoticeLeakFree?: boolean
+    toolResultStatuses?: Record<string, "completed" | "error">
 }
 
 interface VerifyScenario {
@@ -36,6 +46,35 @@ interface RequestObservation {
     isChild: boolean
     isAuxiliary: boolean
     nudgeSystemTokens?: number
+    candidateSelected?: boolean
+    candidateStartId?: string
+    candidateEndId?: string
+    requestPath?: string
+    advertisedToolNames?: string[]
+    acpToolNames?: string[]
+    systemPromptPresent?: boolean
+    dcpMessageIdRefs?: string[]
+    summaryMarkerPresent?: boolean
+    commandSentinelLeakage?: boolean
+    acpOwnedNoticePresent?: boolean
+    calledToolNames?: string[]
+    toolResultStatuses?: Array<{
+        id?: string
+        name?: string
+        status: "completed" | "error"
+        actionable?: boolean
+    }>
+}
+
+interface ObservationData {
+    requests: RequestObservation[]
+    emittedTools: string[]
+    toolResults: Array<{
+        id?: string
+        name?: string
+        status: "completed" | "error"
+        actionable?: boolean
+    }>
 }
 
 const statePath = process.argv[2]
@@ -57,20 +96,29 @@ function readJson(path: string): any {
     }
 }
 
-function readObservations(): RequestObservation[] {
-    if (!existsSync(observationsPath)) return []
+function readObservationData(): ObservationData {
+    if (!existsSync(observationsPath)) return { requests: [], emittedTools: [], toolResults: [] }
     try {
         const data = JSON.parse(readFileSync(observationsPath, "utf-8"))
-        return Array.isArray(data?.requests) ? data.requests : []
+        return {
+            requests: Array.isArray(data?.requests) ? data.requests : [],
+            emittedTools: Array.isArray(data?.emittedTools) ? data.emittedTools : [],
+            toolResults: Array.isArray(data?.toolResults) ? data.toolResults : [],
+        }
     } catch {
-        return []
+        return { requests: [], emittedTools: [], toolResults: [] }
     }
+}
+
+function readObservations(): RequestObservation[] {
+    return readObservationData().requests
 }
 
 const state = readJson(statePath)
 const scenario = readJson(scenarioPath) as VerifyScenario
 const expect = scenario.verify
-const observations = readObservations()
+const observationData = readObservationData()
+const observations = observationData.requests
 
 let passed = 0
 let failed = 0
@@ -329,6 +377,86 @@ if (expect.nudgeSystemTokensStable) {
         systemValues.length >= 2 && new Set(systemValues).size === 1,
         `got ${JSON.stringify(systemValues)} — compression changed visible history, so system was re-estimated from a later assistant`,
     )
+}
+
+if (expect.advertisedAcpToolNames !== undefined) {
+    const expectedNames = expect.advertisedAcpToolNames
+    const catalogObservation = parentObs.find((observation) => {
+        const names = observation.acpToolNames ?? []
+        return (
+            names.length === expectedNames.length &&
+            expectedNames.every((name) => names.filter((value) => value === name).length === 1)
+        )
+    })
+    assert(
+        "advertised ACP tool names are present exactly once",
+        catalogObservation !== undefined,
+        `expected ${expectedNames.join(",")}`,
+    )
+}
+
+if (expect.requiredEmittedTools !== undefined) {
+    for (const name of expect.requiredEmittedTools) {
+        assert(
+            `fake emitted ${name}`,
+            observationData.emittedTools.includes(name),
+            `emitted ${observationData.emittedTools.join(",")}`,
+        )
+    }
+}
+
+if (expect.systemPromptObserved !== undefined) {
+    const observed = parentObs.some((observation) => observation.systemPromptPresent === true)
+    assert(
+        "ACP system prompt observation",
+        observed === expect.systemPromptObserved,
+        `got ${observed}`,
+    )
+}
+
+if (expect.dcpRefsObserved !== undefined) {
+    const observed = parentObs.some(
+        (observation) => (observation.dcpMessageIdRefs?.length ?? 0) > 0,
+    )
+    assert("dcp message-ID ref observation", observed === expect.dcpRefsObserved, `got ${observed}`)
+}
+
+if (expect.summaryMarkerObserved !== undefined) {
+    const observed = parentObs.some((observation) => observation.summaryMarkerPresent === true)
+    assert(
+        "compressed summary marker observation",
+        observed === expect.summaryMarkerObserved,
+        `got ${observed}`,
+    )
+}
+
+if (expect.commandSentinelLeakFree !== undefined) {
+    const leaked = parentObs.some((observation) => observation.commandSentinelLeakage === true)
+    assert(
+        "command sentinel remains model-invisible",
+        !leaked === expect.commandSentinelLeakFree,
+        `leaked=${leaked}`,
+    )
+}
+
+if (expect.acpOwnedNoticeLeakFree !== undefined) {
+    const leaked = parentObs.some((observation) => observation.acpOwnedNoticePresent === true)
+    assert(
+        "ACP-owned notices remain model-invisible",
+        !leaked === expect.acpOwnedNoticeLeakFree,
+        `leaked=${leaked}`,
+    )
+}
+
+if (expect.toolResultStatuses !== undefined) {
+    for (const [name, status] of Object.entries(expect.toolResultStatuses)) {
+        const observed = observationData.toolResults.find((result) => result.name === name)?.status
+        assert(
+            `tool result ${name} has status ${status}`,
+            observed === status,
+            `got ${observed ?? "missing"}`,
+        )
+    }
 }
 
 console.log()

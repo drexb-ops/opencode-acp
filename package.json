@@ -36,6 +36,7 @@
         "test": "node --import tsx --test tests/*.test.ts",
         "format": "prettier --write .",
         "format:check": "prettier --check .",
+        "e2e:installed": "./scripts/e2e/run-installed-e2e.sh",
         "dcp": "tsx scripts/print.ts"
     },
     "keywords": [

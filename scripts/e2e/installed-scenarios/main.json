@@ -1,0 +1,47 @@
+{
+    "name": "acp-installed-artifact",
+    "description": "Deterministic installed-artifact ACP tool sequence.",
+    "turns": [],
+    "warmupTurns": 1,
+    "warmupText": "Initial context captured before scripted ACP actions.",
+    "toolSequence": [
+        {
+            "tool": "compress",
+            "topic": "Installed ACP context",
+            "summary": "Seed installed ACP context with authentication and provider routing details. Initial context captured before scripted ACP actions. Proxy transition probe preserves authentication and provider routing details. ACP-disabled provider request completed. This summary preserves the installed artifact sequence and the local fake provider route transition."
+        },
+        { "tool": "acp_status", "args": { "scope": "compressed" } },
+        { "tool": "search_context", "args": { "query": "installed ACP provider" } },
+        { "tool": "acp_context_recap", "args": { "blockId": 1 } },
+        { "tool": "decompress", "args": { "blockId": "b1" } }
+    ],
+    "verify": {
+        "blockCount": 1,
+        "advertisedAcpToolNames": [
+            "compress",
+            "decompress",
+            "search_context",
+            "acp_status",
+            "acp_context_recap"
+        ],
+        "requiredEmittedTools": [
+            "compress",
+            "decompress",
+            "search_context",
+            "acp_status",
+            "acp_context_recap"
+        ],
+        "systemPromptObserved": true,
+        "dcpRefsObserved": true,
+        "summaryMarkerObserved": true,
+        "commandSentinelLeakFree": true,
+        "acpOwnedNoticeLeakFree": true,
+        "toolResultStatuses": {
+            "compress": "completed",
+            "decompress": "completed",
+            "search_context": "completed",
+            "acp_status": "completed",
+            "acp_context_recap": "completed"
+        }
+    }
+}

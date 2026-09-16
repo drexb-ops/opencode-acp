@@ -1,0 +1,25 @@
+{
+    "name": "acp-installed-artifact-permission-ask",
+    "description": "Deterministic fail-closed ask permission check for installed ACP.",
+    "turns": [],
+    "warmupTurns": 1,
+    "toolSequence": [
+        {
+            "tool": "compress",
+            "topic": "Permission fallback",
+            "summary": "Permission ask installed-artifact probe must fail closed before compression state mutation. The fake provider records the actionable permission decision and the ACP tool result without claiming that a block was created."
+        }
+    ],
+    "verify": {
+        "blockCount": 0,
+        "advertisedAcpToolNames": [
+            "compress",
+            "decompress",
+            "search_context",
+            "acp_status",
+            "acp_context_recap"
+        ],
+        "requiredEmittedTools": ["compress"],
+        "toolResultStatuses": { "compress": "error" }
+    }
+}

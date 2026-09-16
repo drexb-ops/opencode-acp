@@ -1,0 +1,14 @@
+{
+    "name": "acp-installed-artifact-permission-deny",
+    "description": "Deterministic deny permission check for installed ACP.",
+    "turns": [],
+    "warmupTurns": 1,
+    "toolSequence": [
+        {
+            "tool": "compress",
+            "topic": "Permission fallback",
+            "summary": "Permission deny installed-artifact probe must not allocate compression state."
+        }
+    ],
+    "verify": { "blockCount": 0 }
+}

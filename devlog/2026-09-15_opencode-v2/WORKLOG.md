@@ -3,7 +3,7 @@
 - Task ID: `2026-09-15_opencode-v2`
 - Home Repo: `opencode-acp`
 - Status: InProgress
-- Updated: 2026-09-16 02:06 UTC
+- Updated: 2026-09-16 04:47 UTC
 
 ## 1. Summary
 
@@ -21,18 +21,21 @@
 
 ### Commits
 
-| Commit      | Description                                                   |
-| ----------- | ------------------------------------------------------------- |
-| `7224ab9`   | Record the approved OpenCode V2 compatibility design          |
-| `3c00b9a`   | Refine concurrency boundaries and add the implementation plan |
-| `b42d827`   | Record the integrated pre-change verification baseline        |
-| `b569ccd`   | Add the dual V1/V2 entrypoint and dependency foundation       |
-| `5d21e10`   | Add shared host services and host-neutral tool definitions    |
-| `9a349ec`   | Serialize session mutations and stage transform effects       |
-| `42637b6`   | Add V2 projection, validated patching, and primary context    |
-| `3a8c21e`   | Add V2 tools, commands, permissions, timing, and proxy state  |
-| `6ef5085`   | Add typed notifications and managed runtime cleanup           |
-| This commit | Publish and verify server, TUI, and RPC package entrypoints   |
+| Commit      | Description                                                    |
+| ----------- | -------------------------------------------------------------- |
+| `7224ab9`   | Record the approved OpenCode V2 compatibility design           |
+| `3c00b9a`   | Refine concurrency boundaries and add the implementation plan  |
+| `b42d827`   | Record the integrated pre-change verification baseline         |
+| `b569ccd`   | Add the dual V1/V2 entrypoint and dependency foundation        |
+| `5d21e10`   | Add shared host services and host-neutral tool definitions     |
+| `9a349ec`   | Serialize session mutations and stage transform effects        |
+| `42637b6`   | Add V2 projection, validated patching, and primary context     |
+| `3a8c21e`   | Add V2 tools, commands, permissions, timing, and proxy state   |
+| `6ef5085`   | Add typed notifications and managed runtime cleanup            |
+| `ec3c7a7`   | Publish and verify server, TUI, and RPC package entrypoints    |
+| `5eaafdb`   | Document OpenCode V1/V2 compatibility                          |
+| `0cccee3`   | Resolve lifecycle, state recovery, and projection audit issues |
+| This commit | Add and verify installed-artifact V1/V2 E2E                    |
 
 ### Phase 1
 
@@ -269,3 +272,71 @@
   with message/content reference checks; centralized `isAcpOpaquePart`; added
   direct Promise-shape host tests, cached-model-limit fallback/switch coverage,
   and an end-to-end rejected-context rollback test.
+
+## 12. Phase 9 — Installed-artifact V1/V2 E2E
+
+- Added `scripts/e2e/run-installed-e2e.sh`, `installed-v1.ts`,
+  `installed-v2.ts`, `installed-config.mjs`, and deterministic fixtures under
+  `scripts/e2e/installed-scenarios/`. The harness builds and packs ACP, then
+  installs that tarball into private host/plugin prefixes under
+  `/tmp/opencode/acp-e2e/hosts/{v1,v2}`.
+- Host identities were verified from the installed executables: V1
+  `opencode-ai@1.18.29` and V2 `@opencode/cli@2.0.3`. V1 used the one-shot
+  `run --port 0` path and its installed package directory; V2 used the exact
+  foreground `serve --hostname 127.0.0.1 --port <owned-port>` API path.
+- The V2 2.0.3 release rejected the requested `file:///.../*.tgz` configured
+  plugin path with its exact `configured plugin path must be a directory`
+  diagnostic. The harness retains that server log and falls back to a local
+  wrapper whose server/TUI/RPC files import the same installed tarball.
+- **PASS**: `KEEP_E2E=1 ./scripts/e2e/run-installed-e2e.sh` completed in 104s.
+  V1 passed default dual-entrypoint `.server()` discovery, fake response, and
+  exactly one scripted ACP block. V2 passed active plugin ID/features, native
+  plural config, fake model limits/tools, all five tools in the
+  compress/status/search/recap/decompress sequence, ACP prompt/ID and summary
+  observations, `/acp` and `/dcp` synthetic inbox output, command-sentinel and
+  notice hiding, state persistence across an owned-server restart, two proxy
+  disable/re-enable cycles, and duplicate-registration checks.
+- **PASS**: V2 permission fixtures passed `allow` (compression block created),
+  `deny` (tools/commands omitted), and `ask` (advertised tool returned an
+  actionable fail-closed result with no state mutation). TUI rendering was not
+  started; it remains unit-tested only.
+- The successful run used `KEEP_E2E=1`, so diagnostics remain at
+  `/tmp/opencode/acp-e2e` until a normal success run performs the harness's
+  exact-root cleanup. No service-wide stop, global install, commit, push, or
+  publish was used.
+- **PRE-EXISTING FAIL**: repository-wide `npm run format:check` still reports
+  427 inherited files; all modified package/E2E/config/fixture files pass the
+  targeted Prettier check above.
+- **PASS**: normal `./scripts/e2e/run-installed-e2e.sh` completed in 105s with
+  the same matrix and removed only `/tmp/opencode/acp-e2e`; no diagnostics or
+  owned host/server processes remained afterward.
+- **PASS**: final repository checks included `npm run typecheck`,
+  `npm test` (1,368/1,368; 117.2s), `npm run build`,
+  `npm run verify:package` (253 tarball entries), targeted E2E unit helpers
+  (34/34), strict TS checks for the new Node/Bun drivers, targeted Prettier,
+  `bash -n`, and `git diff --check`. No changes were committed.
+- **AUTHORITATIVE RERUN AFTER AUDIT FIXES**: `npm run e2e:installed` passed from
+  commit `0cccee3` plus the uncommitted Phase 9 harness in 101s. It reverified
+  exact V1 1.18.29 and V2 2.0.3, all five tools, command isolation,
+  persistence/restart, proxy transitions, duplicate prevention, and the
+  allow/deny/ask permission matrix, then removed `/tmp/opencode/acp-e2e` and
+  every owned process.
+
+## 13. Independent audit corrections
+
+- Two independent read-only agents reviewed every Phase 1–8 source and test
+  path. Their initial reports identified stale-history commit risk, lifecycle
+  fencing, same-ID payload replacement, subagent enforcement, proxy retry,
+  compaction/fork recovery, synthetic-ref cleanup, model override fallback,
+  fixture isolation/fidelity, and runtime-clone coverage.
+- Commit `0cccee3` resolves those findings with atomic history+state
+  reservations, reference-validated patch origins, in-flight operation
+  tracking, child-session fail-closed checks, retryable proxy state, restart
+  compaction reconciliation, custom-storage/legacy-ref fork recovery,
+  centralized synthetic IDs, state model fallback, isolated production-shaped
+  fixtures, and binary/Error clone handling.
+- **PASS**: corrective implementation full suite 1,371/1,371; lead-focused
+  corrective suites 118/118; typecheck, build, package verification, targeted
+  formatting, and diff checks.
+- Because source/tests changed after the initial audits, final follow-up reviews
+  of `ec3c7a7..0cccee3` remain required before PR readiness.

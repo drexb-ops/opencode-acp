@@ -1,0 +1,18 @@
+{
+    "name": "acp-installed-artifact-permission-allow",
+    "description": "Deterministic allow permission check for installed ACP.",
+    "turns": [],
+    "warmupTurns": 1,
+    "toolSequence": [
+        {
+            "tool": "compress",
+            "topic": "Permission fallback",
+            "summary": "Permission allow installed-artifact probe records the local fake provider request and the selected OpenCode host version. The permission fallback must run before compression state mutation, preserving the explicit allow decision, the user prompt, the assistant response, and the provider route. This deliberately complete summary is longer than the quality-gate minimum so the allow case proves a real compression block was allocated rather than only advertising the tool."
+        }
+    ],
+    "verify": {
+        "blockCount": 1,
+        "requiredEmittedTools": ["compress"],
+        "toolResultStatuses": { "compress": "completed" }
+    }
+}

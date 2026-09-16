@@ -36,6 +36,9 @@ npm run verify:package
 
 # Inspect the npm pack file list (ignore lifecycle scripts)
 npm pack --dry-run --json --ignore-scripts
+
+# Build, install, and exercise the tarball on exact V1/V2 hosts
+npm run e2e:installed
 ```
 
 Test totals are intentionally not hardcoded here: `npm test` discovers the
@@ -46,10 +49,10 @@ tests, and full message-pipeline tests.
 The V2 adapter targets the exact `@opencode/plugin@2.0.3` API and the package
 claims OpenCode V1 `>=1.18.29`. `npm run verify:package` checks the built and
 packed entrypoint shape, import graph, manifest/lock consistency, exclusions,
-and credential-like filenames; it does not install the tarball into an
-OpenCode host. Installed-artifact V1/V2 E2E coverage from Phase 9 is still
-pending on this branch, so the commands above must not be reported as proof of
-that host-level matrix.
+and credential-like filenames. `npm run e2e:installed` performs the separate
+host-level proof: it packs the artifact, privately installs OpenCode V1 1.18.29
+and V2 2.0.3 under `/tmp/opencode`, and runs the isolated fake-provider matrix
+without inherited credentials or the user's shared service.
 
 ---
 
@@ -90,9 +93,11 @@ the complete set.
 | V2 projection and runtime adapters        | `v2-message-projection.test.ts`, `v2-context*.test.ts`, `v2-tools.test.ts`, `v2-commands.test.ts`, `v2-timing.test.ts`, `v2-proxy.test.ts`, `v2-notifications.test.ts`, `v2-lifecycle.test.ts`                            | Loss-aware projection and validated patches, direct tools, commands, timing, permission fallbacks, proxy refresh, RPC/TUI notifications, and cleanup |
 | Properties and regressions                | `property-*.test.ts`, `compression-candidates-property.test.ts`, `nudge-loop-fix.test.ts`, `tier-detection-fix.test.ts`, `regex-tag-leak.test.ts`, `tool-pair-integrity.test.ts`, `trigger-policy-integration.test.ts`    | Invariants, generated inputs, historical bug regressions, tool-pair atomicity, and trigger-policy behavior                                           |
 | In-process end-to-end flows               | `e2e-message-transform.test.ts`, `e2e-blocks-nudges.test.ts`, `e2e-tier-compression.test.ts`, `e2e-tier-simulation.test.ts`                                                                                               | Full in-process transform and tier flows; these are not installed-artifact host tests                                                                |
+| Installed-artifact host matrix            | `scripts/e2e/run-installed-e2e.sh`, `installed-v1.ts`, `installed-v2.ts`, `installed-scenarios/*`                                                                                                                         | Exact V1 1.18.29 and V2 2.0.3 package loading, tools, commands, permissions, proxy reload, and restart persistence                                   |
 
-Installed-artifact V1/V2 E2E is a separate Phase 9 deliverable and remains
-pending on this branch.
+The installed matrix tests the generated tarball rather than workspace imports.
+See `scripts/e2e/README.md` for isolation, retained diagnostics, and scenario
+details.
 
 ---
 
@@ -563,8 +568,9 @@ coverage when host integration is involved:
    `e2e-*.test.ts` suites; preserve tool-call/result pairs and provider-owned
    fields in assertions.
 5. **Installed artifact:** build and pack once, then run isolated host checks.
-   The dual-host V1/V2 artifact suite is the pending Phase 9 work on this
-   branch and is not covered by `npm test`.
+   Run `npm run e2e:installed`; this dual-host suite is intentionally separate
+   from `npm test` because it installs pinned OpenCode binaries and starts owned
+   local processes.
 
 ---
 

@@ -15,12 +15,76 @@ End-to-end tests for ACP compression using a fake LLM server.
 SKIP_BUILD=1 ./scripts/e2e/run-e2e.sh
 ```
 
+## Installed-artifact compatibility matrix
+
+Run the Phase 9 matrix from the repository root:
+
+```bash
+# Builds, packs, privately installs, and runs both claimed host versions.
+npm run e2e:installed
+
+# Keep the exact temporary root and logs for inspection after a run.
+KEEP_E2E=1 npm run e2e:installed
+
+# Iterate against an existing dist/ directory (the tarball is still packed).
+SKIP_BUILD=1 KEEP_E2E=1 npm run e2e:installed
+```
+
+The installed harness always tests the generated tarball, not the workspace
+module. It runs `opencode-ai@1.18.29` and `@opencode/cli@2.0.3` under private
+prefixes at `/tmp/opencode/acp-e2e/hosts/{v1,v2}`. Host installs run normal
+npm lifecycle scripts; the ACP tarball is installed with
+`npm install --prefix <private-plugin-root> --ignore-scripts --no-save`.
+
+Every host and fake-provider process is launched with `env -i` and an explicit
+minimal PATH/locale, isolated `HOME`, `OPENCODE_TEST_HOME`, all XDG roots,
+`TMPDIR`, `OPENCODE_CONFIG_DIR`, `OPENCODE_DB`, model/project-disable flags,
+and harness-local npm user config/cache. No inherited provider or service
+credentials are read. The V2 server is the foreground command
+`serve --hostname 127.0.0.1 --port <owned-port>` with Basic auth user
+`opencode` and password `e2e-dummy`; it is never connected to the user's
+background service.
+
+The V2 config uses native plural `plugins`, `providers`, `agents`, and
+`permissions`, disables update/share/automatic compaction, and points the fake
+model at a local OpenAI-compatible provider. It first attempts the requested
+`{"package":"file:///.../opencode-acp-*.tgz"}` form. OpenCode 2.0.3 may reject
+that form as a configured file path before Arborist; in that case the harness
+retains the exact server diagnostic and uses a temporary local wrapper whose
+entrypoints import the same installed tarball. The wrapper is only a host
+resolution fallback, never a different artifact.
+
+The fake provider accepts both `/v1/chat/completions` and paths ending in that
+suffix (including `/bili/v1/chat/completions`). It records redacted structural
+observations under the harness root: advertised tool names, ACP system/ID and
+summary markers, provider route, command-sentinel/notice leakage, emitted and
+called tools, and tool-result status. The matrix exercises the five direct ACP
+tools, command aliases, state persistence across an owned-server restart,
+allow/deny/ask permission behavior, repeated `/bili/` catalog reloads, and
+proxy re-enable. TUI rendering remains unit-tested; no interactive terminal is
+started.
+
+The installed flow scripts its provider responses in
+`scripts/e2e/installed-scenarios/`: one main sequence calls `compress`,
+`acp_status`, `search_context`, `acp_context_recap`, and `decompress`, while
+three focused scenarios cover `allow`, `deny`, and fail-closed `ask`.
+
+Successful runs remove only `/tmp/opencode/acp-e2e` (or its explicitly
+configured descendant). Failed runs preserve logs and state for diagnosis;
+`KEEP_E2E=1` also preserves a successful run. Cleanup tracks each exact child
+PID, sends SIGTERM, waits, and escalates only that PID when necessary—never
+`pkill`, `killall`, or a service-wide stop.
+
 ## Prerequisites
 
 - `opencode` binary on PATH (or set `OPENCODE_BIN`)
 - `bun` runtime on PATH (or set `BUN_BIN`)
 - `node` on PATH (or set `NODE_BIN`)
 - `curl` for health checks
+
+The installed-artifact matrix does not require a global `opencode` binary; it
+downloads both pinned host packages into the harness prefixes. It additionally
+requires `npm` and `tar` on PATH.
 
 ## How It Works
 
@@ -60,21 +124,21 @@ the turn counter for real conversation turns.
 
 ## Scenarios
 
-| File | Description |
-|------|-------------|
-| `01-basic-compress.json` | 3 text turns → compress all → verify 1 block |
-| `02-quality-reject.json` | Bad summary → quality gate rejects → verify 0 blocks |
-| `03-quality-acknowledge.json` | Reject → retry with `acknowledgeRisk` → verify 1 block |
-| `04-batch-compress.json` | 4 text turns → batch compress 3 ranges → verify 3 blocks |
-| `05-subagent-compress.json` | Subagent session → compress → verify parent + child blocks |
-| `06-nudge-triggered.json` | Text turns grow context → ACP auto-injects nudge → fake LLM detects nudge and compresses → verify block count + nudge baseline |
-| `07-protection-filtered.json` | Production config (preserveRecentMessages:5) → compress all → verify protected messages excluded from compressed set (soft-filter, not hard-reject) |
-| `08-nudge-with-protection.json` | Nudge→compress WITH protection enabled → verify compress succeeds despite protected zone, nudge baseline set, protected messages survived |
-| `09-nudge-refire-after-compress.json` | Multi-turn nudge→compress→growth→re-nudge→re-compress. Verifies minBlockCount ≥ 1 (full re-nudge cycle with baseline reset is in scenario 10 + unit tests), maxBlockCount ≤ 8 |
-| `10-autonomous-nudge-refire.json` | Issue #176: Autonomous session (bash tool calls grow context) → first nudge→compress → continued growth → second nudge→second compress → verify minBlockCount ≥ 2, maxCompressCallsVisible ≤ 2 |
+| File                                              | Description                                                                                                                                                                                                                                                                                                           |
+| ------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `01-basic-compress.json`                          | 3 text turns → compress all → verify 1 block                                                                                                                                                                                                                                                                          |
+| `02-quality-reject.json`                          | Bad summary → quality gate rejects → verify 0 blocks                                                                                                                                                                                                                                                                  |
+| `03-quality-acknowledge.json`                     | Reject → retry with `acknowledgeRisk` → verify 1 block                                                                                                                                                                                                                                                                |
+| `04-batch-compress.json`                          | 4 text turns → batch compress 3 ranges → verify 3 blocks                                                                                                                                                                                                                                                              |
+| `05-subagent-compress.json`                       | Subagent session → compress → verify parent + child blocks                                                                                                                                                                                                                                                            |
+| `06-nudge-triggered.json`                         | Text turns grow context → ACP auto-injects nudge → fake LLM detects nudge and compresses → verify block count + nudge baseline                                                                                                                                                                                        |
+| `07-protection-filtered.json`                     | Production config (preserveRecentMessages:5) → compress all → verify protected messages excluded from compressed set (soft-filter, not hard-reject)                                                                                                                                                                   |
+| `08-nudge-with-protection.json`                   | Nudge→compress WITH protection enabled → verify compress succeeds despite protected zone, nudge baseline set, protected messages survived                                                                                                                                                                             |
+| `09-nudge-refire-after-compress.json`             | Multi-turn nudge→compress→growth→re-nudge→re-compress. Verifies minBlockCount ≥ 1 (full re-nudge cycle with baseline reset is in scenario 10 + unit tests), maxBlockCount ≤ 8                                                                                                                                         |
+| `10-autonomous-nudge-refire.json`                 | Issue #176: Autonomous session (bash tool calls grow context) → first nudge→compress → continued growth → second nudge→second compress → verify minBlockCount ≥ 2, maxCompressCallsVisible ≤ 2                                                                                                                        |
 | `11-tier2-baseline-preserved-after-compress.json` | Issue #364: verify raw-message T1 captures (m-refs) do NOT touch lastTier2NudgeTokens — stays unset when T2 never fired. The #235 never-undefined invariant is locked by unit tests on the distill/conservative reset path (filename kept from the pre-#364 revision because the CI e2e job hardcodes scenario paths) |
-| `12-consumed-call-hiding.json` | Bug #236 regression: T1 compresses auto-consume previous blocks → verify lastRequestCompressCalls=1 (consumed calls hidden from LLM) |
-| `13-adaptive-compression-candidates.json` | Real nudge→compress flow where the fake model selects an advertised MICRO candidate and verifies candidate selection plus state baseline |
+| `12-consumed-call-hiding.json`                    | Bug #236 regression: T1 compresses auto-consume previous blocks → verify lastRequestCompressCalls=1 (consumed calls hidden from LLM)                                                                                                                                                                                  |
+| `13-adaptive-compression-candidates.json`         | Real nudge→compress flow where the fake model selects an advertised MICRO candidate and verifies candidate selection plus state baseline                                                                                                                                                                              |
 
 ### Scenario Format
 
