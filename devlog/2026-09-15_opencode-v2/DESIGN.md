@@ -210,9 +210,13 @@ or title hooks.
 
 For each primary request:
 
-1. Resolve `event.model` in the V2 catalog and record its current context limit.
-2. Acquire the per-session state guard and await complete initialization.
-3. Read `ctx.session.context({ sessionID })` for projected, ID-bearing history.
+1. Refresh the agent permission snapshot, resolve `event.model` in the V2 catalog,
+   and record its current context limit. This read-only preflight occurs before the
+   per-session guard.
+2. Acquire the per-session state guard and keep any fresh session behind its
+   initialization barrier until the request outcome is accepted.
+3. Read `ctx.session.context({ sessionID })` for projected, ID-bearing history
+   while holding that reservation.
 4. Normalize projected messages into ACP's internal envelope plus a provenance
    sidecar that records origins and opaque host-owned content.
 5. Clone the complete mutable runtime state and stage external effects.
@@ -221,9 +225,10 @@ For each primary request:
 7. Derive a context patch by comparing original and transformed internal data.
 8. Validate every patch correlation and structural invariant.
 9. Render the ACP system prompt from the validated working state.
-10. Replace `event.messages`, append `event.system`, commit working state, and
-    run deferred persistence/effects.
-11. Release the session guard.
+10. After a final lifecycle check, synchronously replace `event.messages`, append
+    `event.system`, and commit working state with no intervening await.
+11. Run initialization and request persistence/effects while the same session
+    reservation remains held, then release the initialization barrier and guard.
 
 Combining message and system behavior in one V2 hook preserves the V1 ordering
 assumption that message processing establishes the current model and state before
@@ -282,13 +287,17 @@ Before mutation:
 - the resulting V2 messages satisfy their schemas
 - the projection fingerprint still matches the already-lowered request
 
-Validation failure preserves the original request. ACP restores the registry
-snapshot so its state cannot claim a transform the model never received. The
-failure is logged without message bodies or credentials.
+Validation failure preserves the original request. ACP restores an existing
+registry snapshot or removes a fresh, still-hidden initialization placeholder,
+including staged persistence and timing changes, so its state cannot claim a
+transform the model never received. The failure is logged without message bodies
+or credentials.
 
 Because `ctx.session.context()` and `event.messages` are not returned with a
 shared sequence token, any fingerprint mismatch is treated as an ambiguous
-projection and leaves the request unchanged.
+projection and leaves the request unchanged. Patchable content uses bounded value
+fingerprints plus exact message/content positions; opaque provider/file content
+uses original object identity and position rather than hashing large payloads.
 
 ## 7. V2 Lifecycle and Integrations
 
@@ -298,10 +307,14 @@ V2 setup loads config, handles environment self-disable, creates runtime service
 registers hooks/transforms/RPC, starts catalog monitoring and the optional update
 check, and returns cleanup.
 
-Registrations are automatically scoped by OpenCode. ACP cleanup aborts event
-iterators, update fetches, delayed notices, in-flight adapter work, and owned timers.
-Cleanup is idempotent. Partial setup failure disposes already-created resources
-before plugin activation fails.
+Registrations are automatically scoped by OpenCode. ACP cleanup stops event/update
+producers, invalidates lifecycle leases so no new accepted commit can begin,
+waits for already-reserved adapter work, and then disposes registrations, delayed
+notices, RPC resources, and owned timers. V2.0.3 cannot force-cancel an already
+running tool callback; ACP instead stages its state, persistence, notifications,
+and command output until the final lifecycle-authorized commit boundary. Cleanup
+is idempotent. Partial setup failure disposes already-created resources before
+plugin activation fails.
 
 ### 7.2 Tools and timing
 
@@ -311,7 +324,16 @@ and status metadata currently sent through V1 tool metadata.
 
 Timing uses V2 tool execute-before/after hooks for ACP tools rather than
 reconstructing V1 `message.part.updated` events. This retains reliable call and
-session correlation.
+session correlation. Keys are lifecycle-instance-scoped; unload removes orphaned
+starts/pending entries owned by that instance if an execute-after event never
+arrives.
+
+Mutating V2 tools execute against a complete state clone and stage persistence,
+notifications, and file output until lifecycle-authorized commit. A typed quality
+gate rejection is the sole selective exception: it commits only the retry marker
+needed by the immediate `acknowledgeRisk` retry and rolls back every other
+speculative mutation. Decompression file export canonicalizes its allowed parent,
+rejects symlink components, and uses a no-follow final open.
 
 OpenCode V2.0.3 tool context does not expose a cancellation signal. ACP passes
 host cancellation only on V1 and otherwise relies on session interruption and
@@ -364,8 +386,9 @@ Therefore:
 
 - `deny`: the tools are not advertised or executed
 - `allow`: tools execute normally
-- `ask`: execution fails closed before state mutation with an actionable message
-  requiring an explicit allow or deny choice
+- `ask`: execution fails closed before shared ACP tool state acquisition or
+  compression mutation with an actionable message requiring an explicit allow
+  or deny choice; ordinary host session/history state may already exist
 
 Agent-specific effective rules remain authoritative. ACP does not emulate native
 permission prompts through private APIs. V1 behavior remains unchanged.
@@ -412,21 +435,33 @@ initialization, and context/tool serialization.
 
 ### 10.2 Installed-package E2E
 
-The E2E harness builds and packs ACP, installs the tarball under isolated home and
-XDG directories, disables auto-update, unsets real provider credentials, and uses
-the existing local fake provider.
+The E2E harness builds and packs ACP, installs the tarball under a unique,
+canonicalized `/tmp/opencode/acp-e2e/run-*` root with isolated home and XDG
+directories, disables auto-update, removes inherited credentials with `env -i`,
+and uses the existing local fake provider. Cleanup may remove only that exact
+generated root and tracks only harness-owned PIDs.
 
 The exact OpenCode 2.0.3 runtime is configured with native `plugins`, `providers`,
-`agents`, and `permissions`. Tests cover discovery, five tools, context behavior,
-both command names, restart persistence, proxy transitions, permission fallbacks,
-and reload/unload. A V1 >= 1.18.29 smoke test validates the same packed dual
-entrypoint.
+`agents`, and `permissions`. It rejects a configured `file:///.../*.tgz` plugin
+with `configured plugin path must be a directory`; only that exact inactive
+activation and diagnostic permits the local-wrapper fallback. Before fallback,
+the harness imports root, server, TUI, and RPC through the privately installed
+tarball package and proves their resolution remains inside that prefix. Tests
+cover discovery, five tools, context behavior, both command names, restart
+persistence, proxy transitions, permission fallbacks, reload/unload, and a real
+baseline → protected/no-target growth → nudge → compression → exact new baseline
+→ growth → second nudge/compression cycle with `preserveRecentMessages: 10`.
+Fixed black-box expectations for the pinned fixture make baseline reset/drift a
+hard failure. A V1 >= 1.18.29 smoke test validates the same packed dual
+entrypoint. Interactive TUI rendering remains unit-tested only.
 
 ### 10.3 Package verification
 
-`scripts/verify-package.mjs` additionally checks the packed runtime shape,
-entrypoint resolution, manifest/lock consistency, tarball exclusions, and absence
-of credential-like files.
+`scripts/verify-package.mjs` additionally creates the real tarball under the
+approved temporary root, installs it with lifecycle scripts disabled, imports all
+four public entrypoints through that isolated package export map, and checks the
+packed runtime shape, manifest/lock consistency, tarball exclusions, and absence
+of credential-like filenames.
 
 Required final commands are:
 

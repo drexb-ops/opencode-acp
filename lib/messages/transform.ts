@@ -51,7 +51,7 @@ export interface MessageTransformOptions {
  * This function deliberately has no registry/client access. Host adapters own
  * session initialization and model lookup, and pass this function a ready
  * state plus deferred effects. That makes the same mutation body usable by V1
- * and by the future V2 projection transaction.
+ * and by the V2 projection transaction.
  */
 export async function runMessageTransform(
     messages: WithParts[],

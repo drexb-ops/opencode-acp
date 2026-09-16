@@ -295,8 +295,11 @@ export function restoreForkCompressionState(
             ),
         })
     }
-    messagesState.nextBlockId =
-        Math.max(normalizedParent.prune.messages.nextBlockId, ...copiedBlockIds) + 1
+    const maxCopiedBlockId = Math.max(0, ...copiedBlockIds)
+    messagesState.nextBlockId = Math.max(
+        normalizedParent.prune.messages.nextBlockId,
+        maxCopiedBlockId + 1,
+    )
     messagesState.nextRunId = normalizedParent.prune.messages.nextRunId
     messagesState.membershipsVerified = true
     state.prune.messages = messagesState

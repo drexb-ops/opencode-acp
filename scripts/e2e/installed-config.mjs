@@ -6,8 +6,15 @@
  * server observes either the old or new document, never a partial JSON file.
  */
 
-import { mkdirSync, renameSync, writeFileSync } from "node:fs"
-import { dirname } from "node:path"
+import {
+    existsSync,
+    mkdirSync,
+    readFileSync,
+    renameSync,
+    realpathSync,
+    writeFileSync,
+} from "node:fs"
+import { dirname, isAbsolute, relative } from "node:path"
 import { pathToFileURL } from "node:url"
 
 const [
@@ -19,6 +26,10 @@ const [
     storagePath,
     workspace,
     hostPermission,
+    preserveRecentMessagesArg,
+    nudgeGrowthTokensArg,
+    minNudgeGrowthFloorArg,
+    qualityGateEnabledArg,
 ] = process.argv.slice(2)
 
 if (!mode || !outputPath) {
@@ -36,11 +47,33 @@ function writeAtomic(path, value) {
 }
 
 if (mode === "wrapper") {
-    const [wrapperDir, packageDir] = [outputPath, pluginTarget]
-    if (!wrapperDir || !packageDir) {
+    const [wrapperDir, packageDir, privatePrefix] = [outputPath, pluginTarget, baseURL]
+    if (!wrapperDir || !packageDir || !privatePrefix) {
         process.stderr.write(
-            "Usage: installed-config.mjs wrapper <directory> <installed-package-directory>\n",
+            "Usage: installed-config.mjs wrapper <directory> <installed-package-directory> <private-prefix>\n",
         )
+        process.exit(2)
+    }
+    if (!existsSync(packageDir) || !existsSync(privatePrefix)) {
+        process.stderr.write("Wrapper source package or private prefix is missing\n")
+        process.exit(2)
+    }
+    const resolvedPackageDir = realpathSync(packageDir)
+    const resolvedPrefix = realpathSync(privatePrefix)
+    const packageRelative = relative(resolvedPrefix, resolvedPackageDir)
+    if (packageRelative === "" || packageRelative.startsWith("..") || isAbsolute(packageRelative)) {
+        process.stderr.write("Wrapper source package is outside the private plugin prefix\n")
+        process.exit(2)
+    }
+    let packageManifest
+    try {
+        packageManifest = JSON.parse(readFileSync(`${resolvedPackageDir}/package.json`, "utf8"))
+    } catch {
+        process.stderr.write("Wrapper source package manifest is unreadable\n")
+        process.exit(2)
+    }
+    if (packageManifest.name !== "opencode-acp") {
+        process.stderr.write("Wrapper source package is not opencode-acp\n")
         process.exit(2)
     }
     mkdirSync(wrapperDir, { recursive: true })
@@ -49,7 +82,7 @@ if (mode === "wrapper") {
         version: "1.0.0",
         private: true,
     })
-    const packageURL = pathToFileURL(`${packageDir.replace(/\/$/, "")}/`)
+    const packageURL = pathToFileURL(`${resolvedPackageDir.replace(/\/$/, "")}/`)
     writeFileSync(
         `${wrapperDir}/server.js`,
         `export { default } from ${JSON.stringify(new URL("dist/index.js", packageURL).href)}\n`,
@@ -125,6 +158,21 @@ if (mode === "v1") {
 }
 
 if (mode === "acp") {
+    const preserveRecentMessages = Number(preserveRecentMessagesArg ?? 0)
+    const nudgeGrowthTokens = Number(nudgeGrowthTokensArg ?? 6000)
+    const minNudgeGrowthFloor = Number(minNudgeGrowthFloorArg ?? 5000)
+    const qualityGateEnabled = qualityGateEnabledArg !== "false"
+    if (
+        !Number.isInteger(preserveRecentMessages) ||
+        preserveRecentMessages < 0 ||
+        !Number.isFinite(nudgeGrowthTokens) ||
+        nudgeGrowthTokens <= 0 ||
+        !Number.isFinite(minNudgeGrowthFloor) ||
+        minNudgeGrowthFloor < 0
+    ) {
+        process.stderr.write("Invalid nudge/protection configuration\n")
+        process.exit(2)
+    }
     writeAtomic(outputPath, {
         autoUpdate: false,
         storagePath,
@@ -132,14 +180,17 @@ if (mode === "acp") {
             permission: acpPermission ?? "allow",
             minCompressRange: 0,
             maxSummaryLengthHard: 20000,
-            preserveRecentMessages: 0,
+            preserveRecentMessages,
             preserveRecentTokens: 0,
             preserveLastUserMessage: false,
             maxContextLimit: 20000,
             minContextLimit: 10000,
-            nudgeGrowthTokens: 6000,
+            minNudgeContextPercent: 0.01,
+            minNudgeGrowthFloor,
+            minNudgeGrowthRatio: 0.45,
+            nudgeGrowthTokens,
         },
-        qualityGate: { enabled: true, algorithm: "rouge-recall-v1" },
+        qualityGate: { enabled: qualityGateEnabled, algorithm: "rouge-recall-v1" },
     })
     process.exit(0)
 }

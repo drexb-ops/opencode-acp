@@ -64,6 +64,8 @@ export async function prepareSession(
         ctx.logger,
         rawMessages,
         ctx.config,
+        undefined,
+        ctx.effects,
     )
 
     assignMessageRefs(ctx.state, rawMessages)
@@ -81,8 +83,58 @@ export async function finalizeSession(
     entries: NotificationEntry[],
     batchTopic: string | undefined,
 ): Promise<void> {
-    const host = resolveToolHost(ctx)
     applyPendingCompressionDurations(ctx.state)
+
+    if (ctx.effects) {
+        ctx.effects.requestPersistence()
+        ctx.effects.defer(async () => {
+            if (ctx.isActive && !ctx.isActive()) return
+            if (entries.length > 0) {
+                const qualityReport = evaluateBatchQuality(
+                    ctx.state,
+                    rawMessages,
+                    entries,
+                    ctx.config,
+                    ctx.logger,
+                )
+                for (const failure of qualityReport.failures) {
+                    if (ctx.isActive && !ctx.isActive()) return
+                    const metrics = Object.fromEntries(
+                        failure.result.metrics.map((m) => [m.name, m.value]),
+                    )
+                    ctx.logger.warn("Compression quality gate FAILED", {
+                        blockId: failure.blockId,
+                        algorithm: ctx.config.qualityGate.algorithm,
+                        layer: failure.result.layer,
+                        reason: failure.result.reason,
+                        ...metrics,
+                    })
+                }
+            }
+            if (ctx.isActive && !ctx.isActive()) return
+            const params = getCurrentParams(ctx.state, rawMessages, ctx.logger)
+            const sessionMessageIds = rawMessages
+                .filter((msg) => !isIgnoredUserMessage(msg))
+                .map((msg) => msg.info.id)
+
+            const contextTokensBefore = getCurrentTokenUsage(ctx.state, rawMessages)
+            if (ctx.isActive && !ctx.isActive()) return
+            await sendCompressNotification(
+                ctx.notifications,
+                ctx.logger,
+                ctx.config,
+                ctx.state,
+                toolCtx.sessionID,
+                entries,
+                batchTopic,
+                sessionMessageIds,
+                params,
+                contextTokensBefore,
+            )
+        })
+        return
+    }
+
     await saveSessionState(ctx.state, ctx.logger)
 
     if (entries.length > 0) {
@@ -113,7 +165,7 @@ export async function finalizeSession(
     const contextTokensBefore = getCurrentTokenUsage(ctx.state, rawMessages)
 
     await sendCompressNotification(
-        host.notifications,
+        ctx.notifications,
         ctx.logger,
         ctx.config,
         ctx.state,

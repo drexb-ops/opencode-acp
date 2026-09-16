@@ -18,7 +18,7 @@ import {
     saveSessionState,
     normalizePersistedMessageIds,
 } from "./persistence"
-import type { DeferredMutationEffects } from "./transaction"
+import { commitSessionState, cloneSessionState, type DeferredMutationEffects } from "./transaction"
 import { createModelLimitCatalog } from "./model-limits"
 import { rebuildCompressionState, restoreForkCompressionState } from "./rebuild"
 import {
@@ -85,6 +85,60 @@ type SessionMutation<History, Result> = (
     history: History,
 ) => Result | Promise<Result>
 
+export interface SessionMutationOptions<Result = unknown> {
+    /** Stage initialization persistence until the caller authorizes commit. */
+    effects?: DeferredMutationEffects
+    /** Invalidate initialization and restore its pre-operation state on unload. */
+    isActive?: () => boolean
+    /** Tell the registry whether the guarded operation committed its outcome. */
+    commitResult?: (result: Result) => boolean
+    /** Apply the accepted state/event result synchronously before any await. */
+    commit?: (state: SessionState, result: Result) => void
+    /** Flush persistence/effects while the same session reservation is held. */
+    postCommit?: (state: SessionState, result: Result) => Promise<void> | void
+}
+
+interface PendingTimingSnapshot {
+    entry: PendingCompressionDuration
+    snapshot: PendingCompressionDuration
+}
+
+interface InitializationSnapshot {
+    state: SessionState
+    startsByCallId: Map<string, number>
+    pendingByCallId: Map<string, PendingTimingSnapshot>
+}
+
+function snapshotInitialization(state: SessionState): InitializationSnapshot {
+    return {
+        state: cloneSessionState(state),
+        startsByCallId: new Map(state.compressionTiming.startsByCallId),
+        pendingByCallId: new Map(
+            [...state.compressionTiming.pendingByCallId].map(([key, entry]) => [
+                key,
+                { entry, snapshot: { ...entry } },
+            ]),
+        ),
+    }
+}
+
+function restoreInitialization(state: SessionState, snapshot: InitializationSnapshot): void {
+    commitSessionState(state, snapshot.state)
+
+    const pending = state.compressionTiming.pendingByCallId
+    pending.clear()
+    for (const [key, value] of snapshot.pendingByCallId) {
+        Object.assign(value.entry, value.snapshot)
+        pending.set(key, value.entry)
+    }
+
+    const starts = state.compressionTiming.startsByCallId
+    starts.clear()
+    for (const [key, startedAt] of snapshot.startsByCallId) {
+        starts.set(key, startedAt)
+    }
+}
+
 // [FIX #33] Per-session state. Replaces the single shared SessionState singleton
 // whose resetSessionState-on-switch wiped modelContextLimit (set only by
 // system.transform, which fires AFTER messages.transform) and flipped
@@ -102,6 +156,8 @@ export class SessionStateRegistry {
     private readonly mutationTails = new Map<string, Promise<void>>()
     /** Includes queued work, not just the callback currently executing. */
     private readonly guardedWork = new Map<string, number>()
+    /** Work whose callback is currently executing and may mutate live state. */
+    private readonly activeWork = new Map<string, number>()
     readonly compressionTiming: CompressionTimingState = {
         startsByCallId: new Map<string, number>(),
         pendingByCallId: new Map<string, PendingCompressionDuration>(),
@@ -170,8 +226,13 @@ export class SessionStateRegistry {
 
     get(sessionId: string): SessionState | undefined {
         // A state object is inserted before async initialization can begin, but
-        // it is deliberately invisible until that initialization has completed.
-        if (this.initializations.has(sessionId)) return undefined
+        // it is deliberately invisible until initialization and its guarded
+        // operation have both completed successfully.
+        // Existing sessions are likewise hidden while a live-state callback is
+        // executing.  Legacy system/event callers use get/all outside the
+        // reservation and therefore fail closed instead of observing a partial
+        // mutation.
+        if (this.initializations.has(sessionId) || this.activeWork.has(sessionId)) return undefined
         return this.states.get(sessionId)
     }
 
@@ -208,9 +269,10 @@ export class SessionStateRegistry {
 
     /**
      * Reserve a session before loading history, then initialize and mutate it
-     * while the same reservation is held. This is the atomic entry point for
-     * adapters whose history must be read as part of the transaction (notably
-     * the V2 context hook).
+     * while the same reservation is held. New sessions remain behind their
+     * initialization barrier until the operation reports an accepted result.
+     * This is the atomic entry point for adapters whose history must be read as
+     * part of the transaction (notably the V2 context hook).
      *
      * `historyToMessages` may return undefined to reject/skip a history
      * projection without creating a new persisted session state.
@@ -222,11 +284,20 @@ export class SessionStateRegistry {
         historyToMessages: SessionHistoryMessages<History>,
         config: PluginConfig | undefined,
         operation: SessionMutation<History, Result>,
+        options?: SessionMutationOptions<Result>,
     ): Promise<Result | undefined> {
         return this.withReservedSessionWork(sessionId, async () => {
             let state = this.states.get(sessionId)
             let initialization = this.initializations.get(sessionId)
             let createdInitialization: DeferredValue<SessionState> | undefined
+            // Snapshot every guarded operation, not only fresh initialization.
+            // Some legacy callers mutate the live state directly and a
+            // synchronous external commit can still throw after doing part of
+            // that work.  Restoring this snapshot keeps both existing and
+            // fresh sessions (including shared timing maps) transaction-safe.
+            let operationSnapshot: InitializationSnapshot | undefined
+            let initializationFinished = false
+            let commitAccepted = false
 
             if (!state) {
                 state = createSessionState()
@@ -245,6 +316,15 @@ export class SessionStateRegistry {
                 initialization = createdInitialization.promise
             }
 
+            operationSnapshot = snapshotInitialization(state)
+
+            const finishCreatedInitialization = (): void => {
+                if (!createdInitialization || initializationFinished) return
+                initializationFinished = true
+                createdInitialization.resolve(state!)
+                this.finishInitialization(sessionId, initialization!)
+            }
+
             try {
                 // The reservation was installed synchronously before this
                 // history load. A concurrent caller can queue, but cannot read
@@ -259,6 +339,11 @@ export class SessionStateRegistry {
                 }
 
                 if (initialization && state.sessionId !== sessionId) {
+                    if (options?.isActive && !options.isActive()) {
+                        if (operationSnapshot) restoreInitialization(state, operationSnapshot)
+                        this.discardInitialization(sessionId, createdInitialization)
+                        return undefined
+                    }
                     try {
                         await ensureSessionInitialized(
                             resolveSessionService(sessions),
@@ -268,10 +353,15 @@ export class SessionStateRegistry {
                             messages,
                             config,
                             this.projectDir,
+                            options?.effects,
                         )
-                        createdInitialization?.resolve(state)
-                        this.finishInitialization(sessionId, initialization)
+                        if (options?.isActive && !options.isActive()) {
+                            if (operationSnapshot) restoreInitialization(state, operationSnapshot)
+                            this.discardInitialization(sessionId, createdInitialization)
+                            return undefined
+                        }
                     } catch (error) {
+                        if (operationSnapshot) restoreInitialization(state, operationSnapshot)
                         createdInitialization?.reject(error)
                         throw error
                     }
@@ -285,9 +375,44 @@ export class SessionStateRegistry {
                 if (state.sessionId !== sessionId) {
                     throw new Error(`ACP: session ${sessionId} is not initialized`)
                 }
-                return await operation(state, history)
+                const result = await operation(state, history)
+                const committed =
+                    (options?.commitResult ? options.commitResult(result) : true) &&
+                    (options?.isActive ? options.isActive() : true)
+                if (!committed) {
+                    if (operationSnapshot) restoreInitialization(state, operationSnapshot)
+                    this.discardInitialization(sessionId, createdInitialization)
+                    return result
+                }
+
+                // Once the synchronous commit returns, the state and external
+                // result have been accepted.  A later effect/post-commit error
+                // must not roll that decision back (and must not strand a
+                // fresh initialization barrier).
+                try {
+                    if (options?.commit) options.commit(state, result)
+                    commitAccepted = true
+                    if (options?.postCommit) await options.postCommit(state, result)
+                } catch (error) {
+                    if (commitAccepted) finishCreatedInitialization()
+                    throw error
+                }
+
+                finishCreatedInitialization()
+                return result
             } catch (error) {
-                if (createdInitialization && this.states.get(sessionId) === state) {
+                // A failed operation or synchronous commit has not been
+                // accepted. Restore the complete live snapshot before removing
+                // a fresh placeholder.  If postCommit threw, its barrier was
+                // finalized above and the accepted state must remain visible.
+                if (!commitAccepted && this.states.get(sessionId) === state) {
+                    if (operationSnapshot) restoreInitialization(state, operationSnapshot)
+                }
+                if (
+                    !commitAccepted &&
+                    createdInitialization &&
+                    this.states.get(sessionId) === state
+                ) {
                     this.discardInitialization(sessionId, createdInitialization)
                 }
                 throw error
@@ -333,8 +458,12 @@ export class SessionStateRegistry {
         return (async () => {
             try {
                 await previous
+                this.activeWork.set(sessionId, (this.activeWork.get(sessionId) ?? 0) + 1)
                 return await operation()
             } finally {
+                const activeCount = (this.activeWork.get(sessionId) ?? 1) - 1
+                if (activeCount > 0) this.activeWork.set(sessionId, activeCount)
+                else this.activeWork.delete(sessionId)
                 const count = (this.guardedWork.get(sessionId) ?? 1) - 1
                 if (count > 0) this.guardedWork.set(sessionId, count)
                 else this.guardedWork.delete(sessionId)
@@ -496,6 +625,7 @@ export async function ensureSessionInitialized(
     messages: WithParts[],
     config?: PluginConfig,
     projectDir?: string,
+    effects?: DeferredMutationEffects,
 ): Promise<void> {
     const sessionService = resolveSessionService(sessions)
     if (state.sessionId === sessionId) {
@@ -519,7 +649,13 @@ export async function ensureSessionInitialized(
     state.currentTurn = countTurns(state, messages)
     state.nudges.turnNudgeAnchors = collectTurnNudgeAnchors(messages)
 
-    const persisted = await loadSessionState(sessionId, logger, state.storageDir)
+    const loadedPersisted = await loadSessionState(sessionId, logger, state.storageDir)
+    // Normalize legacy four-digit refs before loading prune blocks.  Boundary
+    // IDs live on CompressionBlock as well as in the bidirectional ref maps;
+    // doing this only in fork recovery leaves ordinary restarts with blocks
+    // that still point at stale m0001/m0002 boundaries.
+    const persisted =
+        loadedPersisted === null ? null : normalizePersistedMessageIds(loadedPersisted)
     if (persisted === null) {
         // No persisted boundary exists on this branch, so the current history
         // boundary is safe to carry into fork/replay persistence.
@@ -584,7 +720,8 @@ export async function ensureSessionInitialized(
             const rebuilt =
                 restored > 0 ? 0 : rebuildCompressionState(state, messages, config, logger)
             if (restored > 0 || rebuilt > 0) {
-                await saveSessionState(state, logger)
+                if (effects) effects.requestPersistence()
+                else await saveSessionState(state, logger)
             }
         }
         state.isSubAgent = isChildSession
@@ -615,11 +752,12 @@ export async function ensureSessionInitialized(
     }
 
     const persistedAny = persisted as any
-    if (persistedAny._persistedMessageIds) {
+    const persistedMessageIds = persisted.messageIds ?? persistedAny._persistedMessageIds
+    if (persistedMessageIds) {
         state.messageIds = {
-            byRawId: new Map(Object.entries(persistedAny._persistedMessageIds.byRawId || {})),
-            byRef: new Map(Object.entries(persistedAny._persistedMessageIds.byRef || {})),
-            nextRef: persistedAny._persistedMessageIds.nextRef || 1,
+            byRawId: new Map(Object.entries(persistedMessageIds.byRawId || {})),
+            byRef: new Map(Object.entries(persistedMessageIds.byRef || {})),
+            nextRef: persistedMessageIds.nextRef || 1,
         }
         // [FIX Bug 29] Auto-cleanup stale synthetic message refs from persistence.
         // This includes ACP-owned V2 command notices, which otherwise consume
@@ -662,9 +800,9 @@ export async function ensureSessionInitialized(
         }
     }
     const persistedCompaction =
-        typeof persistedAny._persistedLastCompaction === "number" &&
-        Number.isFinite(persistedAny._persistedLastCompaction)
-            ? persistedAny._persistedLastCompaction
+        typeof (persisted.lastCompaction ?? persistedAny._persistedLastCompaction) === "number" &&
+        Number.isFinite(persisted.lastCompaction ?? persistedAny._persistedLastCompaction)
+            ? (persisted.lastCompaction ?? persistedAny._persistedLastCompaction)
             : 0
     if (currentCompactionTimestamp > persistedCompaction) {
         // Compare only after loading the persisted transient state. Assigning
@@ -689,8 +827,10 @@ export async function ensureSessionInitialized(
 
     const applied = applyPendingCompressionDurations(state)
     if (applied > 0) {
-        await saveSessionState(state, logger)
+        if (effects) effects.requestPersistence()
+        else await saveSessionState(state, logger)
     }
     // [FIX Bug 1] Always save after initialization to persist messageIds + lastCompaction
-    await saveSessionState(state, logger)
+    if (effects) effects.requestPersistence()
+    else await saveSessionState(state, logger)
 }

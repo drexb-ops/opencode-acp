@@ -18,7 +18,7 @@ export type DeferredMutationEffect = () => void | Promise<void>
  * The transform and tool pipelines can update a working state freely, but
  * persistence and host-facing work must not run until that state has been
  * accepted. Keeping this object deliberately small also makes it usable by
- * the V1 adapter and the future V2 patch adapter.
+ * the V1 adapter and the V2 patch adapter.
  */
 export class DeferredMutationEffects {
     private readonly pending: DeferredMutationEffect[] = []
@@ -36,10 +36,11 @@ export class DeferredMutationEffects {
         this.pending.push(effect)
     }
 
-    async run(): Promise<void> {
-        const effects = this.pending.splice(0)
+    async run(isActive?: () => boolean): Promise<void> {
         let firstError: unknown
-        for (const effect of effects) {
+        while (this.pending.length > 0) {
+            const effect = this.pending.shift()!
+            if (isActive && !isActive()) continue
             try {
                 await effect()
             } catch (error) {

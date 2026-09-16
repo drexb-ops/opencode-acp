@@ -51,8 +51,8 @@ export interface NoticeMetadata {
 
 /**
  * An ACP-owned notice is visible to the user but must not resume a model turn.
- * V1 implements this with an ignored/no-reply prompt; V2 will use a synthetic
- * non-resuming message in a later phase.
+ * V1 implements this with an ignored/no-reply prompt; V2 uses a synthetic
+ * non-resuming message.
  */
 export interface NoticeInput {
     sessionID: string

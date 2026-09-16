@@ -181,6 +181,11 @@ export const setup: V2Api.Plugin["setup"] = async (context) => {
         )
 
         const timing = createV2CompressionTimingHandlers(registry, logger, operations)
+        // Timing maps are registry-owned and may outlive a hook callback.  The
+        // handler tracks the keys created by this setup instance so unload can
+        // discard an execute-before entry without touching a later instance's
+        // unrelated work.
+        resources.push(() => timing.dispose())
         ownRegistration(
             resources,
             await context.tool.hook("execute.before", async (event) => {
@@ -196,13 +201,50 @@ export const setup: V2Api.Plugin["setup"] = async (context) => {
             }),
         )
 
-        const monitor = startV2ProxyMonitor(context, proxyState, logger, async () => {
-            if (disposed) return
-            await operations.run("proxy", async () => {
+        const runtimeLogger = logger
+        const monitor = startV2ProxyMonitor(
+            context,
+            proxyState,
+            runtimeLogger,
+            async (_nextDisabled, previousDisabled) => {
                 if (disposed) return
-                await Promise.all([context.tool.reload(), context.command.reload()])
-            })
-        })
+                await operations.run("proxy", async (lease) => {
+                    if (disposed) return
+                    const reloadDomains = () => [
+                        Promise.resolve().then(() => context.tool.reload()),
+                        Promise.resolve().then(() => context.command.reload()),
+                    ]
+                    const forward = await Promise.allSettled([...reloadDomains()])
+                    const failed = forward.find(
+                        (result): result is PromiseRejectedResult => result.status === "rejected",
+                    )
+                    if (!failed) return
+
+                    // A domain reload is not transactional in V2. If either reload
+                    // succeeds before its sibling fails, restore the old disabled
+                    // state and replay both domains so they converge before the
+                    // monitor reports failure. The monitor leaves its catalog event
+                    // retryable because proxyState is restored as well.
+                    proxyState.disabled = previousDisabled
+                    if (lease.isActive()) {
+                        const compensation = await Promise.allSettled([...reloadDomains()])
+                        const compensationFailure = compensation.find(
+                            (result): result is PromiseRejectedResult =>
+                                result.status === "rejected",
+                        )
+                        if (compensationFailure) {
+                            runtimeLogger.warn("V2 ACP catalog reload compensation failed", {
+                                error:
+                                    compensationFailure.reason instanceof Error
+                                        ? compensationFailure.reason.message
+                                        : String(compensationFailure.reason),
+                            })
+                        }
+                    }
+                    throw failed.reason
+                })
+            },
+        )
         stopProxyMonitor = () => monitor.stop()
 
         stopAutoUpdate = startAutoUpdate(notifications, config.autoUpdate, logger)

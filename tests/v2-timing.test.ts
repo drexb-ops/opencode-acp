@@ -171,3 +171,34 @@ test("V2 timing keeps same message/call IDs independent across sessions", async 
         rmSync(storageTwo, { recursive: true, force: true })
     }
 })
+
+test("V2 timing disposal clears only this instance's starts and pending entries", async () => {
+    const logger = new Logger(false, "silent")
+    const registry = new SessionStateRegistry(logger, "/tmp/v2-timing")
+    const handlers = createV2CompressionTimingHandlers(registry, logger)
+    const future = "session:message:future"
+
+    handlers.before({
+        tool: "compress",
+        sessionID: "session",
+        messageID: "message",
+        id: "owned",
+    })
+    registry.compressionTiming.startsByCallId.set(future, 20)
+    registry.compressionTiming.pendingByCallId.set(future, {
+        messageId: "future-message",
+        callId: "future-call",
+        durationMs: 30,
+    })
+    const owned = [...registry.compressionTiming.startsByCallId.keys()].find(
+        (key) => key !== future,
+    )
+    assert.ok(owned)
+
+    handlers.dispose()
+
+    assert.equal(registry.compressionTiming.startsByCallId.has(owned!), false)
+    assert.equal(registry.compressionTiming.pendingByCallId.has(owned!), false)
+    assert.equal(registry.compressionTiming.startsByCallId.get(future), 20)
+    assert.equal(registry.compressionTiming.pendingByCallId.get(future)?.durationMs, 30)
+})

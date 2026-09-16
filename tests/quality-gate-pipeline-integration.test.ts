@@ -6,7 +6,11 @@ import type { PluginConfig } from "../lib/config"
 import { Logger } from "../lib/logger"
 import { createSessionState, type WithParts, type CompressionBlock } from "../lib/state"
 import { evaluateBatchQuality, evaluateBlockQuality } from "../lib/compress/quality-gate"
-import { registerQualityGate, clearQualityGateRegistryForTests, listQualityGates } from "../lib/compress/quality-gate/registry"
+import {
+    registerQualityGate,
+    clearQualityGateRegistryForTests,
+    listQualityGates,
+} from "../lib/compress/quality-gate/registry"
 import { ensureBuiltinGatesRegistered } from "../lib/compress/quality-gate/algorithms"
 import type { QualityGate } from "../lib/compress/quality-gate/types"
 import type { NotificationEntry } from "../lib/compress/pipeline"
@@ -19,7 +23,7 @@ const stubGate: QualityGate = {
     description: "Stub gate for pipeline integration tests — fails L1 when summary < minChars",
 
     evaluate(ctx, rawConfig) {
-        const cfg = (rawConfig as { minChars?: number } | null | undefined)
+        const cfg = rawConfig as { minChars?: number } | null | undefined
         const minChars = cfg?.minChars ?? 200
         const metrics = [
             { name: "summaryLen", value: ctx.summary.length },
@@ -45,10 +49,12 @@ function buildConfig(qualityGateEnabled: boolean): PluginConfig {
         enabled: true,
         autoUpdate: true,
         debug: false,
+        logLevel: "info",
+        allowSubAgents: true,
         pruneNotification: "off",
         pruneNotificationType: "chat",
         commands: { enabled: true, protectedTools: [] },
-        experimental: { allowSubAgents: false, customPrompts: false },
+        experimental: { customPrompts: false },
         protectedFilePatterns: [],
         compress: {
             permission: "allow",
@@ -80,10 +86,16 @@ function buildConfig(qualityGateEnabled: boolean): PluginConfig {
                 },
             },
         },
+        messageFilters: { enabled: false, filters: {} },
     }
 }
 
-function makeBlock(blockId: number, summary: string, directMessageIds: string[], compressedTokens = 1000): CompressionBlock {
+function makeBlock(
+    blockId: number,
+    summary: string,
+    directMessageIds: string[],
+    compressedTokens = 1000,
+): CompressionBlock {
     return {
         blockId,
         runId: 1,
@@ -151,8 +163,15 @@ test("evaluateBlockQuality runs gate when enabled", () => {
     const state = createSessionState()
     const block = makeBlock(1, "x".repeat(50), ["msg-1"], 10000)
     installBlock(state, block)
-    const rawMessages: WithParts[] = [makeTextMessage("msg-1", "original content with technical keywords")]
-    const entry: NotificationEntry = { blockId: 1, runId: 1, summary: "x".repeat(50), summaryTokens: 13 }
+    const rawMessages: WithParts[] = [
+        makeTextMessage("msg-1", "original content with technical keywords"),
+    ]
+    const entry: NotificationEntry = {
+        blockId: 1,
+        runId: 1,
+        summary: "x".repeat(50),
+        summaryTokens: 13,
+    }
 
     const result = evaluateBlockQuality(state, rawMessages, entry, buildConfig(true), logger)
     assert.ok(result, "should produce a result when enabled")
@@ -165,7 +184,12 @@ test("evaluateBlockQuality returns null when block not in state", () => {
     registerQualityGate(stubGate)
     const state = createSessionState()
     const rawMessages: WithParts[] = []
-    const entry: NotificationEntry = { blockId: 999, runId: 1, summary: "missing", summaryTokens: 2 }
+    const entry: NotificationEntry = {
+        blockId: 999,
+        runId: 1,
+        summary: "missing",
+        summaryTokens: 2,
+    }
 
     const result = evaluateBlockQuality(state, rawMessages, entry, buildConfig(true), logger)
     assert.equal(result, null)
@@ -178,7 +202,12 @@ test("evaluateBlockQuality returns null when block has no direct messages", () =
     const block = makeBlock(1, "x".repeat(500), [])
     installBlock(state, block)
     const rawMessages: WithParts[] = []
-    const entry: NotificationEntry = { blockId: 1, runId: 1, summary: "x".repeat(500), summaryTokens: 125 }
+    const entry: NotificationEntry = {
+        blockId: 1,
+        runId: 1,
+        summary: "x".repeat(500),
+        summaryTokens: 125,
+    }
 
     const result = evaluateBlockQuality(state, rawMessages, entry, buildConfig(true), logger)
     assert.equal(result, null, "blocks with no direct messages have no original to compare")
@@ -221,12 +250,20 @@ test("evaluateBlockQuality extracts tool-call content from messages", () => {
             ],
         } as any,
     ]
-    const entry: NotificationEntry = { blockId: 1, runId: 1, summary: "x".repeat(500), summaryTokens: 125 }
+    const entry: NotificationEntry = {
+        blockId: 1,
+        runId: 1,
+        summary: "x".repeat(500),
+        summaryTokens: 125,
+    }
 
     const result = evaluateBlockQuality(state, rawMessages, entry, buildConfig(true), logger)
     assert.ok(result)
     const metrics = Object.fromEntries(result!.metrics.map((m) => [m.name, m.value]))
-    assert.ok(metrics.stubMetric !== undefined, "L2 metrics should be present when originalText is non-empty")
+    assert.ok(
+        metrics.stubMetric !== undefined,
+        "L2 metrics should be present when originalText is non-empty",
+    )
 })
 
 test("evaluateBatchQuality: empty entries → empty report", () => {
@@ -344,13 +381,22 @@ test("evaluateBlockQuality returns null when algorithm not registered", () => {
     const block = makeBlock(1, "x".repeat(500), ["msg-1"])
     installBlock(state, block)
     const rawMessages: WithParts[] = [makeTextMessage("msg-1", "content")]
-    const entry: NotificationEntry = { blockId: 1, runId: 1, summary: "x".repeat(500), summaryTokens: 125 }
+    const entry: NotificationEntry = {
+        blockId: 1,
+        runId: 1,
+        summary: "x".repeat(500),
+        summaryTokens: 125,
+    }
 
     const cfg = buildConfig(true)
     cfg.qualityGate!.algorithm = "nonexistent-algorithm"
 
     const result = evaluateBlockQuality(state, rawMessages, entry, cfg, logger)
-    assert.equal(result, null, "missing algorithm in registry should return null (logged as warning)")
+    assert.equal(
+        result,
+        null,
+        "missing algorithm in registry should return null (logged as warning)",
+    )
 })
 
 test("evaluateBlockQuality treats a throwing gate as pass (defensive)", () => {
@@ -368,14 +414,23 @@ test("evaluateBlockQuality treats a throwing gate as pass (defensive)", () => {
     const block = makeBlock(1, "x".repeat(500), ["msg-1"])
     installBlock(state, block)
     const rawMessages: WithParts[] = [makeTextMessage("msg-1", "content")]
-    const entry: NotificationEntry = { blockId: 1, runId: 1, summary: "x".repeat(500), summaryTokens: 125 }
+    const entry: NotificationEntry = {
+        blockId: 1,
+        runId: 1,
+        summary: "x".repeat(500),
+        summaryTokens: 125,
+    }
 
     const cfg = buildConfig(true)
     cfg.qualityGate!.algorithm = "throwing-stub"
 
     const result = evaluateBlockQuality(state, rawMessages, entry, cfg, logger)
     assert.ok(result)
-    assert.equal(result!.passed, true, "throwing gate must be treated as pass to not break pipeline")
+    assert.equal(
+        result!.passed,
+        true,
+        "throwing gate must be treated as pass to not break pipeline",
+    )
     assert.equal(result!.metrics.length, 0)
 })
 
@@ -383,7 +438,10 @@ test("ensureBuiltinGatesRegistered auto-registers rouge-recall-v1 from context-c
     clearQualityGateRegistryForTests()
     ensureBuiltinGatesRegistered()
     const registered = listQualityGates()
-    assert.ok(registered.includes("rouge-recall-v1"), "rouge-recall-v1 should be auto-registered from context-compress-algorithms package")
+    assert.ok(
+        registered.includes("rouge-recall-v1"),
+        "rouge-recall-v1 should be auto-registered from context-compress-algorithms package",
+    )
 
     ensureBuiltinGatesRegistered()
     const stillOnce = listQualityGates().filter((n) => n === "rouge-recall-v1").length
@@ -396,8 +454,15 @@ test("evaluateBlockQuality end-to-end with real rouge-recall-v1 from context-com
     const state = createSessionState()
     const block = makeBlock(1, "x".repeat(50), ["msg-1"], 10000)
     installBlock(state, block)
-    const rawMessages: WithParts[] = [makeTextMessage("msg-1", "original content with technical keywords")]
-    const entry: NotificationEntry = { blockId: 1, runId: 1, summary: "x".repeat(50), summaryTokens: 13 }
+    const rawMessages: WithParts[] = [
+        makeTextMessage("msg-1", "original content with technical keywords"),
+    ]
+    const entry: NotificationEntry = {
+        blockId: 1,
+        runId: 1,
+        summary: "x".repeat(50),
+        summaryTokens: 13,
+    }
 
     const cfg = buildConfig(true)
     cfg.qualityGate!.algorithm = "rouge-recall-v1"
@@ -406,7 +471,7 @@ test("evaluateBlockQuality end-to-end with real rouge-recall-v1 from context-com
             layer1MinChars: 200,
             layer1MinRetentionPct: 1.0,
             layer2MaxRougeF1: 0.05,
-            layer2MaxTop20Recall: 0.20,
+            layer2MaxTop20Recall: 0.2,
         },
     }
 

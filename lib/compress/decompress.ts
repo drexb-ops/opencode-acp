@@ -35,6 +35,147 @@ import {
     buildRestoredContentPreview,
 } from "./decompress-logic"
 import { formatTokenCount } from "../ui/utils"
+import { constants as fsConstants } from "node:fs"
+import { lstat, open, realpath } from "node:fs/promises"
+import { homedir, tmpdir } from "node:os"
+import { dirname, isAbsolute, relative, resolve } from "node:path"
+
+interface AllowedWriteRoot {
+    lexical: string
+    canonical: string
+}
+
+/**
+ * Return the platform's no-follow flag or fail closed.  Silently omitting the
+ * flag would turn a safe write into a symlink-following write on a platform
+ * whose Node build does not expose the primitive.
+ */
+export function requireNoFollowFlag(value?: unknown): number {
+    const candidate = arguments.length === 0 ? fsConstants.O_NOFOLLOW : value
+    if (typeof candidate !== "number" || !Number.isSafeInteger(candidate) || candidate <= 0) {
+        throw new Error("safe decompression writes require a numeric, nonzero O_NOFOLLOW flag")
+    }
+    return candidate
+}
+
+function effectiveUid(): number | undefined {
+    return typeof process.geteuid === "function" ? process.geteuid() : undefined
+}
+
+function requireOwnedByCurrentUser(uid: number | undefined, path: string, owner: number): void {
+    if (uid !== undefined && owner !== uid) {
+        throw new Error(`${path} is not owned by the current user`)
+    }
+}
+
+function isWithinDirectory(directory: string, candidate: string): boolean {
+    const rel = relative(directory, candidate)
+    return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))
+}
+
+async function allowedWriteRoots(): Promise<AllowedWriteRoot[]> {
+    const roots = [tmpdir(), resolve(homedir(), ".cache", "opencode")]
+    const result: AllowedWriteRoot[] = []
+    for (const lexical of roots) {
+        try {
+            const stats = await lstat(lexical)
+            if (!stats.isDirectory() || stats.isSymbolicLink()) continue
+            result.push({ lexical, canonical: await realpath(lexical) })
+        } catch {
+            // An absent cache root is not created as a side effect of a tool
+            // call.  The /tmp root normally exists on supported hosts.
+        }
+    }
+    return result
+}
+
+/** Reject symlink components in the existing parent chain of a destination. */
+async function rejectSymlinkParents(root: string, parent: string): Promise<void> {
+    const rel = relative(root, parent)
+    if (rel === "") return
+    if (rel.startsWith("..") || isAbsolute(rel)) {
+        throw new Error("destination parent is outside the allowed root")
+    }
+
+    let current = root
+    const uid = effectiveUid()
+    for (const component of rel.split(/[\\/]+/u).filter(Boolean)) {
+        current = resolve(current, component)
+        const stats = await lstat(current)
+        if (stats.isSymbolicLink()) {
+            throw new Error("destination parent contains a symbolic-link component")
+        }
+        if (!stats.isDirectory()) {
+            throw new Error("destination parent is not a directory")
+        }
+        requireOwnedByCurrentUser(uid, "destination parent", stats.uid)
+    }
+}
+
+/**
+ * Write a decompressed payload without following a path outside ACP's two
+ * explicitly permitted roots.  Parent directories must already exist; the
+ * final open uses O_NOFOLLOW as the last line of defence against a symlink
+ * appearing after validation. Node's public fs API does not expose openat, so
+ * a same-UID process replacing a validated parent after the final lstat is
+ * outside this helper's threat boundary.
+ */
+export async function writeDecompressedFileSafely(
+    targetPath: string,
+    content: string,
+    isActive: () => boolean = () => true,
+): Promise<boolean> {
+    const noFollowFlag = requireNoFollowFlag()
+    const resolvedPath = resolve(targetPath)
+    const parent = dirname(resolvedPath)
+    const roots = await allowedWriteRoots()
+    const root = roots.find((candidate) => isWithinDirectory(candidate.lexical, resolvedPath))
+    if (!root) {
+        throw new Error(
+            `toFile path must be under ${tmpdir()} or ~/.cache/opencode/. Got: ${targetPath}`,
+        )
+    }
+
+    let canonicalParent: string
+    try {
+        canonicalParent = await realpath(parent)
+    } catch {
+        throw new Error("toFile destination parent must already exist")
+    }
+    if (!isWithinDirectory(root.canonical, canonicalParent)) {
+        throw new Error("toFile destination resolves outside the allowed root")
+    }
+    // Check lexical components as well as canonical containment.  This rejects
+    // an intermediate symlink that happens to point back inside the root.
+    await rejectSymlinkParents(root.lexical, parent)
+
+    try {
+        const existing = await lstat(resolvedPath)
+        if (existing.isSymbolicLink()) {
+            throw new Error("toFile destination must not be a symbolic link")
+        }
+        if (!existing.isFile()) {
+            throw new Error("toFile destination must be a regular file")
+        }
+        requireOwnedByCurrentUser(effectiveUid(), "toFile destination", existing.uid)
+    } catch (error) {
+        // ENOENT is the expected case for a new file.  Any other lstat failure
+        // is surfaced rather than turning an inaccessible path into a write.
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+    }
+
+    // This is intentionally immediately before the no-follow open.  V2 staged
+    // effects can be cancelled while the parent-chain checks are awaiting.
+    if (!isActive()) return false
+    const flags = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | noFollowFlag
+    const handle = await open(resolvedPath, flags, 0o600)
+    try {
+        await handle.writeFile(content, "utf8")
+    } finally {
+        await handle.close()
+    }
+    return true
+}
 
 async function prepareDecompressSession(
     ctx: ToolContext,
@@ -59,6 +200,8 @@ async function prepareDecompressSession(
         ctx.logger,
         rawMessages,
         ctx.config,
+        undefined,
+        ctx.effects,
     )
 
     assignMessageRefs(ctx.state, rawMessages)
@@ -67,6 +210,10 @@ async function prepareDecompressSession(
 }
 
 async function finalizeDecompressSession(ctx: ToolContext): Promise<void> {
+    if (ctx.effects) {
+        ctx.effects.requestPersistence()
+        return
+    }
     await saveSessionState(ctx.state, ctx.logger)
 }
 
@@ -317,21 +464,6 @@ export function createDecompressToolDefinition(
 
                 if (args.toFile) {
                     const targetPath = args.toFile
-                    const os = await import("os")
-                    const path = await import("path")
-                    const allowedDirs = [
-                        os.tmpdir() + "/",
-                        path.join(os.homedir(), ".cache", "opencode") + "/",
-                    ]
-                    const resolvedPath = path.resolve(targetPath)
-                    const isAllowed = allowedDirs.some((dir) => {
-                        const rel = path.relative(dir, resolvedPath)
-                        return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel))
-                    })
-                    if (!isAllowed) {
-                        return `Error: toFile path must be under ${os.tmpdir()} or ~/.cache/opencode/. Got: ${targetPath}`
-                    }
-
                     const msgIdSet = new Set<string>()
                     for (const block of activeBlocks) {
                         for (const id of block.effectiveMessageIds ?? []) {
@@ -342,12 +474,18 @@ export function createDecompressToolDefinition(
                         msgIdSet.has(extractMessageId(m)),
                     )
                     const lines = blockMessages.map(extractMessageText)
-                    const { writeFile } = await import("fs/promises")
                     const fileContent =
                         lines.length > 0
                             ? lines.join("\n\n---\n\n")
                             : (targets[0]?.blocks[0]?.summary ?? "(no content available)")
-                    await writeFile(targetPath, fileContent, "utf-8")
+                    if (ctx.effects) {
+                        ctx.effects.defer(async () => {
+                            if (ctx.isActive && !ctx.isActive()) return
+                            await writeDecompressedFileSafely(targetPath, fileContent, ctx.isActive)
+                        })
+                    } else {
+                        await writeDecompressedFileSafely(targetPath, fileContent)
+                    }
 
                     const displayIds = targets.map((t) => `b${t.displayId}`).join(", ")
                     return `Block(s) ${displayIds} content (${blockMessages.length} messages, ${fileContent.length} chars) written to ${targetPath}. Block(s) stay compressed — context unchanged. Use read tool to access specific parts.`

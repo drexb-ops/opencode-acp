@@ -398,7 +398,14 @@ export function addPointer(
     const part =
         pointer.contentIndex === undefined ? undefined : aiContent(message)[pointer.contentIndex]
     if (part !== undefined) {
-        origin.originalContent.push({ pointer, part })
+        origin.originalContent.push({
+            pointer,
+            part,
+            // Keep provenance bounded even when a provider part contains a
+            // very large text/metadata payload.  Opaque parts intentionally
+            // use identity only and never pay this hashing cost.
+            ...(origin.opaque ? {} : { fingerprint: hash(part) }),
+        })
     }
     const protectedFields = ["cache", "providerMetadata", "metadata", "native", "encrypted"]
     const partRecord: Record<string, unknown> | undefined = isRecord(part)

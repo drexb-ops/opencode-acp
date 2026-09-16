@@ -42,6 +42,8 @@ export interface V2OriginalContentReference {
     pointer: V2OutgoingPointer
     /** Exact lowered content object observed during normalization. */
     part: AiContentPart
+    /** Frozen value fingerprint for patchable content (opaque content uses identity). */
+    fingerprint?: string
 }
 
 export interface V2ContentOrigin {
@@ -63,7 +65,8 @@ export interface V2ContentOrigin {
     representableInput?: boolean
     representableOutput?: boolean
     normalizedText?: string
-    normalizedInput?: string
+    /** Bounded comparison fingerprint for potentially large tool input. */
+    normalizedInputHash?: string
     normalizedOutput?: string
     normalizedError?: string
     normalizedToolName?: string

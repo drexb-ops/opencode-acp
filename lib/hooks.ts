@@ -74,10 +74,11 @@ export async function prepareMessageTransformTransaction(
     modelLimitKnown: boolean | undefined,
     debugNotify?: (text: string) => void | Promise<void>,
     sanitizeAssistantTextOnly = false,
+    effects?: DeferredMutationEffects,
 ): Promise<PreparedMessageTransformTransaction> {
     const workingMessages = structuredClone(messages) as WithParts[]
     const workingState = cloneSessionState(state)
-    const effects = new DeferredMutationEffects()
+    const transactionEffects = effects ?? new DeferredMutationEffects()
     prompts.reload()
     ensureBuiltinFiltersRegistered()
 
@@ -91,13 +92,13 @@ export async function prepareMessageTransformTransaction(
         {
             requestModelLimit,
             modelLimitKnown,
-            effects,
+            effects: transactionEffects,
             debugNotify,
             sanitizeAssistantTextOnly,
         },
     )
 
-    return { workingMessages, workingState, effects }
+    return { workingMessages, workingState, effects: transactionEffects }
 }
 
 export async function commitPreparedMessageTransformTransaction(
@@ -106,10 +107,11 @@ export async function commitPreparedMessageTransformTransaction(
     logger: Logger,
     messages?: WithParts[],
     isActive?: () => boolean,
+    flushEffects = true,
 ): Promise<void> {
-    if (isActive && !isActive()) return
-    commitSessionState(state, prepared.workingState)
-    if (messages) messages.splice(0, messages.length, ...prepared.workingMessages)
+    if (!commitPreparedMessageTransformState(prepared, state, messages, isActive)) return
+
+    if (!flushEffects) return
 
     // Disposal can begin while a host persistence write is in flight. The
     // state/event commit above is already atomic; do not start any deferred
@@ -134,6 +136,19 @@ export async function commitPreparedMessageTransformTransaction(
             error: error instanceof Error ? error.message : String(error),
         })
     }
+}
+
+/** Commit the prepared state/message values synchronously, without flushing effects. */
+export function commitPreparedMessageTransformState(
+    prepared: PreparedMessageTransformTransaction,
+    state: SessionState,
+    messages?: WithParts[],
+    isActive?: () => boolean,
+): boolean {
+    if (isActive && !isActive()) return false
+    commitSessionState(state, prepared.workingState)
+    if (messages) messages.splice(0, messages.length, ...prepared.workingMessages)
+    return true
 }
 
 async function runMessageTransformTransaction(

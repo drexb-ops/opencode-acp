@@ -95,6 +95,7 @@ async function resolveToolPermission(
     host: V2HostAdapter,
     hostPermissions: HostPermissionSnapshot,
     context: V2ToolContext,
+    isActive: () => boolean = () => true,
 ): Promise<"ask" | "allow" | "deny"> {
     const basePermission = factoryCtx.config.compress.permission
     if (basePermission === "deny") {
@@ -107,6 +108,7 @@ async function resolveToolPermission(
 
     try {
         const rules = await host.agentPermissions(context.agent)
+        if (!isActive()) return "deny"
         hostPermissions.v2Agents = {
             ...(hostPermissions.v2Agents ?? {}),
             [context.agent]: rules,
@@ -115,6 +117,7 @@ async function resolveToolPermission(
     } catch {
         // V2 has no supported permission-request fallback. Unknown policy is
         // therefore denied before the shared definition or session guard runs.
+        if (!isActive()) return "deny"
         hostPermissions.v2Agents = {
             ...(hostPermissions.v2Agents ?? {}),
             [context.agent]: [{ action: "*", resource: "*", effect: "deny" }],
@@ -178,6 +181,7 @@ function toSharedContext(
             progress({ ...input })
         },
         progress,
+        isActive,
     }
 }
 
@@ -234,6 +238,7 @@ export function createV2Tool<Schema extends AnyToolSchema>(
                         host,
                         hostPermissions,
                         context,
+                        isActive,
                     )
                 } catch (error) {
                     return errorResult(
@@ -286,6 +291,9 @@ export function createV2Tool<Schema extends AnyToolSchema>(
                     return toV2Result(result)
                 } catch (error) {
                     if (progressTasks.length > 0) await Promise.allSettled(progressTasks)
+                    if (!isActive()) {
+                        return errorResult(LIFECYCLE_DENY_MESSAGE, { acpError: "inactive" })
+                    }
                     return errorResult(`ACP ${definition.name} failed: ${errorMessage(error)}`, {
                         acpError: "execution",
                         tool: definition.name,

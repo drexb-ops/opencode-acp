@@ -59,7 +59,6 @@ interface RequestObservation {
     acpOwnedNoticePresent?: boolean
     calledToolNames?: string[]
     toolResultStatuses?: Array<{
-        id?: string
         name?: string
         status: "completed" | "error"
         actionable?: boolean
@@ -70,7 +69,6 @@ interface ObservationData {
     requests: RequestObservation[]
     emittedTools: string[]
     toolResults: Array<{
-        id?: string
         name?: string
         status: "completed" | "error"
         actionable?: boolean

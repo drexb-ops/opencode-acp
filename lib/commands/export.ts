@@ -22,6 +22,7 @@ import type { PluginConfig } from "../config"
 import type { NoticeSink } from "../host"
 import type { CompressionBlock, CompressionTier, SessionState, WithParts } from "../state/types"
 import { sendIgnoredMessage } from "../ui/notification"
+import type { DeferredMutationEffect } from "../state/transaction"
 
 const ALL_TIERS: CompressionTier[] = [1, 2, 3]
 
@@ -39,6 +40,8 @@ export interface ExportCommandContext {
     sessionId: string
     messages: WithParts[]
     workingDirectory: string
+    defer?: (effect: DeferredMutationEffect) => void
+    isActive?: () => boolean
 }
 
 export interface ExportOptions {
@@ -356,11 +359,14 @@ export async function handleExportCommand(ctx: ExportCommandContext, args: strin
                 : resolve(cwd, options.outputPath)
             : resolveDefaultOutputPath(sessionId, cwd)
 
-    try {
+    const writeExport = async (): Promise<void> => {
+        if (ctx.isActive && !ctx.isActive()) return
         const dir = dirname(targetPath)
         if (!existsSync(dir)) {
+            if (ctx.isActive && !ctx.isActive()) return
             await fs.mkdir(dir, { recursive: true })
         }
+        if (ctx.isActive && !ctx.isActive()) return
         const flag = options.append ? "a" : "w"
         if (options.append && existsSync(targetPath)) {
             // Separate repeated exports with a clear boundary.
@@ -368,25 +374,45 @@ export async function handleExportCommand(ctx: ExportCommandContext, args: strin
         } else {
             await fs.writeFile(targetPath, markdown, { flag, encoding: "utf-8" })
         }
-    } catch (err: any) {
-        const msg = err?.message ?? String(err)
+        if (ctx.isActive && !ctx.isActive()) return
+        logger.info("export: wrote markdown", {
+            path: targetPath,
+            blocks: blocks.length,
+            tiers: tiers.size ? [...tiers].sort().join(",") : "all",
+        })
+
+        const summary = formatExportSummary(targetPath, blocks, allActive, generatedAt)
+        await sendExportNotice(sessionId, ctx, summary)
+    }
+
+    if (ctx.defer) {
+        ctx.defer(async () => {
+            try {
+                await writeExport()
+            } catch (err: unknown) {
+                const msg = err instanceof Error ? err.message : String(err)
+                logger.warn("export: file write failed", { path: targetPath, error: msg })
+                await sendExportNotice(
+                    sessionId,
+                    ctx,
+                    `[ACP Export] Failed to write \`${targetPath}\`: ${msg}`,
+                )
+            }
+        })
+        return
+    }
+
+    try {
+        await writeExport()
+    } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err)
         logger.warn("export: file write failed", { path: targetPath, error: msg })
         await sendExportNotice(
             sessionId,
             ctx,
             `[ACP Export] Failed to write \`${targetPath}\`: ${msg}`,
         )
-        return
     }
-
-    logger.info("export: wrote markdown", {
-        path: targetPath,
-        blocks: blocks.length,
-        tiers: tiers.size ? [...tiers].sort().join(",") : "all",
-    })
-
-    const summary = formatExportSummary(targetPath, blocks, allActive, generatedAt)
-    await sendExportNotice(sessionId, ctx, summary)
 }
 
 function formatExportSummary(

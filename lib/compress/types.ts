@@ -4,6 +4,14 @@ import { createLegacyHostServices } from "../host/legacy"
 import type { Logger } from "../logger"
 import type { PromptStore } from "../prompts/store"
 import type { CompressionBlock, CompressionMode, SessionState, WithParts } from "../state"
+import {
+    cloneSessionState,
+    commitSessionState,
+    DeferredMutationEffects,
+} from "../state/transaction"
+import { saveSessionState } from "../state/persistence"
+import type { PendingCompressionDuration } from "./timing"
+import { QualityGateRejectionError } from "./quality-gate/rejection"
 import type { z } from "zod"
 
 export interface ToolContext {
@@ -17,6 +25,10 @@ export interface ToolContext {
     logger: Logger
     config: PluginConfig
     prompts: PromptStore
+    /** V2-only speculative effects, committed after the working state is accepted. */
+    effects?: DeferredMutationEffects
+    /** V2 lifecycle authorization checked before state/effect commits. */
+    isActive?: () => boolean
 }
 
 export interface ToolFactoryContext {
@@ -58,6 +70,8 @@ export interface ToolExecutionContext {
     ask(input: ToolAskInput): Promise<void>
     metadata(input: { title?: string; metadata?: Record<string, unknown> }): void
     progress?(input: { title?: string; status?: string }): Promise<void> | void
+    /** V2 lifecycle fence. V1 leaves this undefined to preserve direct behavior. */
+    isActive?: () => boolean
 }
 
 export type SharedToolResult =
@@ -103,6 +117,7 @@ export function resolveToolContext(
     factoryCtx: ToolFactoryContext,
     sessionID: string,
     stateOverride?: SessionState,
+    transaction?: { effects: DeferredMutationEffects; isActive: () => boolean },
 ): ToolContext {
     const host = resolveFactoryHost(factoryCtx)
     const state = stateOverride ?? factoryCtx.registry.get(sessionID)
@@ -112,16 +127,34 @@ export function resolveToolContext(
                 "messages.transform must run before a compress tool call.",
         )
     }
+    const notices = transaction
+        ? {
+              send: async (input: Parameters<HostServices["notices"]["send"]>[0]) => {
+                  if (!transaction.isActive()) return
+                  await host.notices.send(input)
+              },
+          }
+        : host.notices
+    const notifications = transaction
+        ? {
+              notify: (input: Parameters<HostServices["notifications"]["notify"]>[0]) => {
+                  if (!transaction.isActive()) return
+                  return host.notifications.notify(input)
+              },
+          }
+        : host.notifications
     return {
         host,
         sessions: host.sessions,
         models: host.models,
-        notices: host.notices,
-        notifications: host.notifications,
+        notices,
+        notifications,
         state,
         logger: factoryCtx.logger,
         config: factoryCtx.config,
         prompts: factoryCtx.prompts,
+        effects: transaction?.effects,
+        isActive: transaction?.isActive,
     }
 }
 
@@ -137,12 +170,81 @@ export async function withToolSessionMutation<T>(
     toolCtx: ToolExecutionContext,
     operation: (ctx: ToolContext) => Promise<T> | T,
 ): Promise<T> {
-    const run = (state: SessionState) =>
-        operation(resolveToolContext(factoryCtx, toolCtx.sessionID, state))
+    const active = toolCtx.isActive
+    const run = async (state: SessionState): Promise<T> => {
+        // V1 does not provide a lifecycle fence. Keep its historical live-state
+        // behavior and avoid introducing a transaction boundary into that path.
+        if (!active) return operation(resolveToolContext(factoryCtx, toolCtx.sessionID, state))
+        if (!active()) throw new Error("ACP tool operation is no longer active")
+
+        const working = cloneSessionState(state)
+        const pendingTimingBefore = new Map(
+            [...state.compressionTiming.pendingByCallId].map(([key, entry]) => [
+                key,
+                { entry, snapshot: { ...entry } },
+            ]),
+        )
+        const startsBefore = new Map(state.compressionTiming.startsByCallId)
+        const effects = new DeferredMutationEffects()
+        const context = resolveToolContext(factoryCtx, toolCtx.sessionID, working, {
+            effects,
+            isActive: active,
+        })
+        let result: T
+        try {
+            result = await operation(context)
+        } catch (error) {
+            restoreSharedTiming(state, pendingTimingBefore, startsBefore)
+            // A quality rejection is deliberately retryable.  Keep only its
+            // retry marker on the live V2 state; all other working-state,
+            // timing, persistence, and host effects stay speculative.  V1 has
+            // no lifecycle fence and therefore retains its historical behavior.
+            if (error instanceof QualityGateRejectionError && active()) {
+                state.qualityGateRetryPending = true
+            }
+            throw error
+        }
+        if (!active()) {
+            restoreSharedTiming(state, pendingTimingBefore, startsBefore)
+            return result
+        }
+
+        commitSessionState(state, working)
+        if (!active()) return result
+        if (effects.persistenceRequested) {
+            if (!active()) return result
+            await saveSessionState(working, context.logger)
+        }
+        if (!active()) return result
+        await effects.run(active)
+        return result
+    }
     if (factoryCtx.registry.withSessionMutation) {
         return factoryCtx.registry.withSessionMutation(toolCtx.sessionID, run)
     }
     return run(resolveToolContext(factoryCtx, toolCtx.sessionID).state)
+}
+
+/** Restore only entries removed while a fenced transaction was speculative. */
+function restoreSharedTiming(
+    state: SessionState,
+    pendingBefore: ReadonlyMap<
+        string,
+        { entry: PendingCompressionDuration; snapshot: PendingCompressionDuration }
+    >,
+    startsBefore: ReadonlyMap<string, number>,
+): void {
+    const pending = state.compressionTiming.pendingByCallId
+    pending.clear()
+    for (const [key, value] of pendingBefore) {
+        Object.assign(value.entry, value.snapshot)
+        pending.set(key, value.entry)
+    }
+    const starts = state.compressionTiming.startsByCallId
+    starts.clear()
+    for (const [key, startedAt] of startsBefore) {
+        starts.set(key, startedAt)
+    }
 }
 
 export interface CompressRangeEntry {

@@ -38,7 +38,7 @@ export function startV2ProxyMonitor(
     context: V2Context,
     state: V2ProxyState,
     logger: Logger,
-    onChanged: (disabled: boolean) => Promise<void> | void,
+    onChanged: (disabled: boolean, previousDisabled: boolean) => Promise<void> | void,
 ): { stop(): Promise<void> } {
     const controller = new AbortController()
     let stopped = false
@@ -68,7 +68,7 @@ export function startV2ProxyMonitor(
                 // then retry instead of being swallowed as a no-op.
                 state.disabled = nextDisabled
                 try {
-                    await onChanged(nextDisabled)
+                    await onChanged(nextDisabled, previousDisabled)
                 } catch (error) {
                     state.disabled = previousDisabled
                     logger.warn("V2 ACP catalog reload failed", {

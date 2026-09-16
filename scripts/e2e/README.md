@@ -28,12 +28,16 @@ KEEP_E2E=1 npm run e2e:installed
 
 # Iterate against an existing dist/ directory (the tarball is still packed).
 SKIP_BUILD=1 KEEP_E2E=1 npm run e2e:installed
+
+# Run dependency-free projection, fallback, environment, cleanup, and nudge checks.
+node scripts/e2e/self-test.mjs
 ```
 
 The installed harness always tests the generated tarball, not the workspace
-module. It runs `opencode-ai@1.18.29` and `@opencode/cli@2.0.3` under private
-prefixes at `/tmp/opencode/acp-e2e/hosts/{v1,v2}`. Host installs run normal
-npm lifecycle scripts; the ACP tarball is installed with
+module. Each run creates a unique
+`/tmp/opencode/acp-e2e/run-XXXXXXXXXX` root and runs `opencode-ai@1.18.29` and
+`@opencode/cli@2.0.3` under its private `hosts/{v1,v2}` prefixes. Host installs
+run normal npm lifecycle scripts; the ACP tarball is installed with
 `npm install --prefix <private-plugin-root> --ignore-scripts --no-save`.
 
 Every host and fake-provider process is launched with `env -i` and an explicit
@@ -48,32 +52,62 @@ background service.
 The V2 config uses native plural `plugins`, `providers`, `agents`, and
 `permissions`, disables update/share/automatic compaction, and points the fake
 model at a local OpenAI-compatible provider. It first attempts the requested
-`{"package":"file:///.../opencode-acp-*.tgz"}` form. OpenCode 2.0.3 may reject
-that form as a configured file path before Arborist; in that case the harness
-retains the exact server diagnostic and uses a temporary local wrapper whose
-entrypoints import the same installed tarball. The wrapper is only a host
-resolution fallback, never a different artifact.
+`{"package":"file:///.../opencode-acp-*.tgz"}` form. OpenCode 2.0.3 rejects
+that form with `configured plugin path must be a directory`. The fallback is
+allowed only when the fresh attempt exits 10, inventory is inactive, the exact
+diagnostic is present, and every other fresh line is in the conservative
+allowlist; schema/import/activation/fatal lines reject the fallback. Startup
+lines are excluded by byte offsets. Before
+using a temporary local wrapper, the harness imports the root, server, TUI, and
+RPC exports from the privately installed tarball package and confirms they
+resolve inside its private prefix. The wrapper points at those same installed
+package files; it is only a host-resolution fallback, never a different
+artifact or a workspace-source run.
 
 The fake provider accepts both `/v1/chat/completions` and paths ending in that
 suffix (including `/bili/v1/chat/completions`). It records redacted structural
 observations under the harness root: advertised tool names, ACP system/ID and
 summary markers, provider route, command-sentinel/notice leakage, emitted and
-called tools, and tool-result status. The matrix exercises the five direct ACP
-tools, command aliases, state persistence across an owned-server restart,
-allow/deny/ask permission behavior, repeated `/bili/` catalog reloads, and
-proxy re-enable. TUI rendering remains unit-tested; no interactive terminal is
-started.
+called tools, and tool-result status. Tool observations retain only tool names,
+argument lengths, sorted argument keys, and result status. Permission snapshots
+use a complete deterministic ACP projection: summaries, message text, tool
+arguments/results, provider values, and paths are hashes/shapes only, with host
+context/ref changes compared separately from ACP tool-owned mutations. The
+matrix exercises the five direct ACP tools, command aliases, state persistence
+across an owned-server restart, allow/deny/ask permission behavior, repeated
+`/bili/` catalog reloads, and proxy re-enable. A separate installed scenario
+grows context across turns, detects two ACP nudges, performs two real
+compressions, and verifies pinned persisted baseline transitions with
+`preserveRecentMessages: 10`. TUI rendering remains unit-tested; no interactive
+terminal is started.
 
 The installed flow scripts its provider responses in
 `scripts/e2e/installed-scenarios/`: one main sequence calls `compress`,
 `acp_status`, `search_context`, `acp_context_recap`, and `decompress`, while
-three focused scenarios cover `allow`, `deny`, and fail-closed `ask`.
+`nudge-growth.json` covers pinned black-box baselines `15 → 11370 → 23059`, a
+protected `preserveRecentMessages: 10` no-target phase, eligible growth, nudge →
+real compression → exact pinned baseline, and a second nudge/compression. This
+V2.0.3 host retains ordinary m-ref tags for its preserved recent window rather
+than rewriting them to `BLOCKED`; the driver therefore verifies that the
+provider-visible ref count stays within the configured window, no candidate or
+range text is advertised, and no block or compress call appears. Literal
+`BLOCKED` tags, when present on another host, are checked directly. The
+transient shown-token field is not observable after the host completes the tool
+loop; the driver records provider-visible nudge/system usage and verifies the
+persisted field is cleared after commit, without equating it to provider input
+tokens. It requires exactly two blocks and two nudge-triggered compress
+emissions. Three focused scenarios cover `allow`, `deny`, and fail-closed `ask`.
 
-Successful runs remove only `/tmp/opencode/acp-e2e` (or its explicitly
-configured descendant). Failed runs preserve logs and state for diagnosis;
-`KEEP_E2E=1` also preserves a successful run. Cleanup tracks each exact child
-PID, sends SIGTERM, waits, and escalates only that PID when necessary—never
-`pkill`, `killall`, or a service-wide stop.
+Successful runs remove only their canonical, generated run directory. Failed
+runs preserve that directory for diagnosis; `KEEP_E2E=1` also preserves a
+successful run and prints its exact path. `E2E_ROOT` is treated as a base under
+`/tmp/opencode/acp-e2e`, and traversal/sibling/unsafe deletion targets are
+rejected. Cleanup records the generated directory device/inode and revalidates
+realpath, non-symlink status, and identity immediately before removal. Cleanup
+tracks each exact child PID, sends SIGTERM, waits, and
+escalates only that PID when necessary—never `pkill`, `killall`, or a
+service-wide stop. Run `E2E_GUARD_TEST=1 npm run e2e:installed` for the
+dependency-free path/concurrency guard self-test.
 
 ## Prerequisites
 

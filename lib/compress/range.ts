@@ -137,8 +137,9 @@ export function createCompressRangeToolDefinition(
                 // V2 projected tool history can omit user model metadata even
                 // though the context transaction already resolved the active
                 // model. Keep provider/model overrides effective in that case.
-                const providerId = modelInfo.providerId ?? ctx0.state.modelProviderID
-                const modelId = modelInfo.modelId ?? ctx0.state.modelID
+                const providerId =
+                    modelInfo.providerId?.trim() || ctx0.state.modelProviderID?.trim() || undefined
+                const modelId = modelInfo.modelId?.trim() || ctx0.state.modelID?.trim() || undefined
                 const ctx: typeof ctx0 = {
                     ...ctx0,
                     config: applyCompressOverrides(ctx0.config, providerId, modelId),

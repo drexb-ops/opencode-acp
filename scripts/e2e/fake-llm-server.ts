@@ -68,6 +68,8 @@ interface ScenarioStep {
     toolArgs?: Record<string, unknown>
     /** For nudge-compress: text to emit when no nudge detected (grows context) */
     growthText?: string
+    /** Repeat growthText so installed scenarios can request a deterministic token-sized turn. */
+    growthRepeat?: number
     /** For autonomous-nudge: stop after this many total compressions emitted (default: 2) */
     maxCompressCount?: number
     /** Prefer an advertised candidate category when responding to a nudge. */
@@ -110,6 +112,15 @@ export interface RequestObservation {
     compressCallCount: number
     nudgeDetected: boolean
     nudgeSystemTokens?: number
+    scenarioPhase?: string
+    blockedRefCount: number
+    protectedRefCount: number
+    compressibleRefCount: number
+    messageRefCount: number
+    blockRefCount: number
+    candidateOrRangeText: boolean
+    calledCompress: boolean
+    emittedCompressCount: number
     candidateSelected?: boolean
     candidateStartId?: string
     candidateEndId?: string
@@ -133,25 +144,37 @@ export interface RequestObservation {
     acpOwnedNoticePresent: boolean
     /** Tool calls already present in the incoming conversation. */
     calledToolNames: string[]
+    /** Redacted tool-call shape; argument payloads are never recorded. */
+    toolParameterObservations: ToolParameterObservation[]
     /** Statuses of tool results present in the incoming conversation. */
     toolResultStatuses: ToolResultObservation[]
 }
 
 export interface ToolResultObservation {
-    id?: string
     name?: string
     status: "completed" | "error"
     actionable?: boolean
+}
+
+export interface ToolParameterObservation {
+    name?: string
+    argumentLength: number
+    argumentKeys: string[]
 }
 
 export interface Observations {
     requests: RequestObservation[]
     emittedTools: string[]
     toolResults: ToolResultObservation[]
+    activation?: {
+        exactStatus: number
+        exactDiagnosticMatched: boolean
+        fallbackUsed: boolean
+    }
+    nudgeCheckpoints?: unknown[]
 }
 
 const observations: Observations = { requests: [], emittedTools: [], toolResults: [] }
-const observedToolResultIds = new Set<string>()
 
 const ACP_TOOL_NAMES = new Set([
     "compress",
@@ -172,12 +195,16 @@ function recordObservation(
     compressCallCount: number,
     nudgeDetected: boolean,
     nudgeSystemTokens: number | undefined,
+    scenarioPhase: string | undefined,
     isChild: boolean,
     isAuxiliary: boolean,
 ): void {
     const messages = messagesFromBody(body)
     const advertisedToolNames = advertisedNames(toolsFromBody(body))
     const toolResultStatuses = inspectToolResults(messages)
+    const toolParameterObservations = inspectToolParameters(messages)
+    const calledNames = calledToolNames(messages)
+    const refEvidence = inspectRefEvidence(messages)
     observations.requests.push({
         turn,
         inputTokens,
@@ -185,6 +212,16 @@ function recordObservation(
         compressCallCount,
         nudgeDetected,
         nudgeSystemTokens,
+        ...(scenarioPhase ? { scenarioPhase } : {}),
+        blockedRefCount: refEvidence.blockedRefCount,
+        protectedRefCount: refEvidence.protectedRefCount,
+        compressibleRefCount: refEvidence.compressibleRefCount,
+        messageRefCount: refEvidence.messageRefCount,
+        blockRefCount: refEvidence.blockRefCount,
+        candidateOrRangeText: refEvidence.candidateOrRangeText,
+        calledCompress: calledNames.includes("compress"),
+        emittedCompressCount: observations.emittedTools.filter((name) => name === "compress")
+            .length,
         isChild,
         isAuxiliary,
         requestPath,
@@ -195,12 +232,11 @@ function recordObservation(
         summaryMarkerPresent: hasSummaryMarker(messages),
         commandSentinelLeakage: hasCommandSentinel(body),
         acpOwnedNoticePresent: hasAcpOwnedNotice(messages),
-        calledToolNames: calledToolNames(messages),
+        calledToolNames: calledNames,
+        toolParameterObservations,
         toolResultStatuses,
     })
     for (const result of toolResultStatuses) {
-        if (result.id && observedToolResultIds.has(result.id)) continue
-        if (result.id) observedToolResultIds.add(result.id)
         observations.toolResults.push(result)
     }
     writeObservations()
@@ -208,7 +244,19 @@ function recordObservation(
 
 function writeObservations(): void {
     try {
-        writeFileSync(OBSERVATIONS_FILE, JSON.stringify(observations, null, 2))
+        let preserved: Pick<Observations, "activation" | "nudgeCheckpoints"> = {}
+        try {
+            const existing = JSON.parse(readFileSync(OBSERVATIONS_FILE, "utf-8"))
+            preserved = {
+                ...(existing?.activation ? { activation: existing.activation } : {}),
+                ...(Array.isArray(existing?.nudgeCheckpoints)
+                    ? { nudgeCheckpoints: existing.nudgeCheckpoints }
+                    : {}),
+            }
+        } catch {
+            // The first fake-provider write creates the observations file.
+        }
+        writeFileSync(OBSERVATIONS_FILE, JSON.stringify({ ...observations, ...preserved }, null, 2))
     } catch {
         // best-effort — verify.ts treats missing file as "no constraints"
     }
@@ -325,6 +373,7 @@ async function handleChatCompletion(req: Request): Promise<Response> {
         compressCallCount,
         nudgeDetected,
         extractNudgeSystemTokens(messages),
+        hasProtectedNoTargetPhase(body) ? "protected-no-target" : undefined,
         isChild,
         isAuxiliary,
     )
@@ -412,6 +461,23 @@ async function handleChatCompletion(req: Request): Promise<Response> {
     const step = scenario.turns[turnIdx]
 
     if (!step) {
+        if (scenario.name === "acp-installed-artifact-nudge-growth-refire") {
+            return handleNudgeCompressStep(
+                model,
+                messages,
+                {
+                    respond: "nudge-compress",
+                    growthRepeat: 15,
+                    growthText:
+                        "The installed artifact growth record covers authentication boundaries, provider routing, session ownership, request validation, persistence ordering, and context retention. The service validates incoming input before selecting a provider, records a durable session reference, preserves tool call and result pairing, and keeps recent user intent visible while older completed discussion remains eligible for compression.",
+                    topic: "Installed nudge growth cycle",
+                    summary:
+                        "Installed nudge compression summary: The completed context growth record covers authentication boundaries, provider routing, session ownership, request validation, persistence ordering, context retention, protected recent messages, and exact nudge baseline transitions. The service validates incoming input before selecting a provider, records durable session references, preserves tool call and result pairing, keeps recent user intent visible, and makes older completed discussion eligible for compression. This summary captures the completed provider route, the protected recent intent, the nudge-triggered compression decision, and the persisted baseline transition so the installed artifact quality gate can verify the real compression.",
+                },
+                isStream,
+                inputTokens,
+            )
+        }
         log(`  → no scenario step for turn ${turnIdx + 1}, emitting default text`)
         return textResponse(model, "Done.", isStream, inputTokens)
     }
@@ -570,7 +636,9 @@ function handleNudgeCompressStep(
         log(
             `  → nudge-compress: no nudge detected, emitting ${growthText.length} chars of growth text`,
         )
-        return textResponse(model, growthText, isStream, inputTokens)
+        const repeat = Math.max(1, Math.floor(step.growthRepeat ?? 1))
+        const expandedGrowth = Array.from({ length: repeat }, () => growthText).join("\n")
+        return textResponse(model, expandedGrowth, isStream, inputTokens)
     }
 
     log(`  → nudge-compress: nudge DETECTED, emitting compress call`)
@@ -639,6 +707,34 @@ function calledToolNames(messages: any[]): string[] {
     return names
 }
 
+function inspectToolParameters(messages: any[]): ToolParameterObservation[] {
+    const results: ToolParameterObservation[] = []
+    for (const message of messages) {
+        if (!Array.isArray(message?.tool_calls)) continue
+        for (const call of message.tool_calls) {
+            const rawArguments = call?.function?.arguments
+            const argumentText = typeof rawArguments === "string" ? rawArguments : ""
+            let argumentKeys: string[] = []
+            try {
+                const parsed = JSON.parse(argumentText)
+                if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+                    argumentKeys = Object.keys(parsed).sort()
+                }
+            } catch {
+                // Keep the structural observation payload-free when arguments are
+                // streamed in a host-specific format.
+            }
+            const name = normalizeToolName(call?.function?.name ?? call?.name)
+            results.push({
+                ...(name ? { name } : {}),
+                argumentLength: argumentText.length,
+                argumentKeys,
+            })
+        }
+    }
+    return results
+}
+
 function inspectToolResults(messages: any[]): ToolResultObservation[] {
     const results: ToolResultObservation[] = []
     const namesByCallId = new Map<string, string>()
@@ -656,15 +752,20 @@ function inspectToolResults(messages: any[]): ToolResultObservation[] {
         const id = typeof message?.tool_call_id === "string" ? message.tool_call_id : undefined
         const name = normalizeToolName(message?.name) ?? (id ? namesByCallId.get(id) : undefined)
         const status =
-            /(?:^|\n)\s*(?:error:|ACP cannot request|ACP tool execution is disabled|ACP .* execution failed|permission .* blocked|invalid .* input)/i.test(
+            /(?:^|\n)\s*(?:error:|ACP cannot request|ACP tool execution is disabled|ACP .* execution failed|permission .* blocked|invalid .* input|COMPRESSION REJECTED|QUALITY GATE FAILURE)/i.test(
                 text,
             )
                 ? "error"
                 : "completed"
         const actionable = /permission|allow|deny/i.test(text)
-        results.push({ ...(id ? { id } : {}), ...(name ? { name } : {}), status, actionable })
+        results.push({ ...(name ? { name } : {}), status, actionable })
     }
     return results
+}
+
+function hasProtectedNoTargetPhase(body: any): boolean {
+    const serialized = JSON.stringify(body)
+    return serialized.includes("PROTECTED_NO_TARGET_PHASE")
 }
 
 function systemText(body: any): string {
@@ -704,6 +805,46 @@ function parseDcpMessageRefs(messages: any[]): string[] {
         }
     }
     return refs
+}
+
+function inspectRefEvidence(messages: any[]): {
+    blockedRefCount: number
+    protectedRefCount: number
+    compressibleRefCount: number
+    messageRefCount: number
+    blockRefCount: number
+    candidateOrRangeText: boolean
+} {
+    const text = messages.map(extractMessageText).join("\n")
+    const blockedRefCount = (text.match(/<dcp-message-id[^>]*>BLOCKED<\/dcp-message-id>/g) ?? [])
+        .length
+    const messageRefs = new Set(text.match(/<dcp-message-id[^>]*>m\d+<\/dcp-message-id>/g) ?? [])
+    const blockRefs = new Set(text.match(/<dcp-message-id[^>]*>b\d+<\/dcp-message-id>/g) ?? [])
+    const userVisibleText = messages
+        .filter(
+            (message) =>
+                (message?.role === "user" || message?.role === "assistant") &&
+                !extractMessageText(message).includes("PROTECTED_NO_TARGET_PHASE"),
+        )
+        .map(extractMessageText)
+        .join("\n")
+    const candidateOrRangeText =
+        /\b(?:MICRO|EPISODE)\b|\bcandidates?\b|\bcompressible\s+ranges?\b|\bm\d+\s*[–-]\s*m\d+\b/i.test(
+            userVisibleText,
+        )
+    // Only literal BLOCKED tags are counted as explicitly protected here.
+    // OpenCode 2.0.3 keeps m-ref tags in the preserveRecentMessages window, so
+    // the driver combines the observed ref count with its pinned window size
+    // instead of relabeling ordinary m-refs as protected.
+    const protectedRefCount = blockedRefCount
+    return {
+        blockedRefCount,
+        protectedRefCount,
+        compressibleRefCount: Math.max(0, messageRefs.size - blockedRefCount),
+        messageRefCount: messageRefs.size,
+        blockRefCount: blockRefs.size,
+        candidateOrRangeText,
+    }
 }
 
 function hasSummaryMarker(messages: any[]): boolean {
@@ -1358,6 +1499,6 @@ function sseLine(obj: any): string {
 
 process.stderr.write(
     `[fake-llm] listening on http://${HOST}:${PORT}\n` +
-        `[fake-llm] scenario: ${SCENARIO_PATH}\n` +
+        `[fake-llm] scenario loaded\n` +
         `[fake-llm] ready (pid ${process.pid})\n`,
 )

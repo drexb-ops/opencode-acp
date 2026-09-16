@@ -25,12 +25,200 @@ die() { printf '%sFAIL%s %s\n' "$c_red" "$c_rst" "$*" >&2; exit 1; }
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPT_DIR="$REPO_ROOT/scripts/e2e"
-HARNESS_ROOT="${E2E_ROOT:-/tmp/opencode/acp-e2e}"
+APPROVED_E2E_ROOT="/tmp/opencode/acp-e2e"
+E2E_BASE_INPUT="${E2E_ROOT:-$APPROVED_E2E_ROOT}"
 KEEP_E2E="${KEEP_E2E:-0}"
 START_SECONDS="$(date +%s)"
 
-[[ "$HARNESS_ROOT" == /tmp/opencode/acp-e2e || "$HARNESS_ROOT" == /tmp/opencode/acp-e2e/* ]] || \
-    die "E2E_ROOT must remain below /tmp/opencode/acp-e2e (got $HARNESS_ROOT)"
+normalize_path() {
+    realpath -m -- "$1"
+}
+
+directory_identity() {
+    local candidate="$1"
+    [[ -d "$candidate" && ! -L "$candidate" ]] || return 1
+    stat -Lc '%d:%i' -- "$candidate"
+}
+
+is_path_below_or_equal() {
+    local parent="$1"
+    local candidate="$2"
+    [[ "$candidate" == "$parent" || "$candidate" == "$parent/"* ]]
+}
+
+validate_e2e_base() {
+    local candidate
+    candidate="$(normalize_path "$1")" || return 1
+    if [[ -e "$1" && "$candidate" != "$1" ]]; then
+        return 1
+    fi
+    [[ ! -L "$candidate" ]] || return 1
+    is_path_below_or_equal "$APPROVED_E2E_ROOT" "$candidate" || return 1
+    printf '%s\n' "$candidate"
+}
+
+validate_generated_root() {
+    local base="$1"
+    local candidate="$2"
+    local normalized_base
+    local normalized_candidate
+    normalized_base="$(normalize_path "$base")" || return 1
+    normalized_candidate="$(normalize_path "$candidate")" || return 1
+
+    # A generated run directory must be a strict descendant of the validated
+    # base. In particular, neither the base nor the approved root is a valid
+    # deletion target, even when a caller supplied the approved root itself.
+    [[ "$normalized_candidate" != "$normalized_base" ]] || return 1
+    is_path_below_or_equal "$normalized_base" "$normalized_candidate" || return 1
+    [[ "$normalized_candidate" != "$APPROVED_E2E_ROOT" ]] || return 1
+    is_path_below_or_equal "$APPROVED_E2E_ROOT" "$normalized_candidate" || return 1
+    [[ "$normalized_candidate" != "/" ]] || return 1
+    [[ "$normalized_candidate" == "$candidate" ]] || return 1
+    [[ ! -L "$candidate" ]] || return 1
+    [[ "$(basename "$candidate")" == run-* ]] || return 1
+    return 0
+}
+
+create_generated_root() {
+    local base="$1"
+    mkdir -p -- "$base"
+    [[ ! -L "$base" ]] || return 1
+    local generated
+    generated="$(mktemp -d "$base/run-XXXXXXXXXX")" || return 1
+    generated="$(normalize_path "$generated")" || return 1
+    validate_generated_root "$base" "$generated" || return 1
+    printf '%s\n' "$generated"
+}
+
+remove_generated_root() {
+    local base="$1"
+    local generated="$2"
+    local expected_identity="${3:-}"
+    [[ -n "$generated" && -n "$expected_identity" ]] || return 1
+    if [[ ! -e "$generated" && ! -L "$generated" ]]; then
+        return 0
+    fi
+    [[ -d "$generated" && ! -L "$generated" ]] || return 1
+    validate_generated_root "$base" "$generated" || return 1
+    [[ "$(directory_identity "$generated")" == "$expected_identity" ]] || return 1
+    rm -rf -- "$generated"
+}
+
+guard_self_test() {
+    local base="$APPROVED_E2E_ROOT"
+    mkdir -p -- "$base"
+
+    local traversal="$base/../acp-e2e-traversal"
+    local sibling="${base}-sibling"
+    local unsafe_parent="/tmp/opencode"
+    local exact_root="$base"
+
+    if validate_e2e_base "$traversal" >/dev/null 2>&1; then
+        die "guard self-test accepted traversal base"
+    fi
+    if validate_e2e_base "$sibling" >/dev/null 2>&1; then
+        die "guard self-test accepted sibling base"
+    fi
+    if validate_e2e_base "$unsafe_parent" >/dev/null 2>&1; then
+        die "guard self-test accepted unsafe parent base"
+    fi
+    if validate_generated_root "$base" "$exact_root" >/dev/null 2>&1; then
+        die "guard self-test accepted exact root deletion target"
+    fi
+    local symlink_base="$base/self-test-symlink-base"
+    rm -f -- "$symlink_base"
+    ln -s -- "$base" "$symlink_base"
+    if validate_e2e_base "$symlink_base" >/dev/null 2>&1; then
+        rm -f -- "$symlink_base"
+        die "guard self-test accepted a symlinked base"
+    fi
+    rm -f -- "$symlink_base"
+
+    local path_one_file path_two_file path_one path_two pid_one pid_two
+    path_one_file="$(mktemp)"
+    path_two_file="$(mktemp)"
+    (create_generated_root "$base") >"$path_one_file" &
+    pid_one=$!
+    (create_generated_root "$base") >"$path_two_file" &
+    pid_two=$!
+    wait "$pid_one"
+    wait "$pid_two"
+    read -r path_one <"$path_one_file"
+    read -r path_two <"$path_two_file"
+    rm -f -- "$path_one_file" "$path_two_file"
+
+    [[ -n "$path_one" && -n "$path_two" && "$path_one" != "$path_two" ]] || \
+        die "guard self-test did not create two unique concurrent paths"
+    validate_generated_root "$base" "$path_one" || die "guard self-test rejected first unique path"
+    validate_generated_root "$base" "$path_two" || die "guard self-test rejected second unique path"
+    local identity_one identity_two
+    identity_one="$(directory_identity "$path_one")"
+    identity_two="$(directory_identity "$path_two")"
+    remove_generated_root "$base" "$path_one" "$identity_one" || die "guard self-test failed first cleanup"
+    remove_generated_root "$base" "$path_two" "$identity_two" || die "guard self-test failed second cleanup"
+    [[ ! -e "$path_one" && ! -e "$path_two" ]] || die "guard self-test left a generated path"
+
+    local race_path race_identity race_moved race_replacement_identity
+    race_path="$(create_generated_root "$base")"
+    race_identity="$(directory_identity "$race_path")"
+    race_moved="${race_path}-moved"
+    mv -- "$race_path" "$race_moved"
+    mkdir -- "$race_path"
+    if remove_generated_root "$base" "$race_path" "$race_identity" >/dev/null 2>&1; then
+        die "guard self-test accepted an inode replacement"
+    fi
+    race_replacement_identity="$(directory_identity "$race_path")"
+    remove_generated_root "$base" "$race_path" "$race_replacement_identity" || \
+        die "guard self-test failed replacement cleanup"
+    local race_moved_identity
+    race_moved_identity="$(directory_identity "$race_moved")"
+    remove_generated_root "$base" "$race_moved" "$race_moved_identity" || \
+        die "guard self-test failed moved cleanup"
+
+    local file_path file_identity file_moved file_replacement_identity
+    file_path="$(create_generated_root "$base")"
+    file_identity="$(directory_identity "$file_path")"
+    file_moved="${file_path}-file-moved"
+    mv -- "$file_path" "$file_moved"
+    : >"$file_path"
+    if remove_generated_root "$base" "$file_path" "$file_identity" >/dev/null 2>&1; then
+        die "guard self-test accepted a regular-file replacement"
+    fi
+    rm -f -- "$file_path"
+    file_replacement_identity="$(directory_identity "$file_moved")"
+    remove_generated_root "$base" "$file_moved" "$file_replacement_identity" || \
+        die "guard self-test failed regular-file cleanup"
+
+    local symlink_path symlink_target symlink_moved symlink_identity symlink_replacement_identity
+    symlink_path="$(create_generated_root "$base")"
+    symlink_identity="$(directory_identity "$symlink_path")"
+    symlink_moved="${symlink_path}-symlink-moved"
+    symlink_target="$(mktemp "$base/symlink-target-XXXXXX")"
+    mv -- "$symlink_path" "$symlink_moved"
+    ln -s -- "$symlink_target" "$symlink_path"
+    if remove_generated_root "$base" "$symlink_path" "$symlink_identity" >/dev/null 2>&1; then
+        die "guard self-test accepted a symlink-to-file replacement"
+    fi
+    rm -f -- "$symlink_path" "$symlink_target"
+    symlink_replacement_identity="$(directory_identity "$symlink_moved")"
+    remove_generated_root "$base" "$symlink_moved" "$symlink_replacement_identity" || \
+        die "guard self-test failed symlink replacement cleanup"
+
+    pass "installed E2E path guard self-test passed (traversal, sibling, parent, exact-root, symlink, file, identity, concurrency)"
+}
+
+if [[ "${E2E_GUARD_TEST:-0}" == "1" || "${1:-}" == "--self-test" ]]; then
+    guard_self_test
+    exit 0
+fi
+
+E2E_BASE="$(validate_e2e_base "$E2E_BASE_INPUT")" || \
+    die "E2E_ROOT must remain below /tmp/opencode/acp-e2e after normalization (got $E2E_BASE_INPUT)"
+HARNESS_ROOT="$(create_generated_root "$E2E_BASE")" || \
+    die "unable to create a unique installed E2E run directory below $E2E_BASE"
+HARNESS_ROOT_IDENTITY="$(directory_identity "$HARNESS_ROOT")" || \
+    die "unable to record unique installed E2E run identity"
+info "installed E2E run root: $HARNESS_ROOT"
 
 NODE_BIN="${NODE_BIN:-$(command -v node || true)}"
 NPM_BIN="${NPM_BIN:-$(command -v npm || true)}"
@@ -45,9 +233,8 @@ TAR_BIN="${TAR_BIN:-$(command -v tar || true)}"
 [[ -x "$TAR_BIN" ]] || die "tar executable not found (set TAR_BIN)"
 
 NODE_DIR="$(dirname "$NODE_BIN")"
-mkdir -p "$HARNESS_ROOT"
-rm -rf "$HARNESS_ROOT"
-mkdir -p "$HARNESS_ROOT"/{artifacts,build,hosts,logs,scenarios}
+[[ -d "$HARNESS_ROOT" ]] || die "unique installed E2E run root disappeared: $HARNESS_ROOT"
+mkdir -p -- "$HARNESS_ROOT"/{artifacts,build,hosts,logs,scenarios}
 
 OWNED_PIDS=()
 V2_PID=""
@@ -96,8 +283,11 @@ cleanup() {
     V2_PID=""
     FAKE_PID=""
     if [[ "$status" -eq 0 && "$KEEP_E2E" != "1" ]]; then
-        rm -rf "$HARNESS_ROOT"
-        info "diagnostics cleaned: $HARNESS_ROOT"
+        if remove_generated_root "$E2E_BASE" "$HARNESS_ROOT" "$HARNESS_ROOT_IDENTITY"; then
+            info "diagnostics cleaned: $HARNESS_ROOT"
+        else
+            info "diagnostics retained (safe cleanup refused): $HARNESS_ROOT"
+        fi
     else
         info "diagnostics retained: $HARNESS_ROOT"
     fi
@@ -116,6 +306,71 @@ free_port() {
             server.close()
         })
     '
+}
+
+EXPECTED_V2_TARBALL_DIAGNOSTIC="configured plugin path must be a directory"
+
+log_byte_offset() {
+    local path="$1"
+    [[ -f "$path" ]] || { printf '0\n'; return 0; }
+    stat -c '%s' -- "$path"
+}
+
+capture_new_log_lines() {
+    local source="$1"
+    local start="$2"
+    local destination="$3"
+    mkdir -p -- "$(dirname "$destination")"
+    if [[ ! -f "$source" ]]; then
+        : >"$destination"
+        return 0
+    fi
+    local current
+    current="$(log_byte_offset "$source")"
+    if [[ "$current" -lt "$start" ]]; then
+        start=0
+    fi
+    tail -c +$((start + 1)) -- "$source" >"$destination"
+}
+
+redact_diagnostic_file() {
+    local source="$1"
+    local destination="$2"
+    if [[ ! -f "$source" ]]; then
+        printf 'diagnostic source was not produced: %s\n' "$(basename "$source")" >"$destination"
+        return 0
+    fi
+    # Preserve useful status/error text but never print or retain obvious
+    # credentials, auth headers, or configured file URLs in the fallback
+    # diagnostic copy.
+    sed -E \
+        -e 's#((api[-_]?key|authorization|password|token|secret)[[:space:]]*:[[:space:]]*)"[^"]*"#\1"<redacted>"#gi' \
+        -e 's#((api[-_]?key|authorization|password|token|secret)[[:space:]]*=[[:space:]]*)("[^"]*"|[^,[:space:]}]+)#\1<redacted>#gi' \
+        -e 's#(api[-_]?key|authorization|password|token|secret)[[:space:]]*[:=][[:space:]]*[^,[:space:]}" ]+#\1=<redacted>#gi' \
+        -e 's#file:///[^[:space:]" ]+#file://<redacted>#g' \
+        -e 's#/(home|root|tmp|var|opt)/[^[:space:]" ]+#<path-redacted>#g' \
+        "$source" >"$destination"
+}
+
+record_v2_activation_observation() {
+    local observations_path="$1"
+    local exact_status="$2"
+    local diagnostic_matched="$3"
+    local fallback_used="$4"
+    "$NODE_BIN" --input-type=module -e '
+        import {readFileSync, renameSync, writeFileSync} from "node:fs"
+        const [file, status, matched, fallback] = process.argv.slice(1)
+        let observations = {}
+        try { observations = JSON.parse(readFileSync(file, "utf8")) } catch {}
+        observations.activation = {
+            exactStatus: Number(status),
+            exactDiagnosticMatched: matched === "true",
+            fallbackUsed: fallback === "true",
+        }
+        const temporary = `${file}.activation-${process.pid}`
+        writeFileSync(temporary, `${JSON.stringify(observations, null, 2)}\n`)
+        renameSync(temporary, file)
+    ' "$observations_path" "$exact_status" "$diagnostic_matched" "$fallback_used"
 }
 
 write_npmrc() {
@@ -251,7 +506,22 @@ install_hosts() {
         "$NODE_BIN" -e 'const p=require(process.argv[1]); if(p.name!=="opencode-acp" || p.version!==process.argv[2]) process.exit(1)' "$plugin_dir/package.json" "$ACP_VERSION" || \
             die "installed ACP package does not match the packed artifact: $plugin_dir"
     done
-    "$NODE_BIN" "$SCRIPT_DIR/installed-config.mjs" wrapper "$V2_WRAPPER" "$V2_PLUGIN_DIR"
+    "$NODE_BIN" "$SCRIPT_DIR/installed-config.mjs" wrapper "$V2_WRAPPER" "$V2_PLUGIN_DIR" "$V2_PLUGIN_ROOT"
+    step "independently import all private ACP package entrypoints"
+    env -i \
+        HOME="$V1_ROOT/home" \
+        PATH="$NODE_DIR:/usr/bin:/bin" \
+        LANG=C.UTF-8 \
+        LC_ALL=C.UTF-8 \
+        TZ=UTC \
+        "$NODE_BIN" "$SCRIPT_DIR/verify-installed-package.mjs" "$V1_PLUGIN_ROOT" "$V1_PLUGIN_DIR"
+    env -i \
+        HOME="$V2_ROOT/home" \
+        PATH="$NODE_DIR:/usr/bin:/bin" \
+        LANG=C.UTF-8 \
+        LC_ALL=C.UTF-8 \
+        TZ=UTC \
+        "$NODE_BIN" "$SCRIPT_DIR/verify-installed-package.mjs" "$V2_PLUGIN_ROOT" "$V2_PLUGIN_DIR"
     V2_WRAPPER_URL=$("$NODE_BIN" --input-type=module -e 'import {pathToFileURL} from "node:url"; process.stdout.write(pathToFileURL(process.argv[1]).href)' "$V2_WRAPPER")
     pass "packed artifact installed privately for both hosts"
 }
@@ -339,6 +609,7 @@ start_v2() {
 
 run_v2_stage() {
     local stage="$1"
+    local observations="${E2E_ACTIVE_OBSERVATIONS:-$V2_ROOT/observations.json}"
     (cd "$REPO_ROOT" && env -i \
         "${v2_env[@]}" \
         E2E_ROOT="$HARNESS_ROOT" \
@@ -347,7 +618,7 @@ run_v2_stage() {
         E2E_CONFIG_FILE="$V2_CONFIG_FILE" \
         E2E_PLUGIN_TGZ_URL="$ACP_TGZ_URL" \
         E2E_WRAPPER_DIR="$V2_WRAPPER" \
-        E2E_OBSERVATIONS="$V2_ROOT/observations.json" \
+        E2E_OBSERVATIONS="$observations" \
         E2E_STATE_DIR="$V2_STORAGE" \
         "$NODE_BIN" --import tsx "$SCRIPT_DIR/installed-v2.ts" "$stage")
 }
@@ -446,21 +717,73 @@ run_v2_checks() {
     # path and rejects it before Arborist. Try the requested shape first and
     # retain the exact server diagnostic if the release exhibits that behavior.
     step "activate V2 configured packed plugin"
+    local exact_server_log="$V2_ROOT/logs/server.log"
+    local exact_opencode_log="$V2_ROOT/data/opencode/log/opencode.log"
+    local exact_server_start exact_opencode_start
+    exact_server_start="$(log_byte_offset "$exact_server_log")"
+    exact_opencode_start="$(log_byte_offset "$exact_opencode_log")"
+    : >"$V2_ROOT/logs/activation-exact.log"
     set +e
     run_v2_stage activate >"$V2_ROOT/logs/activation-exact.log" 2>&1
     local activation_status=$?
     set -e
-    if [[ "$activation_status" -eq 10 ]]; then
-        cp "$V2_ROOT/logs/server.log" "$V2_ROOT/logs/plugin-resolution-error.log"
-        [[ -s "$V2_ROOT/logs/plugin-resolution-error.log" ]] || die "V2 exact plugin failure produced no retained server diagnostic"
-        info "V2 configured file URL was rejected; using verified local wrapper fallback"
+    local fresh_server_log="$V2_ROOT/logs/activation-exact-server.log"
+    local fresh_opencode_log="$V2_ROOT/logs/activation-exact-opencode.log"
+    capture_new_log_lines "$exact_server_log" "$exact_server_start" "$fresh_server_log"
+    capture_new_log_lines "$exact_opencode_log" "$exact_opencode_start" "$fresh_opencode_log"
+    local gate_result gate_status
+    set +e
+    gate_result="$($NODE_BIN "$SCRIPT_DIR/check-v2-activation.mjs" \
+        "$activation_status" "$HARNESS_ROOT/v2/activation.json" \
+        "$fresh_server_log" "$fresh_opencode_log")"
+    gate_status=$?
+    set -e
+    printf '%s\n' "$gate_result" >"$V2_ROOT/logs/activation-classification.json"
+    local diagnostic_matched=false
+    local fallback_allowed=false
+    local diagnostic_source_index=-1
+    if [[ -n "$gate_result" ]]; then
+        diagnostic_matched="$($NODE_BIN -e 'process.stdout.write(JSON.parse(process.argv[1]).exactDiagnosticMatched ? "true" : "false")' "$gate_result")"
+        fallback_allowed="$($NODE_BIN -e 'process.stdout.write(JSON.parse(process.argv[1]).accepted ? "true" : "false")' "$gate_result")"
+        diagnostic_source_index="$($NODE_BIN -e 'process.stdout.write(String(JSON.parse(process.argv[1]).sourceIndex))' "$gate_result")"
+    fi
+    case "$diagnostic_source_index" in
+        0) V2_DIAGNOSTIC_SOURCE="$fresh_server_log" ;;
+        1) V2_DIAGNOSTIC_SOURCE="$fresh_opencode_log" ;;
+        *) V2_DIAGNOSTIC_SOURCE="$V2_ROOT/logs/activation-exact.log" ;;
+    esac
+    if [[ "$activation_status" -eq 10 && "$gate_status" -eq 0 && "$fallback_allowed" == true ]]; then
+        redact_diagnostic_file \
+            "$V2_DIAGNOSTIC_SOURCE" \
+            "$V2_ROOT/logs/plugin-resolution-error.log"
+        [[ -s "$V2_ROOT/logs/plugin-resolution-error.log" ]] || \
+            die "V2 exact plugin failure produced no retained redacted server diagnostic"
+        "$NODE_BIN" -e '
+            const fs = require("node:fs")
+            const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"))
+            if (value.active !== false) process.exit(1)
+        ' "$HARNESS_ROOT/v2/activation.json" || {
+            redact_diagnostic_file "$V2_ROOT/logs/activation-exact.log" "$V2_ROOT/logs/activation-exact-error.log"
+            die "V2 exact plugin activation did not produce the expected inactive outcome"
+        }
+        record_v2_activation_observation "$V2_OBSERVATIONS" "$activation_status" true true
+        info "V2 exact tarball activation failed only with the expected directory diagnostic; using verified local wrapper fallback"
         CURRENT_PLUGIN_TARGET="$V2_WRAPPER_URL"
         write_v2_route "http://127.0.0.1:$V2_FAKE_PORT/v1"
         run_v2_stage activate >"$V2_ROOT/logs/activation-wrapper.log" 2>&1 || die "V2 wrapper fallback activation failed"
     elif [[ "$activation_status" -ne 0 ]]; then
-        cat "$V2_ROOT/logs/activation-exact.log" >&2 || true
-        die "V2 exact packed plugin activation failed unexpectedly"
+        redact_diagnostic_file "$V2_ROOT/logs/activation-exact.log" "$V2_ROOT/logs/activation-exact-error.log"
+        redact_diagnostic_file "$V2_DIAGNOSTIC_SOURCE" "$V2_ROOT/logs/plugin-resolution-error.log"
+        record_v2_activation_observation "$V2_OBSERVATIONS" "$activation_status" "$diagnostic_matched" false
+        info "exact activation diagnostic (redacted): $V2_ROOT/logs/activation-exact-error.log"
+        info "owned server diagnostic (redacted): $V2_ROOT/logs/plugin-resolution-error.log"
+        die "V2 exact packed plugin activation failed without the sole allowed diagnostic"
     else
+        record_v2_activation_observation "$V2_OBSERVATIONS" "$activation_status" "$diagnostic_matched" false
+        if [[ "$diagnostic_matched" == true ]]; then
+            redact_diagnostic_file "$V2_DIAGNOSTIC_SOURCE" "$V2_ROOT/logs/plugin-resolution-error.log"
+            die "V2 exact packed plugin activated despite reporting the fallback diagnostic"
+        fi
         CURRENT_PLUGIN_TARGET="$ACP_TGZ_URL"
         pass "V2 configured file URL activated directly"
     fi
@@ -492,6 +815,36 @@ run_v2_checks() {
     stop_owned_pid "$FAKE_PID"
     FAKE_PID=""
     pass "V2 catalog transitions, commands, five tools, state restart, and cleanup checks passed"
+}
+
+run_v2_nudge_growth() {
+    step "run installed V2 nudge/growth/compress/refire cycle"
+    V2_NUDGE_OBSERVATIONS="$V2_ROOT/nudge-observations.json"
+    V2_NUDGE_COUNTER="$V2_ROOT/nudge-turn-counter"
+    # This is intentionally a separate installed session/config from the main
+    # matrix. It keeps preserveRecentMessages > 0 and the small growth floor
+    # scoped to the mandatory nudge proof without weakening the existing tool
+    # and permission scenarios.
+    "$NODE_BIN" "$SCRIPT_DIR/installed-config.mjs" acp \
+        "$V2_ACP_CONFIG" "$CURRENT_PLUGIN_TARGET" "" allow "$V2_STORAGE" "$V2_WORKSPACE" \
+        "" 10 7500 5000
+    rm -f -- "$V2_NUDGE_OBSERVATIONS" "$V2_NUDGE_COUNTER"
+    start_fake \
+        "$V2_ROOT" \
+        "$V2_FAKE_PORT" \
+        "$SCRIPT_DIR/installed-scenarios/nudge-growth.json" \
+        "$V2_NUDGE_COUNTER" \
+        "$V2_NUDGE_OBSERVATIONS" \
+        "$V2_ROOT/logs/nudge-fake.log"
+    start_v2
+    E2E_ACTIVE_OBSERVATIONS="$V2_NUDGE_OBSERVATIONS"
+    run_v2_stage nudge-growth
+    unset E2E_ACTIVE_OBSERVATIONS
+    stop_owned_pid "$FAKE_PID"
+    FAKE_PID=""
+    stop_owned_pid "$V2_PID"
+    V2_PID=""
+    pass "installed V2 nudge growth cycle preserved baselines and refired after two real compressions"
 }
 
 run_v2_permission_case() {
@@ -653,6 +1006,7 @@ v2_env=(
 CURRENT_PLUGIN_TARGET="$ACP_TGZ_URL"
 run_v1_checks
 run_v2_checks
+run_v2_nudge_growth
 for permission in allow deny ask; do
     run_v2_permission_case "$permission"
 done

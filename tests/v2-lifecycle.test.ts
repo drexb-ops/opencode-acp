@@ -9,6 +9,7 @@ import { Message } from "@opencode/ai"
 import v1Server from "../lib/v1/plugin"
 import { setup } from "../lib/v2/plugin"
 import { V2OperationTracker } from "../lib/v2/lifecycle"
+import { V2_ACP_TOOL_NAMES } from "../lib/v2/tools"
 
 type DisposeRecord = {
     readonly disposed: string[]
@@ -22,9 +23,18 @@ type DisposeRecord = {
     readonly invokeContext: (event: unknown) => Promise<void>
     readonly invokeTool: (name: string, sessionID?: string) => Promise<unknown>
     readonly invokeCommand: (name: string, sessionID?: string) => Promise<void>
+    readonly replayToolNames: () => string[]
+    readonly replayCommandNames: () => string[]
 }
 
-async function makeContext(options: { failCommand?: boolean; throwToolDispose?: boolean } = {}) {
+async function makeContext(
+    options: {
+        failCommand?: boolean
+        throwToolDispose?: boolean
+        failToolReload?: number
+        failCommandReload?: number
+    } = {},
+) {
     const directory = await mkdtemp(join(tmpdir(), "acp-v2-lifecycle-"))
     await mkdir(join(directory, ".opencode"), { recursive: true })
     await writeFile(join(directory, ".opencode", "acp.jsonc"), '{ "autoUpdate": false }\n', "utf8")
@@ -46,6 +56,8 @@ async function makeContext(options: { failCommand?: boolean; throwToolDispose?: 
     let signalHistoryStarted = () => {}
     let expectedHistoryStarts = 1
     let observedHistoryStarts = 0
+    let remainingToolReloadFailures = options.failToolReload ?? 0
+    let remainingCommandReloadFailures = options.failCommandReload ?? 0
 
     const blockHistory = (expectedStarts = 1) => {
         historyBlocked = true
@@ -165,6 +177,10 @@ async function makeContext(options: { failCommand?: boolean; throwToolDispose?: 
             },
             async reload() {
                 reloads.tool += 1
+                if (remainingToolReloadFailures > 0) {
+                    remainingToolReloadFailures--
+                    throw new Error("tool reload failed")
+                }
             },
         },
         command: {
@@ -177,6 +193,10 @@ async function makeContext(options: { failCommand?: boolean; throwToolDispose?: 
             },
             async reload() {
                 reloads.command += 1
+                if (remainingCommandReloadFailures > 0) {
+                    remainingCommandReloadFailures--
+                    throw new Error("command reload failed")
+                }
             },
         },
         agent: {
@@ -266,6 +286,20 @@ async function makeContext(options: { failCommand?: boolean; throwToolDispose?: 
                     prompt: { text: `${name} help` },
                     delivery: "queue",
                 })
+            },
+            replayToolNames() {
+                const names: string[] = []
+                toolTransform?.({
+                    add: (tool) => names.push((tool as { name: string }).name),
+                })
+                return names
+            },
+            replayCommandNames() {
+                const names: string[] = []
+                commandTransform?.({
+                    add: (definition) => names.push((definition as { name: string }).name),
+                })
+                return names
             },
         } satisfies DisposeRecord,
     }
@@ -358,7 +392,9 @@ test("V1 exposes idempotent dispose for managed notification and update work", a
         assert.equal(typeof hooks.dispose, "function")
         await hooks.dispose?.()
         await hooks.dispose?.()
-        await new Promise<void>((resolve) => setTimeout(resolve, 10))
+        // Explicitly yield to the event loop so any late managed callback has
+        // a chance to run; do not rely on a wall-clock sleep.
+        await new Promise<void>((resolve) => setImmediate(resolve))
         assert.deepEqual(toasts, [])
     } finally {
         await rm(directory, { recursive: true, force: true })
@@ -466,6 +502,56 @@ test("V2 unload during blocked tool and command waits for both operations", asyn
         assert.equal(cleanupSettled, true)
         assert.equal(fixture.record.disposed.includes("tool"), true)
         assert.equal(fixture.record.disposed.includes("command"), true)
+    } finally {
+        await rm(fixture.directory, { recursive: true, force: true })
+    }
+})
+
+test("V2 proxy reload compensates both domains after command failure and retries the event", async () => {
+    const fixture = await makeContext({ failCommandReload: 1 })
+    try {
+        fixture.record.setProxy(true)
+        const cleanup = await setup(fixture.context)
+        fixture.record.setProxy(false)
+        fixture.record.pushCatalogEvent({ type: "catalog.updated", data: {} })
+        await new Promise<void>((resolve) => setImmediate(resolve))
+
+        assert.deepEqual(fixture.record.reloads, { tool: 2, command: 2 })
+
+        // The failed transition restored the prior enabled state. Replaying
+        // the unchanged catalog event must therefore retry the forward reload.
+        fixture.record.pushCatalogEvent({ type: "catalog.updated", data: {} })
+        await new Promise<void>((resolve) => setImmediate(resolve))
+        assert.deepEqual(fixture.record.reloads, { tool: 3, command: 3 })
+
+        // The fixture captures replayable transforms; each fresh editor models
+        // OpenCode's reload domain and must receive one registration per name.
+        const replayedTools = fixture.record.replayToolNames()
+        assert.deepEqual(replayedTools, [...V2_ACP_TOOL_NAMES])
+        assert.deepEqual(fixture.record.replayCommandNames(), ["acp", "dcp"])
+        assert.equal(new Set(replayedTools).size, V2_ACP_TOOL_NAMES.length)
+        assert.equal(new Set(fixture.record.replayCommandNames()).size, 2)
+
+        await (cleanup as () => Promise<void>)()
+    } finally {
+        await rm(fixture.directory, { recursive: true, force: true })
+    }
+})
+
+test("V2 proxy reload compensates both domains after tool failure and retries in inverse order", async () => {
+    const fixture = await makeContext({ failToolReload: 1 })
+    try {
+        fixture.record.setProxy(true)
+        const cleanup = await setup(fixture.context)
+        fixture.record.setProxy(false)
+        fixture.record.pushCatalogEvent({ type: "catalog.updated", data: {} })
+        await new Promise<void>((resolve) => setImmediate(resolve))
+        assert.deepEqual(fixture.record.reloads, { tool: 2, command: 2 })
+
+        fixture.record.pushCatalogEvent({ type: "catalog.updated", data: {} })
+        await new Promise<void>((resolve) => setImmediate(resolve))
+        assert.deepEqual(fixture.record.reloads, { tool: 3, command: 3 })
+        await (cleanup as () => Promise<void>)()
     } finally {
         await rm(fixture.directory, { recursive: true, force: true })
     }

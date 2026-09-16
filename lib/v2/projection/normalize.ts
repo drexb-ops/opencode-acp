@@ -29,7 +29,6 @@ const {
     addTextOrigin,
     isAcpOwnedId,
     isRecord,
-    canonical,
     contentCallId,
     contentResultId,
     contentText,
@@ -92,12 +91,12 @@ function expectedSourceMessage(source: SourceRecord): boolean {
 
 function outgoingById(
     id: string | undefined,
-    messages: readonly AiMessageValue[],
+    indicesById: ReadonlyMap<string, readonly number[]>,
     claimed: Set<number>,
 ): number | undefined {
     if (!id) return undefined
-    for (let index = 0; index < messages.length; index++) {
-        if (claimed.has(index) || aiMessageId(messages[index]) !== id) continue
+    for (const index of indicesById.get(id) ?? []) {
+        if (claimed.has(index)) continue
         claimed.add(index)
         return index
     }
@@ -106,20 +105,13 @@ function outgoingById(
 
 function outgoingSystem(
     text: string,
-    messages: readonly AiMessageValue[],
+    indicesByText: ReadonlyMap<string, readonly number[]>,
     claimed: Set<number>,
 ): number | undefined {
-    for (let index = 0; index < messages.length; index++) {
-        if (claimed.has(index) || aiRole(messages[index]) !== "system") continue
-        const parts = aiContent(messages[index])
-        if (
-            parts.length === 1 &&
-            contentType(parts[0]) === "text" &&
-            contentText(parts[0]) === text
-        ) {
-            claimed.add(index)
-            return index
-        }
+    for (const index of indicesByText.get(text) ?? []) {
+        if (claimed.has(index)) continue
+        claimed.add(index)
+        return index
     }
     return undefined
 }
@@ -412,7 +404,10 @@ function buildNormalizedSource(
                     origin.normalizedOutput = normalizedTool.output
                 if (normalizedTool.error !== undefined)
                     origin.normalizedError = normalizedTool.error
-                origin.normalizedInput = canonical(normalizedTool.state.input)
+                // Keep only a bounded fingerprint for potentially large tool
+                // inputs; the raw input remains available in the normalized
+                // working part when a representable edit is required.
+                origin.normalizedInputHash = hash(normalizedTool.state.input)
                 if (call) addPointer(origin, call, messages)
                 if (result) addPointer(origin, result, messages)
                 draft.origins.push(origin)
@@ -522,6 +517,33 @@ function sourceOutputMessageRoleIsValid(
     return aiRole(first) === "user"
 }
 
+function loweredToolCorrelationIsExact(
+    origin: V2ProvenanceEntry["origins"][number],
+    outgoing: readonly AiMessageValue[],
+): boolean {
+    if (origin.kind !== "tool" || origin.opaque) return true
+    if (origin.normalizedInputHash !== undefined) {
+        if (!origin.call || origin.call.contentIndex === undefined) return false
+        const callPart = aiContent(outgoing[origin.call.messageIndex])[origin.call.contentIndex]
+        const callInput = isRecord(callPart)
+            ? (callPart as unknown as Record<string, unknown>).input
+            : undefined
+        if (hash(callInput) !== origin.normalizedInputHash) return false
+    }
+    if (origin.normalizedOutput !== undefined) {
+        if (!origin.result || origin.result.contentIndex === undefined) return false
+        const resultPart = aiContent(outgoing[origin.result.messageIndex])[
+            origin.result.contentIndex
+        ]
+        const resultRecord = isRecord(resultPart)
+            ? (resultPart as unknown as Record<string, unknown>).result
+            : undefined
+        if (!isRecord(resultRecord) || resultRecord.type !== "text") return false
+        if (stringValue(resultRecord.value) !== origin.normalizedOutput) return false
+    }
+    return true
+}
+
 /**
  * Normalize V2 SessionMessage.Info values for ACP's existing WithParts engine.
  *
@@ -549,6 +571,52 @@ export function normalizeV2ProjectedHistory(
     const drafts: Draft[] = []
     const sourceIds = new Map<string, number[]>()
     let rejection: V2ProjectionRejection | undefined
+
+    // Duplicate lowered message IDs make index-based replay ambiguous.  Reject
+    // them before any patch can be attempted rather than letting one object
+    // silently shadow another in the provenance maps.
+    const outgoingIds = new Set<string>()
+    const outgoingIndicesById = new Map<string, number[]>()
+    const outgoingSystemIndicesByText = new Map<string, number[]>()
+    const outgoingRoleToolResultIndicesByCallId = new Map<string, number[]>()
+    for (let messageIndex = 0; messageIndex < outgoing.length; messageIndex++) {
+        const id = aiMessageId(outgoing[messageIndex])
+        if (id) {
+            if (outgoingIds.has(id)) {
+                rejection = rejection ?? {
+                    code: "invalid-source",
+                    message: `Lowered outgoing message ID ${id} occurs more than once`,
+                    sourceIndex: messageIndex,
+                }
+            }
+            outgoingIds.add(id)
+            const indices = outgoingIndicesById.get(id) ?? []
+            indices.push(messageIndex)
+            outgoingIndicesById.set(id, indices)
+        }
+        if (
+            aiRole(outgoing[messageIndex]) === "system" &&
+            aiContent(outgoing[messageIndex]).length === 1 &&
+            contentType(aiContent(outgoing[messageIndex])[0]) === "text"
+        ) {
+            const text = contentText(aiContent(outgoing[messageIndex])[0])
+            if (text !== undefined) {
+                const indices = outgoingSystemIndicesByText.get(text) ?? []
+                indices.push(messageIndex)
+                outgoingSystemIndicesByText.set(text, indices)
+            }
+        }
+        if (aiRole(outgoing[messageIndex]) === "tool") {
+            for (const part of aiContent(outgoing[messageIndex])) {
+                if (contentType(part) !== "tool-result") continue
+                const callID = contentResultId(part)
+                if (!callID) continue
+                const indices = outgoingRoleToolResultIndicesByCallId.get(callID) ?? []
+                if (indices[indices.length - 1] !== messageIndex) indices.push(messageIndex)
+                outgoingRoleToolResultIndicesByCallId.set(callID, indices)
+            }
+        }
+    }
 
     for (let sourceIndex = 0; sourceIndex < projected.length; sourceIndex++) {
         const source = sourceRecord(projected[sourceIndex])
@@ -591,13 +659,9 @@ export function normalizeV2ProjectedHistory(
             continue
         }
         if (draft.source.type === "system") {
-            const candidates = outgoing.filter(
-                (message, index) =>
-                    !claimedMessages.has(index) &&
-                    aiRole(message) === "system" &&
-                    aiContent(message).length === 1 &&
-                    contentType(aiContent(message)[0]) === "text" &&
-                    contentText(aiContent(message)[0]) === stringValue(draft.source.text),
+            const systemText = stringValue(draft.source.text) ?? ""
+            const candidates = (outgoingSystemIndicesByText.get(systemText) ?? []).filter(
+                (index) => !claimedMessages.has(index),
             )
             if (candidates.length > 1) {
                 rejection ??= {
@@ -606,9 +670,9 @@ export function normalizeV2ProjectedHistory(
                     sourceIndex: draft.sourceIndex,
                 }
             }
-            mapped = outgoingSystem(stringValue(draft.source.text) ?? "", outgoing, claimedMessages)
+            mapped = outgoingSystem(systemText, outgoingSystemIndicesByText, claimedMessages)
         } else {
-            mapped = outgoingById(id, outgoing, claimedMessages)
+            mapped = outgoingById(id, outgoingIndicesById, claimedMessages)
         }
         if (mapped !== undefined) draft.outgoingMessageIndices.push(mapped)
     }
@@ -629,12 +693,11 @@ export function normalizeV2ProjectedHistory(
             if (!callID) continue
             const executed = itemValue.executed === true
             if (executed) continue
+            const roleToolResultIndices = outgoingRoleToolResultIndicesByCallId.get(callID) ?? []
             const result = aiToolResultPointer(
                 [
                     ...draft.outgoingMessageIndices,
-                    ...outgoing.flatMap((message, index) =>
-                        aiRole(message) === "tool" && !claimedMessages.has(index) ? [index] : [],
-                    ),
+                    ...roleToolResultIndices.filter((index) => !claimedMessages.has(index)),
                 ],
                 callID,
                 outgoing,
@@ -734,8 +797,35 @@ export function normalizeV2ProjectedHistory(
         }
     }
 
+    for (const entry of normalizedEntries) {
+        for (const origin of entry.origins) {
+            if (!origin.opaque && origin.originalContent.length === 0) {
+                rejection ??= {
+                    code: "invalid-source",
+                    message: `Patchable origin ${origin.key} has no exact lowered outgoing match`,
+                    sourceIndex: entry.sourceIndex,
+                }
+            }
+            if (!loweredToolCorrelationIsExact(origin, outgoing)) {
+                rejection ??= {
+                    code: "invalid-source",
+                    message: `Tool origin ${origin.key} has no exact lowered input/output match`,
+                    sourceIndex: entry.sourceIndex,
+                }
+            }
+        }
+    }
+
+    const ownerByOutgoingIndex = new Map<number, Draft>()
+    for (const draft of drafts) {
+        for (const messageIndex of draft.outgoingMessageIndices) {
+            if (!ownerByOutgoingIndex.has(messageIndex))
+                ownerByOutgoingIndex.set(messageIndex, draft)
+        }
+    }
+
     const outgoingProvenance: V2OutgoingProvenance[] = outgoing.map((message, messageIndex) => {
-        const owner = drafts.find((draft) => draft.outgoingMessageIndices.includes(messageIndex))
+        const owner = ownerByOutgoingIndex.get(messageIndex)
         const opaqueContent = new Map<number, AiContentPart>()
         let opaqueMessage: AiMessageValue | undefined
         if (owner) {
@@ -753,9 +843,9 @@ export function normalizeV2ProjectedHistory(
                 }
             }
             // A provider may add content that has no lossless projected origin
-            // (for example a file result extension). Keep those non-text parts
-            // opaque without making ordinary patchable text in the same
-            // message opaque as well.
+            // (for example a file result extension or an extra text segment).
+            // Keep every such part opaque without changing the provenance of
+            // ordinary projected origins in the same message.
             if (!owner.opaque) {
                 const referenced = new Set(
                     owner.origins.flatMap((origin) =>
@@ -771,7 +861,7 @@ export function normalizeV2ProjectedHistory(
                 ) {
                     if (referenced.has(contentIndex)) continue
                     const part = aiContent(message)[contentIndex]
-                    if (part && contentType(part) !== "text") opaqueContent.set(contentIndex, part)
+                    if (part) opaqueContent.set(contentIndex, part)
                 }
             }
         } else {

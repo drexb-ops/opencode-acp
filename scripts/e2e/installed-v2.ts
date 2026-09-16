@@ -8,17 +8,41 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
+import {
+    assertNudgeCheckpointSequence,
+    comparePermissionProjections,
+    projectAcpState,
+    stableSerialize,
+} from "./verification-guards.mjs"
 
 type JsonRecord = Record<string, any>
 
+// Exact black-box values for the pinned OpenCode 2.0.3 fake-provider fixture.
+// Keeping them independent of ACP's implementation makes the installed test
+// fail if baseline transition logic drifts or resets unexpectedly.
+const EXPECTED_NUDGE_BASELINES = { initial: 15, first: 11_370, second: 23_059 }
+
 interface ToolResultObservation {
-    id?: string
     name?: string
     status: "completed" | "error"
     actionable?: boolean
 }
 
 interface RequestObservation {
+    inputTokens: number
+    messageCount: number
+    compressCallCount: number
+    nudgeDetected: boolean
+    nudgeSystemTokens?: number
+    scenarioPhase?: string
+    blockedRefCount?: number
+    protectedRefCount?: number
+    compressibleRefCount?: number
+    messageRefCount?: number
+    blockRefCount?: number
+    candidateOrRangeText?: boolean
+    calledCompress?: boolean
+    emittedCompressCount?: number
     isChild?: boolean
     isAuxiliary?: boolean
     requestPath?: string
@@ -30,6 +54,11 @@ interface RequestObservation {
     commandSentinelLeakage?: boolean
     acpOwnedNoticePresent?: boolean
     calledToolNames?: string[]
+    toolParameterObservations?: Array<{
+        name?: string
+        argumentLength: number
+        argumentKeys: string[]
+    }>
     toolResultStatuses?: ToolResultObservation[]
 }
 
@@ -37,6 +66,12 @@ interface Observations {
     requests: RequestObservation[]
     emittedTools?: string[]
     toolResults?: ToolResultObservation[]
+    activation?: {
+        exactStatus: number
+        exactDiagnosticMatched: boolean
+        fallbackUsed: boolean
+    }
+    nudgeCheckpoints?: Array<Record<string, any>>
 }
 
 const stage = process.argv[2]
@@ -170,6 +205,12 @@ function readObservations(): Observations {
         ...(Array.isArray(value.toolResults)
             ? { toolResults: value.toolResults as ToolResultObservation[] }
             : {}),
+        ...(value.activation && typeof value.activation === "object"
+            ? { activation: value.activation }
+            : {}),
+        ...(Array.isArray(value.nudgeCheckpoints)
+            ? { nudgeCheckpoints: value.nudgeCheckpoints as Array<Record<string, any>> }
+            : {}),
     }
 }
 
@@ -235,6 +276,61 @@ function stateBlocks(state: JsonRecord): JsonRecord[] {
     ) as JsonRecord[]
 }
 
+function protectedPermissionView(state: JsonRecord): JsonRecord {
+    return projectAcpState(state)
+}
+
+function permissionToolObservationView(observations: Observations): unknown[] {
+    return realRequests(observations).flatMap((item) => item.toolParameterObservations ?? [])
+}
+
+function persistedPermissionView(state: JsonRecord): JsonRecord {
+    return projectAcpState(state)
+}
+
+function readPersistedState(sessionID: string): JsonRecord {
+    return asRecord(readJSON(statePath(sessionID)))
+}
+
+function snapshotNudgeCheckpoint(
+    checkpoint: string,
+    sessionID: string,
+    observation: RequestObservation,
+    extra: JsonRecord = {},
+): JsonRecord {
+    const state = readPersistedState(sessionID)
+    const snapshot = {
+        checkpoint,
+        request: {
+            inputTokens: observation.inputTokens,
+            messageCount: observation.messageCount,
+            nudgeDetected: observation.nudgeDetected,
+            nudgeSystemTokens: observation.nudgeSystemTokens ?? null,
+            compressCallCount: observation.compressCallCount,
+            scenarioPhase: observation.scenarioPhase ?? null,
+            blockedRefCount: observation.blockedRefCount ?? 0,
+            protectedRefCount: observation.protectedRefCount ?? 0,
+            compressibleRefCount: observation.compressibleRefCount ?? 0,
+            messageRefCount: observation.messageRefCount ?? 0,
+            blockRefCount: observation.blockRefCount ?? 0,
+            candidateOrRangeText: observation.candidateOrRangeText ?? false,
+            calledCompress: observation.calledCompress === true,
+            emittedCompressCount: observation.emittedCompressCount ?? 0,
+        },
+        persisted: {
+            blockCount: countBlocks(state),
+            lastPerMessageNudgeTokens: state.nudges?.lastPerMessageNudgeTokens ?? null,
+            lastNudgeShownTokens: state.nudges?.lastNudgeShownTokens ?? null,
+        },
+        ...extra,
+    }
+    const observations = readObservations()
+    observations.nudgeCheckpoints = [...(observations.nudgeCheckpoints ?? []), snapshot]
+    writeJSON(observationsPath, observations)
+    writeJSON(`${root}/v2/nudge-${checkpoint}.json`, snapshot)
+    return snapshot
+}
+
 function statePath(sessionID: string): string {
     return `${stateDir}/${sessionID}.json`
 }
@@ -254,7 +350,7 @@ function pluginInfo(inventory: any[]): JsonRecord | undefined {
     return inventory.map(asRecord).find((item) => item.id === "opencode-acp")
 }
 
-async function inventory(strict: boolean): Promise<JsonRecord | undefined> {
+async function inventory(strict: boolean, requireActive = true): Promise<JsonRecord | undefined> {
     await request("POST", withLocation("/api/plugin/await-activation"), undefined, [204])
     let value = await request("GET", withLocation("/api/plugin"))
     let info = pluginInfo(data(value))
@@ -281,15 +377,24 @@ async function inventory(strict: boolean): Promise<JsonRecord | undefined> {
                 return false
             }
         })()
-    const fallbackMarker = process.env.E2E_WRAPPER_DIR
-        ? source.type === "local" &&
-          String(source.path ?? "").startsWith(process.env.E2E_WRAPPER_DIR)
-        : false
+    const wrapperDir = process.env.E2E_WRAPPER_DIR
+    const wrapperPrefix = wrapperDir
+        ? wrapperDir.endsWith("/")
+            ? wrapperDir
+            : `${wrapperDir}/`
+        : ""
+    const sourcePath = String(source.path ?? "")
+    const fallbackMarker =
+        wrapperDir !== undefined &&
+        source.type === "local" &&
+        (sourcePath === wrapperDir || sourcePath.startsWith(wrapperPrefix))
     if (!info) {
         writeJSON(`${root}/v2/activation.json`, { active: false, sourceType: source.type ?? null })
         return undefined
     }
-    record("installed ACP plugin is active", active, `status ${String(pluginState.status)}`)
+    if (requireActive) {
+        record("installed ACP plugin is active", active, `status ${String(pluginState.status)}`)
+    }
     record("installed ACP plugin has stable id", info.id === "opencode-acp")
     record("ACP server feature is present", asRecord(info.features).server === true)
     record("ACP TUI feature is present", asRecord(info.features).tui === true)
@@ -298,18 +403,20 @@ async function inventory(strict: boolean): Promise<JsonRecord | undefined> {
         record(
             "ACP source target is the packed file URL or documented wrapper fallback",
             sourceMatches || sourceLocalMatches || fallbackMarker,
-            `source ${String(source.type)} ${String(source.target ?? source.path ?? "")}`,
+            `source type ${String(source.type)}; packed=${sourceMatches}; local=${sourceLocalMatches}; wrapper=${fallbackMarker}`,
         )
     }
     writeJSON(`${root}/v2/activation.json`, {
         active,
         id: info.id,
         sourceType: source.type ?? null,
-        sourceTarget: source.target ?? source.path ?? null,
         sourceMatchesPackedURL: sourceMatches,
         wrapperFallback: fallbackMarker,
-        features: info.features ?? {},
-        state: info.state ?? {},
+        features: {
+            server: asRecord(info.features).server === true,
+            tui: asRecord(info.features).tui === true,
+            rpc: asRecord(info.features).rpc === true,
+        },
     })
     return info
 }
@@ -364,7 +471,13 @@ async function prompt(sessionID: string, text: string): Promise<void> {
 async function promptAndObserve(
     sessionID: string,
     text: string,
-): Promise<{ observations: Observations; observation: RequestObservation }> {
+): Promise<{
+    observations: Observations
+    observation: RequestObservation
+    newObservations: RequestObservation[]
+    nudgeObserved: boolean
+    nudgeObservation?: RequestObservation
+}> {
     const before = realRequests(readObservations()).length
     await prompt(sessionID, text)
     const observations = await waitFor(
@@ -372,7 +485,15 @@ async function promptAndObserve(
         async () => readObservations(),
         (value) => realRequests(value).length > before,
     )
-    return { observations, observation: latestReal(observations, before) }
+    const newObservations = realRequests(observations).slice(before)
+    const nudgeObservation = newObservations.find((item) => item.nudgeDetected === true)
+    return {
+        observations,
+        observation: latestReal(observations, before),
+        newObservations,
+        nudgeObserved: nudgeObservation !== undefined,
+        ...(nudgeObservation ? { nudgeObservation } : {}),
+    }
 }
 
 async function sessionInbox(sessionID: string): Promise<any[]> {
@@ -443,6 +564,18 @@ async function verifyState(sessionID: string, expectedBlocks?: number): Promise<
         )
     }
     return state
+}
+
+async function waitForState(
+    sessionID: string,
+    name: string,
+    predicate: (state: JsonRecord) => boolean,
+): Promise<JsonRecord> {
+    return waitFor(
+        name,
+        async () => readPersistedState(sessionID),
+        (state) => Object.keys(state).length > 0 && predicate(state),
+    )
 }
 
 async function stageMain(): Promise<void> {
@@ -601,7 +734,13 @@ async function stageReenabled(): Promise<void> {
 
     writeJSON(baselineFile, {
         blockCount: countBlocks(state),
-        summaries: stateBlocks(state).map((block) => block.summary),
+        projection: projectAcpState(state),
+        blockSummaryFingerprints: projectAcpState(state).prune.messages.blocksById.map(
+            (block: any) => ({
+                blockId: block.blockId,
+                summary: block.summary,
+            }),
+        ),
         compressedMessageCount: Object.keys(
             asRecord(asRecord(state.prune).messages).byMessageId ?? {},
         ).length,
@@ -641,10 +780,14 @@ async function stagePostRestart(): Promise<void> {
         "compression block count survives V2 server restart",
         countBlocks(state) === baseline.blockCount,
     )
-    const summaries = stateBlocks(state).map((block) => String(block.summary))
+    const currentProjection = projectAcpState(state)
+    const currentSummaryFingerprints = currentProjection.prune.messages.blocksById.map(
+        (block: any) => ({ blockId: block.blockId, summary: block.summary }),
+    )
     record(
         "compression summary survives V2 server restart",
-        summaries.some((summary) => (baseline.summaries ?? []).includes(summary)),
+        stableSerialize(currentSummaryFingerprints) ===
+            stableSerialize(baseline.blockSummaryFingerprints),
     )
     const listed = await waitForCommands(true)
     const names = commandNames(listed)
@@ -661,6 +804,290 @@ async function stagePostRestart(): Promise<void> {
     )
 }
 
+async function stageNudgeGrowth(): Promise<void> {
+    await health()
+    await inventory(true)
+    const sessionID = await createSession()
+
+    const baseline = await promptAndObserve(
+        sessionID,
+        "Establish the initial installed-artifact nudge baseline before context growth.",
+    )
+    record("nudge cycle initial request has no nudge", baseline.observation.nudgeDetected === false)
+    const baselineState = await waitForState(
+        sessionID,
+        "initial nudge baseline",
+        (state) =>
+            countBlocks(state) === 0 &&
+            state.nudges?.lastPerMessageNudgeTokens !== undefined &&
+            state.nudges?.lastNudgeShownTokens === undefined,
+    )
+    const initialBaseline = baselineState.nudges.lastPerMessageNudgeTokens
+    record(
+        "initial persisted per-message baseline matches the pinned fixture",
+        initialBaseline === EXPECTED_NUDGE_BASELINES.initial,
+        `expected ${EXPECTED_NUDGE_BASELINES.initial} got ${String(initialBaseline)}`,
+    )
+    const checkpoints: JsonRecord[] = []
+    const capture = (name: string, observation: RequestObservation, extra: JsonRecord = {}) => {
+        const snapshot = snapshotNudgeCheckpoint(name, sessionID, observation, extra)
+        checkpoints.push(snapshot)
+        return snapshot
+    }
+
+    capture("initial-baseline", baseline.observation)
+
+    // With preserveRecentMessages=10, these turns cross the growth floor while
+    // every candidate is still protected.  No compress call is emitted; the
+    // persisted baseline must remain byte-for-byte the initial numeric value.
+    let previousInputTokens = baseline.observation.inputTokens
+    for (let index = 1; index <= 4; index++) {
+        const growth = await promptAndObserve(
+            sessionID,
+            `PROTECTED_NO_TARGET_PHASE ${index}: grow context while every candidate remains protected.`,
+        )
+        record(
+            `protected no-target turn ${index} has no nudge text`,
+            growth.nudgeObserved === false,
+        )
+        record(
+            `protected no-target turn ${index} grows actual input`,
+            growth.observation.inputTokens > previousInputTokens,
+            `got ${growth.observation.inputTokens} after ${previousInputTokens}`,
+        )
+        previousInputTokens = growth.observation.inputTokens
+        const state = await waitForState(
+            sessionID,
+            `protected no-target state ${index}`,
+            (value) => value.nudges?.lastPerMessageNudgeTokens !== undefined,
+        )
+        record(
+            `protected no-target turn ${index} preserves the exact baseline`,
+            state.nudges.lastPerMessageNudgeTokens === initialBaseline &&
+                state.nudges.lastNudgeShownTokens === undefined,
+            `baseline ${String(state.nudges.lastPerMessageNudgeTokens)}`,
+        )
+        capture(`protected-no-target-${index}`, growth.observation, {
+            phase: "protected-no-target",
+            protectedEvidence: {
+                configuredPreserveRecentMessages: 10,
+                blockedRefCount: growth.observation.blockedRefCount ?? 0,
+                protectedRefCount: growth.observation.protectedRefCount ?? 0,
+                compressibleRefCount: growth.observation.compressibleRefCount ?? 0,
+                messageRefCount: growth.observation.messageRefCount ?? 0,
+                blockRefCount: growth.observation.blockRefCount ?? 0,
+                candidateOrRangeText: growth.observation.candidateOrRangeText === true,
+                withinConfiguredWindow:
+                    (growth.observation.messageRefCount ?? 0) > 0 &&
+                    (growth.observation.messageRefCount ?? 0) <= 10,
+                complete:
+                    (((growth.observation.blockedRefCount ?? 0) >= 10 &&
+                        (growth.observation.compressibleRefCount ?? 0) === 0) ||
+                        ((growth.observation.messageRefCount ?? 0) > 0 &&
+                            (growth.observation.messageRefCount ?? 0) <= 10)) &&
+                    growth.observation.candidateOrRangeText !== true,
+            },
+            preToolCheckpoint: {
+                hostStateObservable: false,
+                providerNudgeObserved: false,
+            },
+        })
+    }
+    const protectedEvidence = checkpoints.filter((item) => item.phase === "protected-no-target")
+    record(
+        "protected no-target phase stays within the configured provider-visible ref window",
+        protectedEvidence.some(
+            (item) =>
+                item.protectedEvidence?.complete === true &&
+                item.protectedEvidence?.withinConfiguredWindow === true,
+        ),
+    )
+
+    const findPostCompressionObservation = (
+        result: Awaited<ReturnType<typeof promptAndObserve>>,
+        nudge: RequestObservation,
+    ) => {
+        const index = result.newObservations.indexOf(nudge)
+        return (
+            result.newObservations
+                .slice(index + 1)
+                .find((item) =>
+                    item.toolResultStatuses?.some((tool) => tool.name === "compress"),
+                ) ?? result.newObservations.at(-1)
+        )
+    }
+
+    let firstNudge: Awaited<ReturnType<typeof promptAndObserve>> | undefined
+    for (let index = 1; index <= 14; index++) {
+        const growth = await promptAndObserve(
+            sessionID,
+            `ELIGIBLE_GROWTH_PHASE ${index}: add completed context until a real nudge is actionable.`,
+        )
+        if (growth.nudgeObserved) {
+            firstNudge = growth
+            break
+        }
+        record(`eligible growth turn ${index} remains pre-nudge`, growth.nudgeObserved === false)
+        const state = await waitForState(
+            sessionID,
+            `eligible growth state ${index}`,
+            (value) => value.nudges?.lastPerMessageNudgeTokens !== undefined,
+        )
+        record(
+            `eligible growth turn ${index} preserves the protected baseline`,
+            state.nudges.lastPerMessageNudgeTokens === initialBaseline,
+        )
+        previousInputTokens = growth.observation.inputTokens
+    }
+    if (!firstNudge?.nudgeObservation)
+        throw new Error("first actionable nudge was not observed in bounded growth")
+    const firstNudgeObservation = firstNudge.nudgeObservation
+    const firstPostObservation = findPostCompressionObservation(firstNudge, firstNudgeObservation)
+    if (!firstPostObservation) throw new Error("first nudge produced no post-tool observation")
+    record("first ACP nudge is observed by detectNudge", true)
+    record(
+        "first nudge carries an actual system-token observation",
+        typeof firstNudgeObservation.nudgeSystemTokens === "number",
+    )
+    record(
+        "first nudge has a real compress result observation",
+        firstPostObservation.toolResultStatuses?.some((tool) => tool.name === "compress") === true,
+    )
+    const firstCompressed = await waitForState(
+        sessionID,
+        "first nudge compression commit",
+        (state) => countBlocks(state) === 1,
+    )
+    const firstPostCompressionBaseline = firstCompressed.nudges?.lastPerMessageNudgeTokens
+    const firstTransition = {
+        baseline: initialBaseline,
+        preCompressTokens: firstNudgeObservation.inputTokens,
+        // OpenCode's persisted baseline is the authoritative post-tool token
+        // observation. The fake provider's prompt_tokens intentionally excludes
+        // host tool/schema accounting, so it is not substituted here.
+        postCompressTokens: firstPostCompressionBaseline,
+        postBaselineSource: "persisted-acp-state",
+    }
+    record(
+        "first compression persists the exact pinned baseline",
+        firstPostCompressionBaseline === EXPECTED_NUDGE_BASELINES.first,
+        `expected ${EXPECTED_NUDGE_BASELINES.first} got ${String(firstPostCompressionBaseline)}`,
+    )
+    record(
+        "first compression clears the pending shown-nudge snapshot",
+        firstCompressed.nudges?.lastNudgeShownTokens === undefined,
+    )
+    capture("first-nudge-observed", firstNudgeObservation, {
+        emittedCompressCount: (firstNudge.observations.emittedTools ?? []).filter(
+            (name) => name === "compress",
+        ).length,
+        preToolCheckpoint: {
+            hostStateObservable: false,
+            providerNudgeObserved: firstNudgeObservation.nudgeDetected === true,
+            observedSystemTokens: firstNudgeObservation.nudgeSystemTokens ?? null,
+        },
+    })
+    capture("post-first-compression", firstPostObservation, {
+        transition: firstTransition,
+        emittedCompressCount: (firstNudge.observations.emittedTools ?? []).filter(
+            (name) => name === "compress",
+        ).length,
+    })
+
+    previousInputTokens = firstPostObservation.inputTokens
+    let secondNudge: Awaited<ReturnType<typeof promptAndObserve>> | undefined
+    for (let index = 1; index <= 20; index++) {
+        const growth = await promptAndObserve(
+            sessionID,
+            `SECOND_ELIGIBLE_GROWTH_PHASE ${index}: grow after the first exact baseline transition.`,
+        )
+        if (growth.nudgeObserved) {
+            secondNudge = growth
+            break
+        }
+        record(
+            `post-first growth turn ${index} remains pre-second-nudge`,
+            growth.nudgeObserved === false,
+        )
+        record(
+            `post-first growth turn ${index} increases actual input`,
+            growth.observation.inputTokens > previousInputTokens,
+            `got ${growth.observation.inputTokens} after ${previousInputTokens}`,
+        )
+        previousInputTokens = growth.observation.inputTokens
+        const state = await waitForState(
+            sessionID,
+            `post-first growth state ${index}`,
+            (value) => value.nudges?.lastPerMessageNudgeTokens !== undefined,
+        )
+        record(
+            `post-first growth turn ${index} preserves its exact new baseline`,
+            state.nudges.lastPerMessageNudgeTokens === firstPostCompressionBaseline &&
+                state.nudges.lastNudgeShownTokens === undefined,
+        )
+    }
+    if (!secondNudge?.nudgeObservation)
+        throw new Error("second actionable nudge was not observed in bounded growth")
+    const secondNudgeObservation = secondNudge.nudgeObservation
+    const secondPostObservation = findPostCompressionObservation(
+        secondNudge,
+        secondNudgeObservation,
+    )
+    if (!secondPostObservation) throw new Error("second nudge produced no post-tool observation")
+    const secondCompressed = await waitForState(
+        sessionID,
+        "second nudge compression commit",
+        (state) => countBlocks(state) === 2,
+    )
+    const secondPostCompressionBaseline = secondCompressed.nudges?.lastPerMessageNudgeTokens
+    const secondTransition = {
+        baseline: firstPostCompressionBaseline,
+        preCompressTokens: secondNudgeObservation.inputTokens,
+        postCompressTokens: secondPostCompressionBaseline,
+        postBaselineSource: "persisted-acp-state",
+    }
+    record("second ACP nudge is observed by detectNudge", true)
+    record(
+        "second compression persists the exact pinned baseline",
+        secondPostCompressionBaseline === EXPECTED_NUDGE_BASELINES.second,
+        `expected ${EXPECTED_NUDGE_BASELINES.second} got ${String(secondPostCompressionBaseline)}`,
+    )
+    record(
+        "second compression clears the pending shown-nudge snapshot",
+        secondCompressed.nudges?.lastNudgeShownTokens === undefined,
+    )
+    const emittedCompresses = (secondNudge.observations.emittedTools ?? []).filter(
+        (name) => name === "compress",
+    ).length
+    record(
+        "exactly two nudge-triggered compress emissions occurred",
+        emittedCompresses === 2,
+        `got ${emittedCompresses}`,
+    )
+    capture("second-nudge-observed", secondNudgeObservation, {
+        emittedCompressCount: emittedCompresses,
+        preToolCheckpoint: {
+            hostStateObservable: false,
+            providerNudgeObserved: secondNudgeObservation.nudgeDetected === true,
+            observedSystemTokens: secondNudgeObservation.nudgeSystemTokens ?? null,
+        },
+    })
+    capture("post-second-compression", secondPostObservation, {
+        transition: secondTransition,
+        emittedCompressCount: emittedCompresses,
+    })
+
+    assertNudgeCheckpointSequence(checkpoints, {
+        expectedCompressEmissions: 2,
+        expectedBaselines: EXPECTED_NUDGE_BASELINES,
+    })
+    record("nudge checkpoint verifier accepts the exact historical branch sequence", true)
+    record(
+        "nudge cycle ends with exactly two resulting blocks",
+        countBlocks(secondCompressed) === 2,
+    )
+}
+
 async function stagePermission(): Promise<void> {
     const permission = process.env.E2E_PERMISSION
     if (permission !== "allow" && permission !== "deny" && permission !== "ask") {
@@ -669,19 +1096,56 @@ async function stagePermission(): Promise<void> {
     await health()
     await inventory(true)
     const sessionID = await createSession()
-    let result = await promptAndObserve(
+    const warmup = await promptAndObserve(
         sessionID,
         `Permission ${permission} installed-artifact probe.`,
     )
+    const beforeState = await verifyState(sessionID, 0)
+    const beforePersisted = readPersistedState(sessionID)
+    const beforeProtected = protectedPermissionView(beforeState)
+    const beforePersistedProtected = persistedPermissionView(beforePersisted)
+    const beforeToolParameters = permissionToolObservationView(warmup.observations)
+    writeJSON(`${root}/v2/permission-${permission}-before.json`, {
+        runtimeProjection: beforeProtected,
+        persistedProjection: beforePersistedProtected,
+        toolParameterObservations: beforeToolParameters,
+    })
+
     // The first request establishes a durable user/assistant pair. The second
     // request lets the allow case allocate a real range while ask still fails
     // before that range can mutate state.
-    result = await promptAndObserve(
+    const result = await promptAndObserve(
         sessionID,
         `Permission ${permission} execute the scripted check now.`,
     )
     const observations = result.observations
     const counts = emittedCounts(observations)
+    const afterState = await waitForState(
+        sessionID,
+        `permission ${permission} state persistence`,
+        (state) =>
+            permission === "allow"
+                ? countBlocks(state) >= 1
+                : comparePermissionProjections(beforeState, state).toolOwned.equal,
+    )
+    const afterPersisted = readPersistedState(sessionID)
+    const afterProtected = protectedPermissionView(afterState)
+    const afterPersistedProtected = persistedPermissionView(afterPersisted)
+    const afterToolParameters = permissionToolObservationView(observations)
+    const runtimeComparison = comparePermissionProjections(beforeState, afterState)
+    const persistedComparison = comparePermissionProjections(beforePersisted, afterPersisted)
+    writeJSON(`${root}/v2/permission-${permission}-after.json`, {
+        runtimeProjection: afterProtected,
+        persistedProjection: afterPersistedProtected,
+        comparison: {
+            runtime: runtimeComparison,
+            persisted: persistedComparison,
+            separation:
+                "message/ref/model/current-turn changes are host context; prune, nudge, stats, timing, cache, and request flags are ACP tool-owned",
+        },
+        toolParameterObservations: afterToolParameters,
+    })
+
     if (permission === "deny") {
         assertAcpCatalog(result.observation, false)
         record(
@@ -691,7 +1155,41 @@ async function stagePermission(): Promise<void> {
         )
         const names = commandNames(await commands())
         record("deny removes ACP commands", !names.some((name) => name === "acp" || name === "dcp"))
-        await verifyState(sessionID, 0)
+        record(
+            "deny leaves ACP prune, stats, and tool-parameter state unchanged",
+            runtimeComparison.toolOwned.equal && runtimeComparison.unknownFields.equal,
+        )
+        record(
+            "deny separates legitimate host context/ref changes",
+            runtimeComparison.hostContext.changedFields.every((field: string) =>
+                [
+                    "sessionId",
+                    "isSubAgent",
+                    "compressPermission",
+                    "messageIds",
+                    "lastCompaction",
+                    "currentTurn",
+                    "modelContextLimit",
+                    "modelProviderID",
+                    "modelID",
+                    "systemPromptTokens",
+                    "storageDir",
+                    "lastUpdated",
+                    "sessionName",
+                    "nudges",
+                    "unknownFields",
+                ].includes(field),
+            ),
+        )
+        record(
+            "deny persists only legitimate context/ref updates",
+            persistedComparison.toolOwned.equal && persistedComparison.unknownFields.equal,
+        )
+        record(
+            "deny records no ACP tool parameters",
+            afterToolParameters.filter((item: any) => item.name && acpTools.includes(item.name))
+                .length === 0,
+        )
         return
     }
 
@@ -709,9 +1207,45 @@ async function stagePermission(): Promise<void> {
             `got ${toolResult?.status ?? "missing"}`,
         )
         record("permission ask result is actionable", toolResult?.actionable === true)
+        record("permission ask leaves no compression block", countBlocks(afterState) === 0)
         record(
-            "permission ask leaves no compression block",
-            countBlocks(await verifyState(sessionID)) === 0,
+            "permission ask does not mutate ACP prune, stats, or tool-parameter state",
+            runtimeComparison.toolOwned.equal && runtimeComparison.unknownFields.equal,
+        )
+        record(
+            "permission ask separates legitimate host context/ref changes",
+            runtimeComparison.hostContext.changedFields.every((field: string) =>
+                [
+                    "sessionId",
+                    "isSubAgent",
+                    "compressPermission",
+                    "messageIds",
+                    "lastCompaction",
+                    "currentTurn",
+                    "modelContextLimit",
+                    "modelProviderID",
+                    "modelID",
+                    "systemPromptTokens",
+                    "storageDir",
+                    "lastUpdated",
+                    "sessionName",
+                    "nudges",
+                    "unknownFields",
+                ].includes(field),
+            ),
+        )
+        record(
+            "permission ask persists no unauthorized compression mutation",
+            persistedComparison.toolOwned.equal && persistedComparison.unknownFields.equal,
+        )
+        record(
+            "permission ask tool parameter observation is redacted and actionable",
+            afterToolParameters.every(
+                (item: any) =>
+                    !Object.prototype.hasOwnProperty.call(item, "arguments") &&
+                    !Object.prototype.hasOwnProperty.call(item, "id") &&
+                    Array.isArray(item.argumentKeys),
+            ) && afterToolParameters.some((item: any) => item.name === "compress"),
         )
         const names = commandNames(await commands())
         record(
@@ -725,18 +1259,23 @@ async function stagePermission(): Promise<void> {
                 (item) => item.name === "compress" && item.status === "completed",
             ),
         )
-        await verifyState(sessionID, 1)
+        record("permission allow allocates a compression block", countBlocks(afterState) === 1)
+        record(
+            "permission allow persists the expected compression mutation",
+            comparePermissionProjections(beforePersisted, afterPersisted).toolOwned.equal === false,
+        )
     }
 }
 
 async function run(): Promise<void> {
     if (!stage)
         throw new Error(
-            "Usage: installed-v2.ts <activate|main|proxy-disabled|reenabled|toggle-disabled|toggle-restored|post-restart|permission>",
+            "Usage: installed-v2.ts <activate|main|proxy-disabled|reenabled|toggle-disabled|toggle-restored|post-restart|nudge-growth|permission>",
         )
     if (stage === "activate") {
-        const info = await inventory(false)
-        if (!info) {
+        const info = await inventory(false, false)
+        const active = asRecord(asRecord(info).state).status === "active"
+        if (!info || !active) {
             writeJSON(`${root}/v2/activation.json`, { active: false })
             process.exitCode = 10
             return
@@ -750,6 +1289,7 @@ async function run(): Promise<void> {
     else if (stage === "toggle-disabled") await stageToggleDisabled()
     else if (stage === "toggle-restored") await stageToggleRestored()
     else if (stage === "post-restart") await stagePostRestart()
+    else if (stage === "nudge-growth") await stageNudgeGrowth()
     else if (stage === "permission") await stagePermission()
     else throw new Error(`unknown installed V2 stage ${stage}`)
     console.log(`  PASS ${stage} stage completed (${assertions} assertions)`)

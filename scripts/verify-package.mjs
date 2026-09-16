@@ -13,6 +13,12 @@ import { execFileSync } from "node:child_process"
 import path from "node:path"
 import process from "node:process"
 import { fileURLToPath } from "node:url"
+import {
+    assertMinimalProbeEnv,
+    buildMinimalProbeEnv,
+    captureOwnedDirectory,
+    removeOwnedDirectory,
+} from "./e2e/verification-guards.mjs"
 
 const require = createRequire(import.meta.url)
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)))
@@ -78,9 +84,34 @@ const credentialFilenamePatterns = [
 ]
 
 const packageInfoCache = new Map()
+const approvedStagingParent = "/tmp/opencode"
+const stagingPrefix = "opencode-acp-package-"
+const installPrefix = "opencode-acp-package-install-"
 
 function fail(message) {
     throw new Error(message)
+}
+
+function ensureApprovedStagingParent() {
+    mkdirSync(approvedStagingParent, { recursive: true })
+    try {
+        captureOwnedDirectory(approvedStagingParent, { label: "approved staging parent" })
+    } catch (error) {
+        fail(error instanceof Error ? error.message : "approved staging parent is unsafe")
+    }
+}
+
+function removeExactStagingRoot(identity, prefix) {
+    if (!identity) return
+    try {
+        removeOwnedDirectory(identity, { parent: approvedStagingParent, prefix })
+    } catch (error) {
+        fail(
+            error instanceof Error
+                ? `refusing unsafe owned-directory cleanup: ${error.message}`
+                : "refusing unsafe owned-directory cleanup",
+        )
+    }
 }
 
 function readJson(relativePath) {
@@ -423,6 +454,12 @@ function copyPackFiles(pkg, stagingRoot) {
         if (!existsSync(source)) {
             fail(`package.json files entry is missing: ${entry}`)
         }
+        try {
+            const sourceStat = statSync(source)
+            if (!sourceStat) fail(`package.json files entry is not stat-able: ${entry}`)
+        } catch {
+            fail(`package.json files entry is not a regular staged source: ${entry}`)
+        }
 
         mkdirSync(path.dirname(destination), { recursive: true })
         cpSync(source, destination, { recursive: true })
@@ -430,12 +467,16 @@ function copyPackFiles(pkg, stagingRoot) {
 }
 
 function stagePackageForPack(pkg) {
-    const stagingParent = "/tmp/opencode"
-    mkdirSync(stagingParent, { recursive: true })
-    const stagingRoot = mkdtempSync(path.join(stagingParent, "opencode-acp-package-"))
+    ensureApprovedStagingParent()
+    const stagingRoot = mkdtempSync(path.join(approvedStagingParent, stagingPrefix))
+    const stagingIdentity = captureOwnedDirectory(stagingRoot, {
+        label: "package staging root",
+        parent: approvedStagingParent,
+        prefix: stagingPrefix,
+    })
 
     try {
-        copyPackFiles(pkg, stagingRoot)
+        copyPackFiles(pkg, stagingIdentity.realPath)
 
         // npm's directory packer runs `prepare` even when --ignore-scripts is
         // supplied. Remove only that lifecycle hook from the staging manifest
@@ -446,41 +487,72 @@ function stagePackageForPack(pkg) {
             delete stagedPackage.scripts.prepare
         }
         writeFileSync(
-            path.join(stagingRoot, "package.json"),
+            path.join(stagingIdentity.realPath, "package.json"),
             `${JSON.stringify(stagedPackage, null, 4)}\n`,
         )
 
-        return { stagingRoot, cleanup: () => rmSync(stagingRoot, { recursive: true, force: true }) }
+        return {
+            stagingRoot: stagingIdentity.realPath,
+            stagingIdentity,
+            cleanup: () => removeExactStagingRoot(stagingIdentity, stagingPrefix),
+        }
     } catch (error) {
-        rmSync(stagingRoot, { recursive: true, force: true })
+        removeExactStagingRoot(stagingIdentity, stagingPrefix)
         throw error
     }
 }
 
-function inspectPackedFiles(pkg) {
+function createPackedArtifact(pkg) {
     const staged = stagePackageForPack(pkg)
     try {
+        const packHome = path.join(staged.stagingRoot, "home")
+        const packNpmrc = path.join(staged.stagingRoot, "npmrc")
+        const packGlobalNpmrc = path.join(staged.stagingRoot, "global-npmrc")
+        const packTmp = path.join(staged.stagingRoot, "tmp")
+        const packCache = path.join(staged.stagingRoot, "npm-cache")
+        mkdirSync(packHome, { recursive: true })
+        mkdirSync(packTmp, { recursive: true })
+        mkdirSync(packCache, { recursive: true })
+        writeFileSync(
+            packNpmrc,
+            "registry=https://registry.npmjs.org/\nfund=false\naudit=false\nupdate-notifier=false\n",
+        )
+        writeFileSync(packGlobalNpmrc, "")
+        const npmEnv = buildMinimalProbeEnv({
+            home: packHome,
+            tmpdir: packTmp,
+            userconfig: packNpmrc,
+            globalconfig: packGlobalNpmrc,
+            cache: packCache,
+            npm: true,
+        })
+        assertMinimalProbeEnv(npmEnv, true)
         let output
         try {
-            output = execFileSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], {
-                cwd: staged.stagingRoot,
-                encoding: "utf8",
-                stdio: ["ignore", "pipe", "pipe"],
-            })
+            output = execFileSync(
+                "npm",
+                ["pack", "--json", "--ignore-scripts", "--pack-destination", staged.stagingRoot],
+                {
+                    cwd: staged.stagingRoot,
+                    encoding: "utf8",
+                    stdio: ["ignore", "pipe", "pipe"],
+                    env: npmEnv,
+                },
+            )
         } catch {
-            fail("npm pack --dry-run --json --ignore-scripts failed")
+            fail("npm pack --json --ignore-scripts failed while creating the verification tarball")
         }
 
         let results
         try {
             results = JSON.parse(output.trim())
         } catch {
-            fail("npm pack --dry-run --json --ignore-scripts did not return JSON metadata")
+            fail("npm pack --json --ignore-scripts did not return JSON metadata")
         }
 
         const [result] = results
         if (!result || !Array.isArray(result.files)) {
-            fail("npm pack --dry-run --json --ignore-scripts did not return file metadata")
+            fail("npm pack --json --ignore-scripts did not return file metadata")
         }
         if (result.name !== pkg.name || result.version !== pkg.version) {
             fail("npm pack metadata name/version do not match package.json")
@@ -507,85 +579,214 @@ function inspectPackedFiles(pkg) {
             fail(`packed tarball contains credential-like filename ${credentialLike}`)
         }
 
-        return { result, packedPaths }
-    } finally {
+        const filename = typeof result.filename === "string" ? result.filename : ""
+        const tarballPath = filename
+            ? path.resolve(staged.stagingRoot, filename)
+            : path.join(staged.stagingRoot, `${pkg.name.replace("/", "-")}-${pkg.version}.tgz`)
+        if (
+            !tarballPath.startsWith(`${staged.stagingRoot}${path.sep}`) ||
+            !existsSync(tarballPath)
+        ) {
+            fail(
+                "npm pack did not create the expected real tarball inside the approved staging root",
+            )
+        }
+
+        let tarMembers
+        try {
+            tarMembers = execFileSync("tar", ["-tzf", tarballPath], {
+                encoding: "utf8",
+                stdio: ["ignore", "pipe", "pipe"],
+            })
+                .trim()
+                .split(/\r?\n/)
+                .filter(Boolean)
+                .map((member) => member.replace(/^package\//, ""))
+        } catch {
+            fail("created verification tarball could not be inspected")
+        }
+        const tarMemberSet = new Set(tarMembers)
+        for (const required of requiredTarballFiles) {
+            if (!tarMemberSet.has(required)) {
+                fail(`created tarball is missing member ${required}`)
+            }
+        }
+
+        return { result, packedPaths, tarballPath, cleanup: staged.cleanup }
+    } catch (error) {
         staged.cleanup()
+        throw error
     }
 }
 
-async function importWithTimeout(specifier, label) {
-    let timer
+function validateInstalledModules(pkg, installRoot, packageDir) {
+    captureOwnedDirectory(packageDir, {
+        label: "installed package directory",
+        parent: installRoot,
+        prefix: pkg.name,
+    })
+    const probePath = path.join(installRoot, `.opencode-acp-entrypoint-probe-${process.pid}.mjs`)
+    const probeSource = `
+import { fileURLToPath } from "node:url"
+import path from "node:path"
+
+const specs = [
+    ["root", ${JSON.stringify(pkg.name)}],
+    ["server", ${JSON.stringify(`${pkg.name}/server`)}],
+    ["TUI", ${JSON.stringify(`${pkg.name}/tui`)}],
+    ["RPC", ${JSON.stringify(`${pkg.name}/rpc`)}],
+]
+const modules = new Map()
+for (const [label, specifier] of specs) {
     try {
-        return await Promise.race([
-            import(specifier),
-            new Promise((_, reject) => {
-                timer = setTimeout(() => reject(new Error("module import timed out")), 5000)
-            }),
-        ])
-    } catch {
-        fail(`unable to dynamically import built ${label} entrypoint`)
+        modules.set(label, await import(specifier))
+    } catch (error) {
+        throw new Error(
+            "installed " + label + " entrypoint import failed: " +
+                (error instanceof Error ? error.message : String(error)),
+        )
+    }
+}
+
+const rootModule = modules.get("root")
+const serverModule = modules.get("server")
+const tuiModule = modules.get("TUI")
+const rpcModule = modules.get("RPC")
+const rootDefinition = rootModule?.default
+if (!rootDefinition || typeof rootDefinition !== "object") {
+    throw new Error("installed root entrypoint default export must be an object")
+}
+if (rootDefinition.id !== ${JSON.stringify(expectedPackageName)}) {
+    throw new Error("installed root entrypoint default export has the wrong id")
+}
+if (typeof rootDefinition.setup !== "function" || typeof rootDefinition.server !== "function") {
+    throw new Error("installed root entrypoint default export is missing setup() or server()")
+}
+if (serverModule?.default !== rootDefinition) {
+    throw new Error("installed server entrypoint is not the same dual definition as root")
+}
+const tuiDefinition = tuiModule?.default
+if (
+    tuiModule?.ACP_TUI_PLUGIN_ID !== "opencode-acp-tui" ||
+    !tuiDefinition ||
+    tuiDefinition.id !== "opencode-acp-tui" ||
+    typeof tuiDefinition.setup !== "function"
+) {
+    throw new Error("installed TUI entrypoint has the wrong definition shape")
+}
+const rpc = rpcModule?.AcpRpc
+const required = rpc?.events?.notification?.schema?.required
+if (
+    rpc?.id !== ${JSON.stringify(expectedPackageName)} ||
+    !rpc?.events?.notification?.schema ||
+    !Array.isArray(required) ||
+    !["title", "message", "variant"].every((field) => required.includes(field))
+) {
+    throw new Error("installed RPC entrypoint has the wrong notification schema")
+}
+
+const resolvedRoot = fileURLToPath(import.meta.resolve(${JSON.stringify(pkg.name)}))
+const resolvedPackage = path.dirname(path.dirname(resolvedRoot))
+const expectedPackage = ${JSON.stringify(packageDir)}
+const expectedInstallRoot = ${JSON.stringify(installRoot)}
+const relative = path.relative(expectedInstallRoot, resolvedPackage)
+if (
+    resolvedPackage !== expectedPackage ||
+    relative === "" ||
+    relative.startsWith(".." + path.sep) ||
+    path.isAbsolute(relative)
+) {
+    throw new Error("installed entrypoints resolved outside the isolated opencode-acp package")
+}
+`
+
+    try {
+        writeFileSync(probePath, probeSource, "utf8")
+        const probeHome = path.join(installRoot, "probe-home")
+        const probeTmp = path.join(installRoot, "probe-tmp")
+        mkdirSync(probeHome, { recursive: true })
+        mkdirSync(probeTmp, { recursive: true })
+        const nodeEnv = buildMinimalProbeEnv({
+            home: probeHome,
+            tmpdir: probeTmp,
+            npm: false,
+        })
+        assertMinimalProbeEnv(nodeEnv, false)
+        execFileSync(process.execPath, [probePath], {
+            cwd: installRoot,
+            env: nodeEnv,
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "pipe"],
+        })
+    } catch (error) {
+        const stderr = error?.stderr ? String(error.stderr).trim() : ""
+        const stdout = error?.stdout ? String(error.stdout).trim() : ""
+        const detail =
+            stderr || stdout || (error instanceof Error ? error.message : "unknown error")
+        fail(`installed package entrypoint verification failed: ${detail}`)
     } finally {
-        if (timer) clearTimeout(timer)
+        rmSync(probePath, { force: true })
     }
 }
 
-function assertServerDefinition(module, label) {
-    const definition = module?.default
-    if (!definition || typeof definition !== "object") {
-        fail(`${label} default export must be an object`)
+function installArtifactForVerification(pkg, tarballPath) {
+    ensureApprovedStagingParent()
+    const installRoot = mkdtempSync(path.join(approvedStagingParent, installPrefix))
+    const installIdentity = captureOwnedDirectory(installRoot, {
+        label: "package install root",
+        parent: approvedStagingParent,
+        prefix: installPrefix,
+    })
+    const npmrc = path.join(installRoot, "npmrc")
+    const globalNpmrc = path.join(installRoot, "global-npmrc")
+    const installHome = path.join(installRoot, "home")
+    const installTmp = path.join(installRoot, "tmp")
+    const installCache = path.join(installRoot, "npm-cache")
+    mkdirSync(installHome, { recursive: true })
+    mkdirSync(installTmp, { recursive: true })
+    mkdirSync(installCache, { recursive: true })
+    writeFileSync(
+        npmrc,
+        "registry=https://registry.npmjs.org/\nfund=false\naudit=false\nupdate-notifier=false\n",
+    )
+    writeFileSync(globalNpmrc, "")
+    const npmEnv = buildMinimalProbeEnv({
+        home: installHome,
+        tmpdir: installTmp,
+        userconfig: npmrc,
+        globalconfig: globalNpmrc,
+        cache: installCache,
+        npm: true,
+    })
+    assertMinimalProbeEnv(npmEnv, true)
+    try {
+        try {
+            execFileSync(
+                "npm",
+                ["install", "--ignore-scripts", "--no-save", "--package-lock=false", tarballPath],
+                {
+                    cwd: installRoot,
+                    encoding: "utf8",
+                    stdio: ["ignore", "pipe", "pipe"],
+                    env: npmEnv,
+                },
+            )
+        } catch {
+            fail("isolated npm install of the real ACP tarball failed")
+        }
+        const packageDir = path.join(installRoot, "node_modules", pkg.name)
+        if (!existsSync(path.join(packageDir, "package.json"))) {
+            fail("isolated npm install did not create node_modules/opencode-acp")
+        }
+        const packageIdentity = captureOwnedDirectory(packageDir, {
+            label: "installed package directory",
+            parent: installIdentity.realPath,
+            prefix: pkg.name,
+        })
+        validateInstalledModules(pkg, installIdentity.realPath, packageIdentity.realPath)
+    } finally {
+        removeExactStagingRoot(installIdentity, installPrefix)
     }
-    if (definition.id !== expectedPackageName) {
-        fail(`${label} default export id must be ${expectedPackageName}`)
-    }
-    if (typeof definition.setup !== "function" || typeof definition.server !== "function") {
-        fail(`${label} default export must provide setup() and server()`)
-    }
-    return definition
-}
-
-function assertTuiDefinition(module) {
-    const expectedId = "opencode-acp-tui"
-    if (module?.ACP_TUI_PLUGIN_ID !== expectedId) {
-        fail(`TUI entrypoint must export stable ID ${expectedId}`)
-    }
-    const definition = module?.default
-    if (!definition || definition.id !== expectedId || typeof definition.setup !== "function") {
-        fail(`TUI default export must provide id ${expectedId} and setup()`)
-    }
-}
-
-function assertRpcDefinition(module) {
-    const rpc = module?.AcpRpc
-    const notification = rpc?.events?.notification
-    const required = notification?.schema?.required
-    if (
-        rpc?.id !== expectedPackageName ||
-        !notification ||
-        typeof notification.schema !== "object"
-    ) {
-        fail(`RPC entrypoint must expose ${expectedPackageName} with a notification event schema`)
-    }
-    if (
-        !Array.isArray(required) ||
-        !["title", "message", "variant"].every((field) => required.includes(field))
-    ) {
-        fail("RPC notification schema must require title, message, and variant")
-    }
-}
-
-async function validateBuiltModules(pkg) {
-    const rootModule = await importWithTimeout(pkg.name, "root")
-    const serverModule = await importWithTimeout(`${pkg.name}/server`, "server")
-    const tuiModule = await importWithTimeout(`${pkg.name}/tui`, "TUI")
-    const rpcModule = await importWithTimeout(`${pkg.name}/rpc`, "RPC")
-
-    const rootDefinition = assertServerDefinition(rootModule, "root")
-    const serverDefinition = assertServerDefinition(serverModule, "server")
-    if (rootDefinition !== serverDefinition) {
-        fail("root and ./server must resolve the same dual server definition")
-    }
-    assertTuiDefinition(tuiModule)
-    assertRpcDefinition(rpcModule)
 }
 
 async function main() {
@@ -594,12 +795,16 @@ async function main() {
     assertPackageJsonShape(pkg)
     validateSourceRuntimeImportGraph()
 
-    const { result, packedPaths } = inspectPackedFiles(pkg)
-    validateBuiltRuntimeImportGraph(packedPaths)
-    await validateBuiltModules(pkg)
+    const packed = createPackedArtifact(pkg)
+    try {
+        validateBuiltRuntimeImportGraph(packed.packedPaths)
+        installArtifactForVerification(pkg, packed.tarballPath)
+    } finally {
+        packed.cleanup()
+    }
 
-    console.log(`package verification passed for ${result.name}@${result.version}`)
-    console.log(`tarball entries: ${result.entryCount ?? result.files.length}`)
+    console.log(`package verification passed for ${packed.result.name}@${packed.result.version}`)
+    console.log(`tarball entries: ${packed.result.entryCount ?? packed.result.files.length}`)
     console.log(`entrypoint files: ${entrypointFiles.join(", ")}`)
 }
 

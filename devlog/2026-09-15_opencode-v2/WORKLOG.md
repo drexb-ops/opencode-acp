@@ -2,15 +2,18 @@
 
 - Task ID: `2026-09-15_opencode-v2`
 - Home Repo: `opencode-acp`
-- Status: InProgress
-- Updated: 2026-09-16 04:47 UTC
+- Status: ReadyForPR
+- Updated: 2026-09-16 20:42 UTC
+- Final audited range: `707e360..working-tree` (commit recorded after integration)
+- References: #395, #404, #407, #415
 
 ## 1. Summary
 
 - **What was done**: Investigated the production plugin failure, mapped ACP's V1
-  host dependencies, verified the exact published OpenCode 2.0.3 plugin API,
-  recorded the approved V1/V2 compatibility design, and implemented the shared
-  host/tool contracts, transactional state, and V2 primary context adapter.
+  host dependencies, verified the exact published OpenCode 2.0.3 plugin API, and
+  implemented one dual-runtime package with shared tools/state, explicit V1/V2
+  adapters, loss-aware V2 projection/patching, transactional lifecycle fencing,
+  typed RPC/TUI notifications, real-tarball verification, and exact-host E2E.
 - **Why**: ACP currently fails before initialization on OpenCode V2 because its
   default export and all host integrations use the V1 plugin API.
 - **Behavior / compatibility changes**: No intentional V1 behavior changes;
@@ -21,21 +24,22 @@
 
 ### Commits
 
-| Commit      | Description                                                    |
-| ----------- | -------------------------------------------------------------- |
-| `7224ab9`   | Record the approved OpenCode V2 compatibility design           |
-| `3c00b9a`   | Refine concurrency boundaries and add the implementation plan  |
-| `b42d827`   | Record the integrated pre-change verification baseline         |
-| `b569ccd`   | Add the dual V1/V2 entrypoint and dependency foundation        |
-| `5d21e10`   | Add shared host services and host-neutral tool definitions     |
-| `9a349ec`   | Serialize session mutations and stage transform effects        |
-| `42637b6`   | Add V2 projection, validated patching, and primary context     |
-| `3a8c21e`   | Add V2 tools, commands, permissions, timing, and proxy state   |
-| `6ef5085`   | Add typed notifications and managed runtime cleanup            |
-| `ec3c7a7`   | Publish and verify server, TUI, and RPC package entrypoints    |
-| `5eaafdb`   | Document OpenCode V1/V2 compatibility                          |
-| `0cccee3`   | Resolve lifecycle, state recovery, and projection audit issues |
-| This commit | Add and verify installed-artifact V1/V2 E2E                    |
+| Commit    | Description                                                    |
+| --------- | -------------------------------------------------------------- |
+| `7224ab9` | Record the approved OpenCode V2 compatibility design           |
+| `3c00b9a` | Refine concurrency boundaries and add the implementation plan  |
+| `b42d827` | Record the integrated pre-change verification baseline         |
+| `b569ccd` | Add the dual V1/V2 entrypoint and dependency foundation        |
+| `5d21e10` | Add shared host services and host-neutral tool definitions     |
+| `9a349ec` | Serialize session mutations and stage transform effects        |
+| `42637b6` | Add V2 projection, validated patching, and primary context     |
+| `3a8c21e` | Add V2 tools, commands, permissions, timing, and proxy state   |
+| `6ef5085` | Add typed notifications and managed runtime cleanup            |
+| `ec3c7a7` | Publish and verify server, TUI, and RPC package entrypoints    |
+| `5eaafdb` | Document OpenCode V1/V2 compatibility                          |
+| `0cccee3` | Resolve lifecycle, state recovery, and projection audit issues |
+| `707e360` | Add and verify installed-artifact V1/V2 E2E                    |
+| Pending   | Close final audit findings and record final verification       |
 
 ### Phase 1
 
@@ -286,8 +290,11 @@
   foreground `serve --hostname 127.0.0.1 --port <owned-port>` API path.
 - The V2 2.0.3 release rejected the requested `file:///.../*.tgz` configured
   plugin path with its exact `configured plugin path must be a directory`
-  diagnostic. The harness retains that server log and falls back to a local
-  wrapper whose server/TUI/RPC files import the same installed tarball.
+  diagnostic. The final harness permits fallback only for status 10 plus that
+  inactive result and exact owned-log diagnostic. It first imports root,
+  server, TUI, and RPC through the privately installed tarball package, then
+  uses a wrapper pointing at those same installed package files. It never falls
+  back to workspace `dist` or a second artifact.
 - **PASS**: `KEEP_E2E=1 ./scripts/e2e/run-installed-e2e.sh` completed in 104s.
   V1 passed default dual-entrypoint `.server()` discovery, fake response, and
   exactly one scripted ACP block. V2 passed active plugin ID/features, native
@@ -298,8 +305,11 @@
   disable/re-enable cycles, and duplicate-registration checks.
 - **PASS**: V2 permission fixtures passed `allow` (compression block created),
   `deny` (tools/commands omitted), and `ask` (advertised tool returned an
-  actionable fail-closed result with no state mutation). TUI rendering was not
-  started; it remains unit-tested only.
+  actionable fail-closed result before shared ACP tool execution). Installed
+  snapshots prove ask/deny leave prune data, statistics, and tool parameters
+  unchanged and persist no unauthorized compression mutation; ordinary host
+  session/history updates are not described as ACP tool mutation. TUI rendering
+  was not started; it remains unit-tested only.
 - The successful run used `KEEP_E2E=1`, so diagnostics remain at
   `/tmp/opencode/acp-e2e` until a normal success run performs the harness's
   exact-root cleanup. No service-wide stop, global install, commit, push, or
@@ -315,12 +325,9 @@
   `npm run verify:package` (253 tarball entries), targeted E2E unit helpers
   (34/34), strict TS checks for the new Node/Bun drivers, targeted Prettier,
   `bash -n`, and `git diff --check`. No changes were committed.
-- **AUTHORITATIVE RERUN AFTER AUDIT FIXES**: `npm run e2e:installed` passed from
-  commit `0cccee3` plus the uncommitted Phase 9 harness in 101s. It reverified
-  exact V1 1.18.29 and V2 2.0.3, all five tools, command isolation,
-  persistence/restart, proxy transitions, duplicate prevention, and the
-  allow/deny/ask permission matrix, then removed `/tmp/opencode/acp-e2e` and
-  every owned process.
+- The historical 101-second rerun was performed from `0cccee3` plus then-
+  uncommitted Phase 9 work. It has been superseded by the final combined-source
+  runs recorded in Section 15.
 
 ## 13. Independent audit corrections
 
@@ -338,5 +345,145 @@
 - **PASS**: corrective implementation full suite 1,371/1,371; lead-focused
   corrective suites 118/118; typecheck, build, package verification, targeted
   formatting, and diff checks.
-- Because source/tests changed after the initial audits, final follow-up reviews
-  of `ec3c7a7..0cccee3` remain required before PR readiness.
+- Follow-up reviews of `ec3c7a7..707e360` found additional lifecycle, replay,
+  model-override, harness-safety, package-import, fixture, and installed-nudge
+  gaps. Section 14 records their resolution. Two independent final reviews of
+  the complete post-`707e360` worktree remain required before PR readiness.
+
+## 14. Final audit corrections
+
+- Filed #415 to record the follow-up defects and their required acceptance
+  evidence; #407 records compaction-restart and custom-storage/legacy fork
+  recovery. The migration PR must also reference the original compatibility
+  failure #395 and same-session concurrency issue #404.
+- V2 context history load, initialization, transformation, patch validation,
+  synchronous state/event commit, persistence, and deferred effects now remain
+  inside one per-session reservation. Fresh sessions stay hidden behind their
+  initialization barrier until acceptance. A rejected, inactive, or throwing
+  request restores seeded state/timing or removes its new placeholder and staged
+  persistence. The accepted commit callback has no await between the final
+  lifecycle check and state/event mutation.
+- V2 tool mutations now use a complete working `SessionState`, exact shared-
+  timing rollback, staged persistence/notifications/files, and a lifecycle-
+  authorized commit. Commands similarly stage state, exports, persistence, and
+  synthetic notices. Cleanup invalidates leases, waits for reserved work, then
+  disposes registrations/resources.
+- Replayed V2 patches validate exact message/content positions and ordered prior
+  output objects. Patchable content carries bounded value fingerprints; opaque
+  provider/file payloads retain identity/position checks without whole-payload
+  hashing. Same-ID replacement, cross-message movement, within-message reorder,
+  and ambiguous source removal fail closed.
+- Empty normalized V2 provider/model IDs now fall back to the active state model,
+  restoring provider/model-specific compression overrides. Public V2 fixtures
+  are schema-validated and cover running/streaming/completed/error tools,
+  provider state/results, file output, and checkpoint provenance.
+- Legacy fork recovery normalizes both parent message maps and message-form block
+  boundaries. Complete clone/commit tests cover all state containers, optional
+  block deactivation fields, binary views, and `Error` values.
+- Proxy transitions compensate both tool and command domains after partial reload
+  failure, restore the old disabled state, and retry the same catalog event
+  without duplicate registrations.
+- The installed harness canonicalizes its approved base, creates unique `mktemp`
+  run roots, rejects traversal/sibling/exact-root deletion targets, and cleans
+  only its revalidated root and owned PIDs. Package verification installs the
+  real tarball under `/tmp/opencode` with lifecycle scripts disabled and imports
+  all public entrypoints through its package export map.
+- Added installed V2 baseline → growth → first nudge → real compression → new
+  baseline → growth → second nudge/compression coverage with
+  `preserveRecentMessages: 2`. Eleven persisted checkpoints make the historical
+  baseline-reset bug observable.
+- Final review follow-up added a protected/no-target phase with
+  `preserveRecentMessages: 10`, fixed black-box baselines for the pinned fixture,
+  exactly two nudge-triggered tool emissions/blocks, and mutation self-tests.
+  Permission artifacts now project every mutable state field into bounded
+  hashes/counts/shapes and never retain summaries, arguments, results, paths, or
+  provider values.
+- V2 quality rejection is now typed: only `qualityGateRetryPending` survives a
+  rejected speculative tool transaction, allowing the immediate
+  `acknowledgeRisk` retry while all other state/timing/effects roll back.
+- Projection normalization rejects incomplete same-ID text/tool correlation and
+  duplicate outgoing IDs. Patch replay uses object/ID/index maps, fixed SHA-256
+  fingerprints, current-array removal positions, and stable ACP insertion IDs;
+  a 1,200-message regression covers the large-history path.
+- `decompress.toFile` now requires an existing canonical parent under `/tmp` or
+  `~/.cache/opencode`, rejects symlink components/final symlinks, and opens with
+  `O_NOFOLLOW`. Ordinary restart now normalizes legacy four-digit block
+  boundaries, not only fork recovery.
+- Registry reads fail closed during active live-state callbacks; synchronous
+  commit errors restore existing/fresh state and shared timing, while accepted
+  post-commit errors release the initialization barrier without rolling back.
+  V2 permission/catalog preflight checks lifecycle before shared mutation, and
+  timing cleanup removes only keys owned by that plugin instance.
+- Package/E2E subprocesses now use allowlisted environments and isolated npm
+  configs. Temporary cleanup verifies canonical path plus device/inode identity;
+  fallback classification examines only fresh attempt logs and rejects any
+  additional activation/schema/import diagnostics.
+
+## 15. Final verification evidence
+
+### Lead-owned source and package checks
+
+- **PASS**: `npm run typecheck`.
+- **PASS**: `npm test` — 1,412/1,412 tests in 119.0s.
+- **PASS**: focused quality/decompress/V2/state/rebuild/nudge suites — 151/151.
+- **PASS**: `npm run build`.
+- **PASS**: `npm run verify:package` — real tarball installed in an isolated
+  prefix; root, server, TUI, and RPC imports passed; 253 entries.
+- **PASS**: `npm pack --dry-run --json --ignore-scripts` — 253 entries containing
+  only published documentation, package metadata, and `dist`; no repository
+  source/tests/scripts, credential-like, or private-key-like filenames.
+- **PASS**: strict TypeScript for installed V1/V2/fake/verifier drivers; `bash -n`
+  for both E2E harnesses and the PR check; `node --check` for modified MJS
+  drivers; `git diff --check`; and targeted Prettier for every changed file.
+- **KNOWN PRE-EXISTING FAILURE**: repository-wide `npm run format:check` still
+  reports 423 inherited files outside this work. The branch does not
+  mass-format unrelated history; all changed files pass targeted Prettier.
+
+### Exact installed-artifact matrix
+
+| Run                  | Result     | Evidence                                                                                          |
+| -------------------- | ---------- | ------------------------------------------------------------------------------------------------- |
+| Path guard           | PASS       | Traversal, sibling, unsafe parent, exact-root deletion, and two concurrent unique roots verified. |
+| Retained diagnostics | PASS, 103s | Exact V1 1.18.29/V2 2.0.3; retained root inspected, then removed with the inode-safe helper.      |
+| Normal cleanup       | PASS, 102s | Exact pinned baseline assertions plus the full matrix; generated root removed; no runs remain.    |
+
+- The direct V2 tarball attempt returned status 10, was inactive, and matched
+  only `configured plugin path must be a directory`; wrapper fallback was
+  recorded as `true`. Both private V1/V2 installs independently resolved all
+  four ACP entrypoints before fallback.
+- V1 discovered the packed dual `.server()` export, reached the fake provider,
+  and created exactly one ACP block.
+- V2 proved the active plugin ID plus server/TUI/RPC features; native config and
+  model limits; five unique tools; both command aliases with no model leakage;
+  summary/ref/system context; restart persistence; two proxy disable/re-enable
+  cycles; duplicate prevention; and allow/deny/ask semantics.
+- Installed nudge checkpoints preserved exact baseline `15` through four
+  protected/no-target growth turns (including growth beyond the configured
+  threshold), committed first block/pinned baseline `11370`, preserved it through
+  later growth, and committed the second block/pinned baseline `23059`. Both
+  nudges were detected from real outbound context and emitted exactly two real
+  compress calls. Self-tests corrupt no-target and post-compression checkpoints
+  and require verification to fail.
+- Interactive terminal rendering was intentionally not started; typed RPC-to-TUI
+  behavior remains covered by `tests/v2-notifications.test.ts`.
+
+### Review gate
+
+- Reviewer A and reviewer B each completed a full read-only source/test/E2E/doc
+  review. They found quality-retry, replay correlation/performance,
+  symlink-write, timing cleanup, restart normalization, diagnostic exclusivity,
+  permission-redaction, verifier-environment, and historical-nudge proof gaps.
+- Two bounded coding passes resolved those findings and added the final tests and
+  script self-tests described above. Lead review then caught and fixed strict
+  `.mjs` declaration drift and replaced a circular nudge expectation with pinned
+  black-box baselines.
+
+| Reviewer                          | Session                          | Scope                                                                                         | Result                                                             |
+| --------------------------------- | -------------------------------- | --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| Reviewer A — runtime correctness  | `ses_f54a18254ffeI7EOwAAg5TPrxo` | Every modified source/test/E2E/verifier/doc path; initial review plus three closure refreshes | No P0/P1/P2 findings; complete independent AGENTS.md review        |
+| Reviewer B — test/artifact safety | `ses_f54a10c54fferJdnE2EeYWIj7G` | Same complete inventory; independent initial review plus closure refreshes                    | No P0/P1/P2 findings; second complete independent AGENTS.md review |
+
+- **PASS**: the dual-agent source and test review requirement is satisfied for
+  the complete `707e360..working-tree` corrective delta. Both reviewers used
+  current direct source for final sign-off. No merge, publish, version bump, or
+  changelog change was performed.

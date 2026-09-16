@@ -6,6 +6,7 @@ import type { Logger } from "../logger"
 import type { NoticeSink } from "../host"
 import type { SessionState, WithParts } from "../state"
 import { sendIgnoredMessage } from "../ui/notification"
+import type { DeferredMutationEffect } from "../state/transaction"
 
 export interface AcpCommandContext {
     notices: NoticeSink
@@ -15,6 +16,9 @@ export interface AcpCommandContext {
     sessionId: string
     messages: WithParts[]
     workingDirectory: string
+    /** Optional V2 transaction hooks; V1 keeps direct command behavior. */
+    defer?: (effect: DeferredMutationEffect) => void
+    isActive?: () => boolean
 }
 
 export function buildAcpHelpText(): string {

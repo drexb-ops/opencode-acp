@@ -22,6 +22,8 @@ import {
     type WithParts,
 } from "../lib/state"
 import type { PluginConfig } from "../lib/config"
+import { withToolSessionMutation } from "../lib/compress/types"
+import { V2OperationTracker } from "../lib/v2/lifecycle"
 
 const sessionID = "v2-tools-session"
 
@@ -217,6 +219,106 @@ test("V2 maps IDs, progress metadata, string/object output, and attachments", as
     assert.equal(run.guarded(), 0)
 })
 
+test("V2 transaction restores shared timing maps exactly after inactivity or failure", async () => {
+    const state = createSessionState()
+    state.sessionId = sessionID
+    state.compressionTiming.startsByCallId.set("original-start", 10)
+    state.compressionTiming.startsByCallId.set("original-removed", 11)
+    state.compressionTiming.pendingByCallId.set("original-pending", {
+        messageId: "message-1",
+        callId: "call-1",
+        durationMs: 20,
+    })
+    const run = factory(state)
+    const schema = z.object({})
+
+    const mutateTiming = async (
+        _input: unknown,
+        context: Parameters<SharedToolDefinition["execute"]>[1],
+    ) =>
+        withToolSessionMutation(run.context, context, async (toolContext) => {
+            toolContext.state.compressionTiming.startsByCallId.set("original-start", 99)
+            toolContext.state.compressionTiming.startsByCallId.delete("original-removed")
+            toolContext.state.compressionTiming.startsByCallId.set("speculative-start", 30)
+            const pending = toolContext.state.compressionTiming.pendingByCallId
+            pending.get("original-pending")!.durationMs = 88
+            pending.delete("original-pending")
+            pending.set("speculative-pending", {
+                messageId: "speculative-message",
+                callId: "speculative-call",
+                durationMs: 40,
+            })
+            if (context.callID === "blocked-call") {
+                await new Promise<void>((resolve) => {
+                    blockedRelease = resolve
+                    blockedStarted()
+                })
+            }
+            if (context.callID === "throwing-call") throw new Error("timing failure")
+            return "done"
+        })
+
+    let blockedRelease = () => {}
+    let blockedStarted = () => {}
+    const started = new Promise<void>((resolve) => {
+        blockedStarted = resolve
+    })
+    const tracker = new V2OperationTracker()
+    const definition: SharedToolDefinition<typeof schema> = {
+        name: "timing-test",
+        description: "timing-test",
+        schema,
+        inputSchema: schema,
+        execute: mutateTiming,
+    }
+    const starts = state.compressionTiming.startsByCallId
+    const pending = state.compressionTiming.pendingByCallId
+    const timing = state.compressionTiming
+    const originalPending = pending.get("original-pending")
+    const beforeStarts = [...starts.entries()]
+    const beforePending = [...pending.entries()].map(([key, value]) => [key, { ...value }] as const)
+    const blockedTool = createV2Tool(
+        definition,
+        run.context,
+        run.adapter,
+        run.hostPermissions,
+        () => true,
+        tracker,
+    )
+    const blockedResult = blockedTool.execute({}, { ...v2Context(), id: "blocked-call" })
+    await started
+    tracker.deactivate()
+    blockedRelease()
+    const inactiveResult = await blockedResult
+
+    assert.match(String(inactiveResult.content), /shutting down/i)
+    assert.strictEqual(state.compressionTiming, timing)
+    assert.strictEqual(state.compressionTiming.startsByCallId, starts)
+    assert.strictEqual(state.compressionTiming.pendingByCallId, pending)
+    assert.strictEqual(pending.get("original-pending"), originalPending)
+    assert.deepEqual([...starts.entries()], beforeStarts)
+    assert.deepEqual([...pending.entries()], beforePending)
+
+    const throwingTracker = new V2OperationTracker()
+    const throwingTool = createV2Tool(
+        definition,
+        run.context,
+        run.adapter,
+        run.hostPermissions,
+        () => true,
+        throwingTracker,
+    )
+    const throwingResult = await throwingTool.execute({}, { ...v2Context(), id: "throwing-call" })
+
+    assert.match(String(throwingResult.content), /timing-test failed/i)
+    assert.strictEqual(state.compressionTiming, timing)
+    assert.strictEqual(state.compressionTiming.startsByCallId, starts)
+    assert.strictEqual(state.compressionTiming.pendingByCallId, pending)
+    assert.strictEqual(pending.get("original-pending"), originalPending)
+    assert.deepEqual([...starts.entries()], beforeStarts)
+    assert.deepEqual([...pending.entries()], beforePending)
+})
+
 test("V2 deny and ask return safe results before state acquisition or mutation", async () => {
     let executed = 0
     const state = createSessionState()
@@ -393,7 +495,7 @@ test("actual ACP definitions retain their exact V2 names", () => {
     )
 })
 
-test("V2 compress applies model overrides from state when tool history lacks user metadata", async () => {
+test("V2 compress applies model overrides from state when normalized history has blank identifiers", async () => {
     const state = createSessionState()
     state.sessionId = sessionID
     state.modelProviderID = "provider"
@@ -406,6 +508,7 @@ test("V2 compress applies model overrides from state when tool history lacks use
                 },
             },
         },
+        minCompressRange: 2000,
         preserveLastUserMessage: false,
         preserveRecentMessages: 0,
         preserveRecentTokens: 0,
@@ -416,6 +519,7 @@ test("V2 compress applies model overrides from state when tool history lacks use
             sessionID,
             role: "user",
             agent: "code",
+            model: { providerID: "", modelID: "" },
             time: { created: 1 },
         } as WithParts["info"],
         parts: [
@@ -424,37 +528,35 @@ test("V2 compress applies model overrides from state when tool history lacks use
                 id: "history-user-part",
                 sessionID,
                 messageID: "history-user",
-                text: "short",
+                text: "x".repeat(1500),
             },
         ],
     }
     run.adapter.sessions.messages = async () => [history]
     const definition = createCompressRangeToolDefinition(run.context)
 
-    await assert.rejects(
-        () =>
-            definition.execute(
+    const result = await definition.execute(
+        {
+            topic: "short range",
+            content: [
                 {
-                    topic: "short range",
-                    content: [
-                        {
-                            startId: "m00001",
-                            endId: "m00001",
-                            summary: "summary",
-                        },
-                    ],
+                    startId: "m00001",
+                    endId: "m00001",
+                    summary: "summary",
                 },
-                {
-                    sessionID,
-                    messageID: "message-1",
-                    callID: "call-1",
-                    ask: async () => {},
-                    metadata: () => {},
-                    permission: "allow",
-                },
-            ),
-        /Range too small/,
+            ],
+        },
+        {
+            sessionID,
+            messageID: "message-1",
+            callID: "call-1",
+            ask: async () => {},
+            metadata: () => {},
+            permission: "allow",
+        },
     )
+    assert.match(String(result), /Compressed 1 messages/)
+    assert.equal(state.prune.messages.blocksById.size, 1)
 })
 
 test("V2 delegates actual ACP execution to the shared single session guard", async () => {

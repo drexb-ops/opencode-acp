@@ -3,11 +3,13 @@
 - Task ID: `2026-09-15_opencode-v2`
 - Home Repo: `opencode-acp`
 - Created: 2026-09-15
-- Status: InProgress
+- Status: Complete
 - Priority: P0
 - Owner: OpenCode agent
 - References: https://github.com/ranxianglei/opencode-acp/issues/395,
-  https://github.com/ranxianglei/opencode-acp/issues/404
+  https://github.com/ranxianglei/opencode-acp/issues/404,
+  https://github.com/ranxianglei/opencode-acp/issues/407,
+  https://github.com/ranxianglei/opencode-acp/issues/415
 
 ## 1. Background & Problem Statement
 
@@ -83,52 +85,55 @@
 ## 4. Acceptance Criteria
 
 - **Plugin compatibility**:
-    - [ ] The packed default export has `id: "opencode-acp"`, a V2 `setup`
+    - [x] The packed default export has `id: "opencode-acp"`, a V2 `setup`
           function, and a V1 `server` function.
-    - [ ] The packed artifact loads as active on OpenCode 2.0.3.
-    - [ ] The packed artifact passes a V1 >= 1.18.29 compatibility smoke test.
+    - [x] The packed artifact loads as active on OpenCode 2.0.3.
+    - [x] The packed artifact passes a V1 >= 1.18.29 compatibility smoke test.
 - **V2 behavior**:
-    - [ ] Primary model context receives ACP pruning, summaries, message refs,
+    - [x] Primary model context receives ACP pruning, summaries, message refs,
           nudges, protected-content handling, and the ACP system prompt.
-    - [ ] Compaction, generate, and title requests are not modified by ACP.
-    - [ ] `compress`, `decompress`, `search_context`, `acp_status`, and
+    - [x] Compaction, generate, and title requests are not modified by ACP.
+    - [x] `compress`, `decompress`, `search_context`, `acp_status`, and
           `acp_context_recap` register once as direct model tools and execute through
           shared ACP logic.
-    - [ ] `/acp` and `/dcp` execute without sending raw arguments to the model.
-    - [ ] Command output remains visible but is excluded from later model context.
-    - [ ] V2 allow and deny permission behavior is enforced; ask fails closed
+    - [x] `/acp` and `/dcp` execute without sending raw arguments to the model.
+    - [x] Command output remains visible but is excluded from later model context.
+    - [x] V2 allow and deny permission behavior is enforced; ask fails closed
           before state mutation with an actionable error.
-    - [ ] `BILLION_CONTEXT_PROXY` and configured `/bili/` routes disable ACP; a
+    - [x] `BILLION_CONTEXT_PROXY` and configured `/bili/` routes disable ACP; a
           later catalog change can re-enable it.
-    - [ ] V2 TUI notifications use a typed RPC bridge and do not affect server-only
+    - [x] V2 TUI notifications use a typed RPC bridge and do not affect server-only
           or headless operation.
-    - [ ] Plugin reload/unload leaves no duplicate registrations, event loops, or
+    - [x] Plugin reload/unload leaves no duplicate registrations, event loops, or
           timers.
 - **Data integrity**:
-    - [ ] Existing state files load without migration or schema changes.
-    - [ ] V2 projection and patch correlation is validated by message ID and tool
+    - [x] Existing state files load without migration or schema changes.
+    - [x] V2 projection and patch correlation is validated by message ID and tool
           call ID.
-    - [ ] An invalid or ambiguous patch preserves the original model request and
+    - [x] An invalid or ambiguous patch preserves the original model request and
           rolls back request-scoped ACP state changes.
-    - [ ] Same-session concurrent initialization and transform/tool work cannot
+    - [x] Same-session concurrent initialization and transform/tool work cannot
           expose partial state or overwrite a newer committed state.
-    - [ ] Tool-call/result pairs remain atomic and unchanged provider data is
+    - [x] Tool-call/result pairs remain atomic and unchanged provider data is
           retained.
-    - [ ] Completed compaction resets transient ACP state while preserving active
+    - [x] Completed compaction resets transient ACP state while preserving active
           ACP blocks.
-    - [ ] Fork recovery retains parent-to-child message/block translation.
+    - [x] Fork recovery retains parent-to-child message/block translation.
 - **Packaging and verification**:
-    - [ ] `npm run format:check`, `npm run typecheck`, `npm test`, `npm run build`,
-          and `npm run verify:package` pass.
-    - [ ] The package lock is consistent with the manifest.
-    - [ ] `./server`, `./tui`, and `./rpc` resolve from the packed artifact.
-    - [ ] Credential-like files and repository-only sources are excluded from the
+    - [x] `npm run typecheck`, `npm test`, `npm run build`, and
+          `npm run verify:package` pass; every file changed by this work passes
+          targeted Prettier. Repository-wide `npm run format:check` is still run
+          and its inherited failures are recorded without mass-formatting
+          unrelated history.
+    - [x] The package lock is consistent with the manifest.
+    - [x] `./server`, `./tui`, and `./rpc` resolve from the packed artifact.
+    - [x] Credential-like files and repository-only sources are excluded from the
           tarball.
-    - [ ] Installed-artifact V1 and V2 E2E tests use isolated homes and a local
+    - [x] Installed-artifact V1 and V2 E2E tests use isolated homes and a local
           fake provider without real credentials.
-    - [ ] All new and modified tests pass and satisfy project-specific nudge/E2E
+    - [x] All new and modified tests pass and satisfy project-specific nudge/E2E
           requirements where those areas are changed.
-    - [ ] At least two independent agents review every modified source and test
+    - [x] At least two independent agents review every modified source and test
           file before PR readiness is reported.
 
 ## 5. Proposed Approach

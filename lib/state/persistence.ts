@@ -75,6 +75,11 @@ function normalizeMessageRef(value: unknown): string | undefined {
     return `m${index.toString().padStart(5, "0")}`
 }
 
+/** Normalize only legacy message-form boundaries; block and opaque forms stay verbatim. */
+export function normalizeMessageBoundary(value: string): string {
+    return normalizeMessageRef(value) ?? value
+}
+
 /**
  * Return a copy of persisted IDs with legacy four-digit aliases normalized.
  * Fork recovery uses this helper for a parent snapshot and must never mutate
@@ -85,13 +90,15 @@ export function normalizePersistedMessageIds(
     persisted: PersistedSessionState,
 ): PersistedSessionState {
     const ids = persisted.messageIds
-    if (!ids || typeof ids !== "object") return persisted
 
     const byRawId: Record<string, string> = {}
     const byRef: Record<string, string> = {}
-    let nextRef = Number.isInteger(ids.nextRef) ? Math.max(1, ids.nextRef) : 1
+    let nextRef =
+        ids && typeof ids === "object" && Number.isInteger(ids.nextRef)
+            ? Math.max(1, ids.nextRef)
+            : 1
 
-    for (const [rawId, ref] of Object.entries(ids.byRawId ?? {})) {
+    for (const [rawId, ref] of Object.entries(ids?.byRawId ?? {})) {
         if (typeof ref !== "string") continue
         const normalized = normalizeMessageRef(ref) ?? ref
         byRawId[rawId] = normalized
@@ -101,7 +108,7 @@ export function normalizePersistedMessageIds(
             nextRef = Math.max(nextRef, Number.parseInt(parsed.slice(1), 10) + 1)
         }
     }
-    for (const [ref, rawId] of Object.entries(ids.byRef ?? {})) {
+    for (const [ref, rawId] of Object.entries(ids?.byRef ?? {})) {
         if (typeof rawId !== "string") continue
         const normalized = normalizeMessageRef(ref) ?? ref
         byRef[normalized] ??= rawId
@@ -109,14 +116,48 @@ export function normalizePersistedMessageIds(
         if (parsed) nextRef = Math.max(nextRef, Number.parseInt(parsed.slice(1), 10) + 1)
     }
 
+    const persistedMessages = persisted.prune?.messages
+    const blocksById = persistedMessages?.blocksById
+    const normalizedBlocksById = Object.fromEntries(
+        Object.entries(blocksById ?? {}).map(([blockId, block]) => [
+            blockId,
+            {
+                ...block,
+                startId:
+                    typeof block.startId === "string"
+                        ? normalizeMessageBoundary(block.startId)
+                        : block.startId,
+                endId:
+                    typeof block.endId === "string"
+                        ? normalizeMessageBoundary(block.endId)
+                        : block.endId,
+            },
+        ]),
+    )
+
     return {
         ...persisted,
-        messageIds: {
-            ...ids,
-            byRawId,
-            byRef,
-            nextRef,
-        },
+        ...(persistedMessages
+            ? {
+                  prune: {
+                      ...persisted.prune,
+                      messages: {
+                          ...persistedMessages,
+                          blocksById: normalizedBlocksById,
+                      },
+                  },
+              }
+            : {}),
+        ...(ids && typeof ids === "object"
+            ? {
+                  messageIds: {
+                      ...ids,
+                      byRawId,
+                      byRef,
+                      nextRef,
+                  },
+              }
+            : {}),
     }
 }
 

@@ -1,4 +1,7 @@
 import assert from "node:assert/strict"
+import { mkdtempSync, rmSync, readFileSync } from "node:fs"
+import { join } from "node:path"
+import { tmpdir } from "node:os"
 import test from "node:test"
 import { createDecompressTool } from "../lib/compress/decompress"
 import type { ToolFactoryContext } from "../lib/compress/types"
@@ -119,10 +122,7 @@ function makeRunContext(): { ask: any; metadata: any; sessionID: string } {
     }
 }
 
-async function runDecompress(
-    state: SessionState,
-    args: Record<string, unknown>,
-): Promise<string> {
+async function runDecompress(state: SessionState, args: Record<string, unknown>): Promise<string> {
     const ctx = makeToolContext(state)
     const tool = createDecompressTool(ctx)
     return tool.execute(args as any, makeRunContext() as any)
@@ -197,22 +197,27 @@ test("E2E: toFile on inactive block writes block summary", async () => {
         summary: "Important compressed content about feature X.",
     })
     const state = makeState([inactiveBlock], [])
+    const outputDir = mkdtempSync(join(tmpdir(), "acp-inactive-decompress-output-"))
+    const outputPath = join(outputDir, "restored.txt")
 
-    const result = await runDecompress(state, {
-        blockId: "b5",
-        toFile: "/tmp/test-inactive-block-decompress.txt",
-    })
+    try {
+        const result = await runDecompress(state, {
+            blockId: "b5",
+            toFile: outputPath,
+        })
 
-    assert.ok(!result.includes("Error"), `should not error: ${result}`)
-    assert.match(result, /written to/)
-    assert.ok(
-        !result.includes("(no content available)"),
-        `should not write placeholder: ${result}`,
-    )
+        assert.ok(!result.includes("Error"), `should not error: ${result}`)
+        assert.match(result, /written to/)
+        assert.ok(
+            !result.includes("(no content available)"),
+            `should not write placeholder: ${result}`,
+        )
 
-    const { readFileSync } = await import("fs")
-    const fileContent = readFileSync("/tmp/test-inactive-block-decompress.txt", "utf-8")
-    assert.equal(fileContent, "Important compressed content about feature X.")
+        const fileContent = readFileSync(outputPath, "utf-8")
+        assert.equal(fileContent, "Important compressed content about feature X.")
+    } finally {
+        rmSync(outputDir, { recursive: true, force: true })
+    }
 })
 
 // --- E2E: multi-block scenario (consumed chain) ---

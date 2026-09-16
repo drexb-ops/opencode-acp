@@ -390,6 +390,72 @@ test("repeated patching accepts ACP-owned output objects after an insertion", ()
     assert.equal(second.accepted, true)
 })
 
+test("rejects a repeated patch after a part is reordered within its message", () => {
+    const { projection } = buildProjection()
+    const transformed = clonedMessages(projection)
+    transformed.find((message) => message.info.id === "u-2")!.parts[0].text = "edited request"
+
+    const first = applyV2ContextPatch(projection, transformed)
+    assert.equal(first.accepted, true)
+    if (!first.accepted) return
+
+    const assistant = first.messages.find((message) => message.id === "a-1")!
+    assistant.content = [...assistant.content].reverse()
+    const repeated = applyV2ContextPatch(projection, transformed, first.messages)
+
+    assert.equal(repeated.accepted, false)
+    if (!repeated.accepted) assert.equal(repeated.rejection.code, "fingerprint-mismatch")
+})
+
+test("rejects a repeated patch after a part moves across messages", () => {
+    const { projection } = buildProjection()
+    const transformed = clonedMessages(projection)
+    transformed.find((message) => message.info.id === "u-2")!.parts[0].text = "edited request"
+
+    const first = applyV2ContextPatch(projection, transformed)
+    assert.equal(first.accepted, true)
+    if (!first.accepted) return
+
+    const firstUser = first.messages.find((message) => message.id === "u-1")!
+    const secondUser = first.messages.find((message) => message.id === "u-2")!
+    const [moved] = secondUser.content.splice(0, 1)
+    if (!moved) return
+    firstUser.content.push(moved)
+    const repeated = applyV2ContextPatch(projection, transformed, first.messages)
+
+    assert.equal(repeated.accepted, false)
+    if (!repeated.accepted) assert.equal(repeated.rejection.code, "fingerprint-mismatch")
+})
+
+test("rejects an in-place mutation of a prior ACP output before replay", () => {
+    const { projection } = buildProjection()
+    const transformed = clonedMessages(projection)
+    const first = applyV2ContextPatch(projection, transformed)
+    assert.equal(first.accepted, true)
+    if (!first.accepted) return
+
+    first.messages.find((message) => message.id === "u-1")!.content[0]!.text = "newer same-ID text"
+    const repeated = applyV2ContextPatch(projection, transformed, first.messages)
+
+    assert.equal(repeated.accepted, false)
+    if (!repeated.accepted) assert.equal(repeated.rejection.code, "fingerprint-mismatch")
+})
+
+test("rejects source removal when a newer same-ID outgoing message has no exact correlation", () => {
+    const { projection, outgoing } = buildProjection()
+    const transformed = clonedMessages(projection).filter((message) => message.info.id !== "u-1")
+    const replacement = outgoing.map((message) =>
+        message.id === "u-1"
+            ? Message.make({ id: "u-1", role: "user", content: "newer provider content" })
+            : message,
+    )
+
+    const result = applyV2ContextPatch(projection, transformed, replacement)
+
+    assert.equal(result.accepted, false)
+    if (!result.accepted) assert.equal(result.rejection.code, "fingerprint-mismatch")
+})
+
 test("repeated removal remains idempotent after tool-pair deletion", () => {
     const { projection } = buildProjection()
     const transformed = clonedMessages(projection)
@@ -407,4 +473,255 @@ test("repeated removal remains idempotent after tool-pair deletion", () => {
     const copiedArray = [...first.messages]
     const third = applyV2ContextPatch(projection, transformed, copiedArray)
     assert.equal(third.accepted, true)
+})
+
+test("repeating a source removal after the array shifts retains every later message", () => {
+    const projected = [
+        { type: "user", id: "u1", time: { created: 1 }, text: "first" },
+        { type: "user", id: "u2", time: { created: 2 }, text: "second" },
+        { type: "user", id: "u3", time: { created: 3 }, text: "third" },
+    ]
+    const outgoing = projected.map((source) =>
+        Message.make({ id: source.id, role: "user", content: source.text }),
+    )
+    const projection = normalizeV2ProjectedHistory(projected, outgoing, {
+        sessionID: "shifted-removal",
+        currentModel: model,
+    })
+    const transformed = structuredClone(projection.messages).filter(
+        (message) => message.info.id !== "u1",
+    )
+
+    const first = applyV2ContextPatch(projection, transformed)
+    assert.equal(first.accepted, true)
+    if (!first.accepted) return
+    const repeated = applyV2ContextPatch(projection, transformed, first.messages)
+
+    assert.equal(repeated.accepted, true)
+    if (!repeated.accepted) return
+    assert.deepEqual(
+        repeated.messages.map((message) => message.id),
+        ["u2", "u3"],
+    )
+})
+
+test("rejects duplicate outgoing message IDs before deriving a patch", () => {
+    const outgoing = [
+        Message.make({ id: "duplicate", role: "user", content: "same" }),
+        Message.make({ id: "duplicate", role: "user", content: "same" }),
+    ]
+    const projection = normalizeV2ProjectedHistory(
+        [{ type: "user", id: "duplicate", time: { created: 1 }, text: "same" }],
+        outgoing,
+        { sessionID: "duplicate-outgoing", currentModel: model },
+    )
+
+    const result = applyV2ContextPatch(projection, projection.messages)
+    assert.equal(result.accepted, false)
+    if (!result.accepted) assert.equal(result.rejection.code, "projection-invalid")
+})
+
+test("rejects a same-ID projected text whose lowered outgoing value differs", () => {
+    const projection = normalizeV2ProjectedHistory(
+        [{ type: "user", id: "same-id", time: { created: 1 }, text: "new" }],
+        [Message.make({ id: "same-id", role: "user", content: "old" })],
+        { sessionID: "mismatched-correlation", currentModel: model },
+    )
+
+    assert.equal(projection.valid, false)
+    const result = applyV2ContextPatch(projection, projection.messages)
+    assert.equal(result.accepted, false)
+    if (!result.accepted) assert.equal(result.rejection.code, "projection-invalid")
+})
+
+test("rejects a tool origin whose projected input/output values differ from lowering", () => {
+    const projected = [
+        {
+            type: "assistant",
+            id: "tool-source",
+            time: { created: 1 },
+            model,
+            content: [
+                {
+                    type: "tool",
+                    id: "tool-call",
+                    name: "read",
+                    executed: false,
+                    state: {
+                        status: "completed",
+                        input: { path: "new.ts" },
+                        content: [{ type: "text", text: "new output" }],
+                    },
+                },
+            ],
+        },
+    ]
+    const outgoing = [
+        Message.make({
+            id: "tool-source",
+            role: "assistant",
+            content: [
+                { type: "tool-call", id: "tool-call", name: "read", input: { path: "old.ts" } },
+            ],
+        }),
+        Message.make({
+            role: "tool",
+            content: [
+                {
+                    type: "tool-result",
+                    id: "tool-call",
+                    name: "read",
+                    result: { type: "text", value: "old output" },
+                },
+            ],
+        }),
+    ]
+    const projection = normalizeV2ProjectedHistory(projected, outgoing, {
+        sessionID: "mismatched-tool-correlation",
+        currentModel: model,
+    })
+    assert.equal(projection.valid, false)
+    const result = applyV2ContextPatch(projection, projection.messages)
+    assert.equal(result.accepted, false)
+    if (!result.accepted) assert.equal(result.rejection.code, "projection-invalid")
+})
+
+test("accepts a genuine same-ID correlation and preserves its lowered object", () => {
+    const outgoing = [Message.make({ id: "same-id-valid", role: "user", content: "old" })]
+    const projection = normalizeV2ProjectedHistory(
+        [{ type: "user", id: "same-id-valid", time: { created: 1 }, text: "old" }],
+        outgoing,
+        { sessionID: "valid-correlation", currentModel: model },
+    )
+    const result = applyV2ContextPatch(projection, structuredClone(projection.messages))
+
+    assert.equal(result.accepted, true)
+    if (result.accepted) assert.strictEqual(result.messages[0], outgoing[0])
+})
+
+test("replaying an ACP-owned part insertion does not duplicate the inserted content", () => {
+    const { projection } = buildProjection()
+    const transformed = clonedMessages(projection)
+    transformed
+        .find((message) => message.info.id === "u-2")!
+        .parts.push({
+            id: "prt_dcp_text_abcdefabcdefabcd",
+            sessionID: "s",
+            messageID: "u-2",
+            type: "text",
+            text: "ACP nudge",
+        })
+
+    const first = applyV2ContextPatch(projection, transformed)
+    assert.equal(first.accepted, true)
+    if (!first.accepted) return
+    const repeated = applyV2ContextPatch(projection, transformed, first.messages)
+
+    assert.equal(repeated.accepted, true)
+    if (!repeated.accepted) return
+    const u2 = repeated.messages.find((message) => message.id === "u-2")!
+    assert.equal(
+        u2.content.filter((part) => part.type === "text" && part.text === "ACP nudge").length,
+        1,
+    )
+})
+
+test("patches a realistic tool-heavy history with bounded provenance fingerprints", () => {
+    const projected: Record<string, unknown>[] = []
+    const outgoing: AiMessage[] = []
+    const pairCount = 400
+    for (let index = 0; index < pairCount; index++) {
+        const userID = `large-user-${index}`
+        const assistantID = `large-assistant-${index}`
+        const callID = `large-call-${index}`
+        const userText = `History request ${index}: ${"detail ".repeat(8)}`
+        const toolOutput = `Tool result ${index}: ${"output detail ".repeat(8)}`
+        projected.push({
+            type: "user",
+            id: userID,
+            time: { created: index * 3 + 1 },
+            text: userText,
+        })
+        projected.push({
+            type: "assistant",
+            id: assistantID,
+            time: { created: index * 3 + 2 },
+            model,
+            content: [
+                {
+                    type: "tool",
+                    id: callID,
+                    name: "read",
+                    executed: false,
+                    state: {
+                        status: "completed",
+                        input: { path: `src/file-${index}.ts` },
+                        content: [{ type: "text", text: toolOutput }],
+                    },
+                },
+            ],
+        })
+        outgoing.push(
+            Message.make({ id: userID, role: "user", content: userText }),
+            Message.make({
+                id: assistantID,
+                role: "assistant",
+                content: [
+                    {
+                        type: "tool-call",
+                        id: callID,
+                        name: "read",
+                        input: { path: `src/file-${index}.ts` },
+                    },
+                ],
+            }),
+            Message.make({
+                role: "tool",
+                content: [
+                    {
+                        type: "tool-result",
+                        id: callID,
+                        name: "read",
+                        result: { type: "text", value: toolOutput },
+                    },
+                ],
+            }),
+        )
+    }
+    const projection = normalizeV2ProjectedHistory(projected, outgoing, {
+        sessionID: "large-history",
+        currentModel: model,
+    })
+    assert.equal(projection.valid, true)
+    assert.equal(
+        projection.entries.filter((entry) => entry.toolCallIds.length > 0).length,
+        pairCount,
+    )
+    assert.equal(
+        projection.entries
+            .flatMap((entry) => entry.origins)
+            .filter((origin) => origin.kind === "tool")
+            .every((origin) => origin.result !== undefined),
+        true,
+    )
+    assert.ok(
+        projection.entries
+            .flatMap((entry) => entry.origins)
+            .filter((origin) => !origin.opaque)
+            .every((origin) =>
+                origin.originalContent.every(
+                    (reference) =>
+                        reference.fingerprint === undefined || reference.fingerprint.length === 64,
+                ),
+            ),
+    )
+
+    const started = Date.now()
+    const result = applyV2ContextPatch(projection, structuredClone(projection.messages))
+    const elapsed = Date.now() - started
+    assert.equal(result.accepted, true)
+    // This is deliberately a generous smoke bound rather than a benchmark;
+    // correlation correctness and bounded fingerprints are the deterministic
+    // assertions, while the pre-indexed path must not regress catastrophically.
+    assert.ok(elapsed < 30_000, `large history patch took ${elapsed}ms`)
 })

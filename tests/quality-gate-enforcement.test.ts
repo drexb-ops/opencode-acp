@@ -6,6 +6,7 @@ import { mkdirSync } from "node:fs"
 import {
     evaluatePreCommitQuality,
     buildQualityRejectionError,
+    QualityGateRejectionError,
 } from "../lib/compress/quality-gate"
 import { createCompressRangeTool } from "../lib/compress/range"
 import { createSessionState, resetSessionState, type WithParts } from "../lib/state"
@@ -28,10 +29,12 @@ function buildConfig(qualityGateEnabled: boolean): PluginConfig {
         enabled: true,
         autoUpdate: true,
         debug: false,
+        logLevel: "info",
+        allowSubAgents: true,
         pruneNotification: "off",
         pruneNotificationType: "chat",
         commands: { enabled: true, protectedTools: [] },
-        experimental: { allowSubAgents: true, customPrompts: false },
+        experimental: { customPrompts: false },
         protectedFilePatterns: [],
         compress: {
             permission: "allow",
@@ -72,11 +75,12 @@ function buildConfig(qualityGateEnabled: boolean): PluginConfig {
                           layer1MinChars: 200,
                           layer1MinRetentionPct: 5.0,
                           layer2MaxRougeF1: 0.05,
-                          layer2MaxTop20Recall: 0.20,
+                          layer2MaxTop20Recall: 0.2,
                       },
                   },
               }
-            : { enabled: false, algorithm: "rouge-recall-v1" },
+            : { enabled: false, algorithm: "rouge-recall-v1", algorithms: {} },
+        messageFilters: { enabled: false, filters: {} },
     }
 }
 
@@ -231,7 +235,9 @@ function buildRejectionFixture() {
 
 test("buildQualityRejectionError includes range, reason, stats, and retry guidance", () => {
     const { plan, result } = buildRejectionFixture()
-    const msg = buildQualityRejectionError(plan, result).message
+    const error = buildQualityRejectionError(plan, result)
+    assert.ok(error instanceof QualityGateRejectionError)
+    const msg = error.message
 
     assert.ok(msg.includes("COMPRESSION REJECTED"), "should have rejection header")
     assert.ok(msg.includes("m00001–m00005"), "should include range")
@@ -321,7 +327,11 @@ function buildIntegrationMessages(sessionID: string): WithParts[] {
     return messages
 }
 
-function buildToolContext(state: ReturnType<typeof createSessionState>, config: PluginConfig, rawMessages: WithParts[]) {
+function buildToolContext(
+    state: ReturnType<typeof createSessionState>,
+    config: PluginConfig,
+    rawMessages: WithParts[],
+) {
     return createCompressRangeTool({
         client: {
             session: {
@@ -370,7 +380,10 @@ test("integration: quality gate rejects bad summary through createCompressRangeT
             { ...toolCtx, sessionID },
         ),
         (err: Error) => {
-            assert.ok(err.message.includes("COMPRESSION REJECTED"), `should be quality rejection, got: ${err.message}`)
+            assert.ok(
+                err.message.includes("COMPRESSION REJECTED"),
+                `should be quality rejection, got: ${err.message}`,
+            )
             return true
         },
     )
@@ -405,7 +418,11 @@ test("integration: acknowledgeRisk bypasses quality after rejection", async () =
         { ...toolCtx, sessionID },
     )
     assert.ok(result.includes("Compressed"), "retry with acknowledgeRisk should succeed")
-    assert.equal(state.qualityGateRetryPending, false, "flag should be consumed after successful retry")
+    assert.equal(
+        state.qualityGateRetryPending,
+        false,
+        "flag should be consumed after successful retry",
+    )
     assert.equal(state.prune.messages.blocksById.size, 1, "one block should be committed")
 })
 
@@ -427,11 +444,18 @@ test("integration: preemptive acknowledgeRisk is a no-op — quality still runs 
             { ...toolCtx, sessionID },
         ),
         (err: Error) => {
-            assert.ok(err.message.includes("QUALITY GATE FAILURE"), `should be quality rejection, got: ${err.message}`)
+            assert.ok(
+                err.message.includes("QUALITY GATE FAILURE"),
+                `should be quality rejection, got: ${err.message}`,
+            )
             return true
         },
     )
-    assert.equal(state.qualityGateRetryPending, true, "rejection arms the flag even when acknowledgeRisk was passed")
+    assert.equal(
+        state.qualityGateRetryPending,
+        true,
+        "rejection arms the flag even when acknowledgeRisk was passed",
+    )
 
     // Fresh session: good summary + preemptive acknowledgeRisk (flag=false)
     // succeeds, with an ignore note in the result.
@@ -441,12 +465,22 @@ test("integration: preemptive acknowledgeRisk is a no-op — quality still runs 
     const result = await tool2.execute(
         {
             topic: "Auth analysis",
-            content: [{ startId: "m00001", endId: "m00004", summary: "Authentication system design analysis. File: lib/auth.ts:142 holds the token refresh logic. Critical bug: retry lacked exponential backoff; fixed with base=1000ms, max=30000ms. Decision: JWT over session cookies for stateless architecture. lib/auth.test.ts now covers refresh edge cases. Performance overhead 3ms per refresh attempt, acceptable." }],
+            content: [
+                {
+                    startId: "m00001",
+                    endId: "m00004",
+                    summary:
+                        "Authentication system design analysis. File: lib/auth.ts:142 holds the token refresh logic. Critical bug: retry lacked exponential backoff; fixed with base=1000ms, max=30000ms. Decision: JWT over session cookies for stateless architecture. lib/auth.test.ts now covers refresh edge cases. Performance overhead 3ms per refresh attempt, acceptable.",
+                },
+            ],
             acknowledgeRisk: true,
         },
         { ...toolCtx, sessionID: sessionID2 },
     )
-    assert.ok(result.includes("Compressed"), "good summary succeeds despite preemptive acknowledgeRisk")
+    assert.ok(
+        result.includes("Compressed"),
+        "good summary succeeds despite preemptive acknowledgeRisk",
+    )
     assert.ok(result.includes("acknowledgeRisk was ignored"), "result notes the ignored flag")
     assert.equal(state2.qualityGateRetryPending, false, "flag stays false")
     assert.equal(state2.prune.messages.blocksById.size, 1, "one block committed")
@@ -475,5 +509,9 @@ test("integration: flag cleared on successful non-acknowledgeRisk compression", 
         { ...toolCtx, sessionID },
     )
     assert.ok(result.includes("Compressed"), "good summary should pass quality and compress")
-    assert.equal(state.qualityGateRetryPending, false, "flag should be cleared on successful quality pass")
+    assert.equal(
+        state.qualityGateRetryPending,
+        false,
+        "flag should be cleared on successful quality pass",
+    )
 })

@@ -39,6 +39,9 @@ npm pack --dry-run --json --ignore-scripts
 
 # Build, install, and exercise the tarball on exact V1/V2 hosts
 npm run e2e:installed
+
+# Run dependency-free artifact/E2E verifier self-tests
+node scripts/e2e/self-test.mjs
 ```
 
 Test totals are intentionally not hardcoded here: `npm test` discovers the
@@ -49,10 +52,26 @@ tests, and full message-pipeline tests.
 The V2 adapter targets the exact `@opencode/plugin@2.0.3` API and the package
 claims OpenCode V1 `>=1.18.29`. `npm run verify:package` checks the built and
 packed entrypoint shape, import graph, manifest/lock consistency, exclusions,
-and credential-like filenames. `npm run e2e:installed` performs the separate
-host-level proof: it packs the artifact, privately installs OpenCode V1 1.18.29
-and V2 2.0.3 under `/tmp/opencode`, and runs the isolated fake-provider matrix
-without inherited credentials or the user's shared service.
+and credential-like filenames, then imports every public entrypoint from an
+isolated installation of the real tarball. `npm run e2e:installed` performs the
+separate host-level proof: it packs the artifact, privately installs OpenCode V1
+1.18.29 and V2 2.0.3 under a unique `/tmp/opencode/acp-e2e` run directory, and
+runs the isolated fake-provider matrix without inherited credentials or the
+user's shared service. The matrix's permission proof compares a complete
+sanitized ACP projection (including prune indexes/blocks, nudges, stats, refs,
+tool cache/parameters, timing, model/compaction/turn fields, and request flags),
+separating legitimate host context/ref changes from tool-owned mutations, and
+requires runtime and persisted `unknownFields.equal === true`. Raw
+summaries, message text, arguments/results, provider values, credentials, and
+paths never enter retained JSON snapshots. The fallback wrapper is accepted
+only for a fresh inactive status-10 attempt containing the exact V2 directory
+diagnostic and no other schema/import/activation/fatal line. Its diagnostics
+are retained only after redaction. The installed nudge proof uses independent
+black-box baselines `15 → 11370 → 23059`; its protected no-target checkpoint
+uses literal outbound `BLOCKED` tags when available, or V2.0.3's bounded m-ref
+window plus zero candidate/range/block/compress evidence. The transient
+shown-token field is treated as host-unobservable after the tool loop and is
+checked only for persisted clearing after commit.
 
 ---
 
@@ -93,7 +112,7 @@ the complete set.
 | V2 projection and runtime adapters        | `v2-message-projection.test.ts`, `v2-context*.test.ts`, `v2-tools.test.ts`, `v2-commands.test.ts`, `v2-timing.test.ts`, `v2-proxy.test.ts`, `v2-notifications.test.ts`, `v2-lifecycle.test.ts`                            | Loss-aware projection and validated patches, direct tools, commands, timing, permission fallbacks, proxy refresh, RPC/TUI notifications, and cleanup |
 | Properties and regressions                | `property-*.test.ts`, `compression-candidates-property.test.ts`, `nudge-loop-fix.test.ts`, `tier-detection-fix.test.ts`, `regex-tag-leak.test.ts`, `tool-pair-integrity.test.ts`, `trigger-policy-integration.test.ts`    | Invariants, generated inputs, historical bug regressions, tool-pair atomicity, and trigger-policy behavior                                           |
 | In-process end-to-end flows               | `e2e-message-transform.test.ts`, `e2e-blocks-nudges.test.ts`, `e2e-tier-compression.test.ts`, `e2e-tier-simulation.test.ts`                                                                                               | Full in-process transform and tier flows; these are not installed-artifact host tests                                                                |
-| Installed-artifact host matrix            | `scripts/e2e/run-installed-e2e.sh`, `installed-v1.ts`, `installed-v2.ts`, `installed-scenarios/*`                                                                                                                         | Exact V1 1.18.29 and V2 2.0.3 package loading, tools, commands, permissions, proxy reload, and restart persistence                                   |
+| Installed-artifact host matrix            | `scripts/e2e/run-installed-e2e.sh`, `installed-v1.ts`, `installed-v2.ts`, `installed-scenarios/*`                                                                                                                         | Exact V1 1.18.29 and V2 2.0.3 package loading, tools, commands, permissions, proxy reload, restart persistence, and nudge/compress/refire growth     |
 
 The installed matrix tests the generated tarball rather than workspace imports.
 See `scripts/e2e/README.md` for isolation, retained diagnostics, and scenario

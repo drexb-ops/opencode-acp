@@ -9,6 +9,14 @@ import { sendIgnoredMessage } from "../ui/notification"
 import type { SessionState, SessionStateRegistry, WithParts } from "../state"
 import type { V2HostAdapter } from "./host"
 import type { V2OperationTracker } from "./lifecycle"
+import type { NoticeSink } from "../host"
+import {
+    cloneSessionState,
+    cloneRuntimeValue,
+    commitSessionState,
+    DeferredMutationEffects,
+} from "../state/transaction"
+import { saveSessionState } from "../state/persistence"
 
 type V2Context = Parameters<V2Api.Plugin["setup"]>[0]
 export type V2CommandEditor = Parameters<Parameters<V2Context["command"]["transform"]>[0]>[0]
@@ -22,6 +30,62 @@ function argumentsForCommand(text: string, name: string): string {
         }
     }
     return trimmed
+}
+
+async function runCommandTransaction(
+    state: SessionState,
+    messages: WithParts[],
+    input: CommandInvocation,
+    name: string,
+    host: V2HostAdapter,
+    logger: Logger,
+    config: PluginConfig,
+    hostPermissions: HostPermissionSnapshot,
+    workingDirectory: string,
+    isActive: () => boolean,
+    effects: DeferredMutationEffects,
+): Promise<void> {
+    if (!isActive()) return
+
+    const workingState = cloneSessionState(state)
+    const workingMessages = cloneRuntimeValue(messages) as WithParts[]
+    const notices: NoticeSink = {
+        send(notice) {
+            effects.defer(async () => {
+                if (!isActive()) return
+                await host.notices.send(notice)
+            })
+            return Promise.resolve()
+        },
+    }
+
+    syncCompressPermissionState(workingState, config, hostPermissions, workingMessages)
+    if (!isActive()) return
+
+    await dispatchAcpCommand(
+        {
+            notices,
+            state: workingState,
+            config,
+            logger,
+            sessionId: input.sessionID,
+            messages: workingMessages,
+            workingDirectory,
+            defer: (effect) => effects.defer(effect),
+            isActive,
+        },
+        argumentsForCommand(input.prompt.text, name),
+    )
+
+    if (!isActive()) return
+    commitSessionState(state, workingState)
+    if (!isActive()) return
+    if (effects.persistenceRequested) {
+        if (!isActive()) return
+        await saveSessionState(state, logger)
+    }
+    if (!isActive()) return
+    await effects.run(isActive)
 }
 
 async function executeCommand(
@@ -79,11 +143,13 @@ async function executeCommand(
         if (agent && host.agentPermissions) {
             try {
                 const rules = await host.agentPermissions(agent)
+                if (!isActive()) return
                 hostPermissions.v2Agents = {
                     ...(hostPermissions.v2Agents ?? {}),
                     [agent]: rules,
                 }
             } catch (error) {
+                if (!isActive()) return
                 logger.warn("V2 command agent permission lookup failed closed", {
                     sessionId: input.sessionID,
                     agent,
@@ -96,23 +162,21 @@ async function executeCommand(
             }
         }
         if (!isActive()) return
-        const run = async (guardedState: SessionState, messages: WithParts[]) => {
-            if (!isActive()) return
-            syncCompressPermissionState(guardedState, config, hostPermissions, messages)
-            if (!isActive()) return
-            await dispatchAcpCommand(
-                {
-                    notices: host.notices,
-                    state: guardedState,
-                    config,
-                    logger,
-                    sessionId: input.sessionID,
-                    messages,
-                    workingDirectory,
-                },
-                argumentsForCommand(input.prompt.text, name),
+        const effects = new DeferredMutationEffects()
+        const run = async (guardedState: SessionState, messages: WithParts[]) =>
+            runCommandTransaction(
+                guardedState,
+                messages,
+                input,
+                name,
+                host,
+                logger,
+                config,
+                hostPermissions,
+                workingDirectory,
+                isActive,
+                effects,
             )
-        }
         if (registry.withSessionMutationAndInitialize) {
             await registry.withSessionMutationAndInitialize(
                 host.sessions,
@@ -121,6 +185,7 @@ async function executeCommand(
                 (history) => history,
                 config,
                 run,
+                { effects, isActive },
             )
         } else {
             const messages = await host.sessions.messages(input.sessionID)

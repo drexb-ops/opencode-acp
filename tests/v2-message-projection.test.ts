@@ -3,6 +3,9 @@ import assert from "node:assert/strict"
 import test from "node:test"
 import { Message } from "@opencode/ai"
 import type { Message as AiMessage } from "@opencode/ai"
+import { DateTime } from "effect"
+import { Info as SessionMessageInfo } from "@opencode/schema/session-message"
+import type { Info as SessionMessageInfoValue } from "@opencode/schema/session-message"
 import {
     applyV2ContextPatch,
     normalizeV2ProjectedHistory,
@@ -40,17 +43,53 @@ function normalize(projected: readonly unknown[], outgoing: readonly AiMessage[]
     })
 }
 
+function validatePublicMessages(projected: readonly unknown[]): readonly unknown[] {
+    for (const message of projected) {
+        // The public transport form encodes DateTime values as epoch millis;
+        // Info.make validates the corresponding schema/type form without
+        // coupling the test to npm's physical dependency layout.
+        SessionMessageInfo.make(toSchemaValue(message) as SessionMessageInfoValue)
+    }
+    return projected
+}
+
+function toSchemaValue(value: unknown): unknown {
+    if (Array.isArray(value)) return value.map((entry) => toSchemaValue(entry))
+    if (!isRecord(value)) return value
+
+    return Object.fromEntries(
+        Object.entries(value).map(([key, entry]) => {
+            if (key !== "time" || !isRecord(entry)) return [key, toSchemaValue(entry)]
+            return [
+                key,
+                Object.fromEntries(
+                    Object.entries(entry).map(([timeKey, timeValue]) => [
+                        timeKey,
+                        typeof timeValue === "number"
+                            ? DateTime.makeUnsafe(timeValue)
+                            : toSchemaValue(timeValue),
+                    ]),
+                ),
+            ]
+        }),
+    )
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return value !== null && typeof value === "object" && !Array.isArray(value)
+}
+
 test("normalizes every public source category and derives assistant step markers", () => {
     const projected = [
-        { type: "agent-switched", id: "control-agent", time: { created: 0 }, agent: "code" },
-        { type: "model-switched", id: "control-model", time: { created: 0 }, model: MODEL },
+        { type: "agent-switched", id: "msg_control-agent", time: { created: 0 }, agent: "code" },
+        { type: "model-switched", id: "msg_control-model", time: { created: 0 }, model: MODEL },
         {
             type: "system",
-            id: "sys-1",
+            id: "msg_sys-1",
             time: { created: 1 },
             text: "operator system text",
         },
-        userSource("u-1", "user text", {
+        userSource("msg_u-1", "user text", {
             skills: [{ id: "skill-1", name: "guide", text: "skill text" }],
             files: [
                 {
@@ -61,13 +100,13 @@ test("normalizes every public source category and derives assistant step markers
                     description: "notes",
                 },
                 {
-                    data: "image-data",
+                    data: "aW1hZ2UtZGF0YQ==",
                     mime: "image/png",
                     source: { type: "inline" },
                     name: "screen.png",
                 },
                 {
-                    data: "pdf-data",
+                    data: "cGRmLWRhdGE=",
                     mime: "application/pdf",
                     source: { type: "uri", uri: "https://example.test/doc.pdf" },
                     name: "doc.pdf",
@@ -82,7 +121,7 @@ test("normalizes every public source category and derives assistant step markers
         }),
         {
             type: "skill",
-            id: "skill-message",
+            id: "msg_skill-message",
             time: { created: 2 },
             skill: "skill-1",
             name: "guide",
@@ -90,25 +129,25 @@ test("normalizes every public source category and derives assistant step markers
         },
         {
             type: "shell",
-            id: "shell-1",
+            id: "msg_shell-1",
             time: { created: 3 },
-            shellID: "sh-1",
+            shellID: "sh_shell-1",
             command: "git status",
             status: "exited",
             output: { output: "clean", cursor: 5, size: 5, truncated: false },
         },
         {
             type: "location-switched",
-            id: "location-1",
+            id: "msg_location-1",
             time: { created: 4 },
             location: { directory: "/workspace" },
         },
-        { type: "synthetic", id: "host-synthetic", time: { created: 5 }, text: "host notice" },
-        assistantSource("a-1", [
+        { type: "synthetic", id: "msg_host-synthetic", time: { created: 5 }, text: "host notice" },
+        assistantSource("msg_a-1", [
             { type: "reasoning", text: "private reasoning" },
             { type: "text", text: "assistant answer" },
         ]),
-        { type: "idle", id: "idle-1", time: { created: 6 }, outcome: "succeeded" },
+        { type: "idle", id: "msg_idle-1", time: { created: 6 }, outcome: "succeeded" },
     ]
 
     const attachmentMetadata = (file: Record<string, unknown>) => ({
@@ -124,7 +163,7 @@ test("normalizes every public source category and derives assistant step markers
             content: [textPart("operator system text")],
         }),
         Message.make({
-            id: "u-1",
+            id: "msg_u-1",
             role: "user",
             content: [
                 textPart("skill text"),
@@ -136,13 +175,13 @@ test("normalizes every public source category and derives assistant step markers
                 {
                     type: "media" as const,
                     mediaType: "image/png",
-                    data: "image-data",
+                    data: "aW1hZ2UtZGF0YQ==",
                     filename: "screen.png",
                 },
                 {
                     type: "media" as const,
                     mediaType: "application/pdf",
-                    data: "pdf-data",
+                    data: "cGRmLWRhdGE=",
                     filename: "doc.pdf",
                 },
                 textPart(
@@ -151,21 +190,21 @@ test("normalizes every public source category and derives assistant step markers
                 ),
             ],
         }),
-        Message.make({ id: "skill-message", role: "user", content: "resolved skill body" }),
+        Message.make({ id: "msg_skill-message", role: "user", content: "resolved skill body" }),
         Message.make({
-            id: "shell-1",
+            id: "msg_shell-1",
             role: "user",
             content:
                 "The following shell command was executed by the user:\n\nCommand:\ngit status\n\nOutput:\nclean",
         }),
         Message.make({
-            id: "location-1",
+            id: "msg_location-1",
             role: "user",
             content: "The working directory has been changed to /workspace.",
         }),
-        Message.make({ id: "host-synthetic", role: "user", content: "host notice" }),
+        Message.make({ id: "msg_host-synthetic", role: "user", content: "host notice" }),
         Message.make({
-            id: "a-1",
+            id: "msg_a-1",
             role: "assistant",
             content: [
                 { type: "reasoning", text: "private reasoning" },
@@ -174,18 +213,26 @@ test("normalizes every public source category and derives assistant step markers
         }),
     ]
 
-    const projection = normalize(projected, outgoing)
+    const projection = normalize(validatePublicMessages(projected), outgoing)
     assert.equal(projection.valid, true)
     assert.deepEqual(
         projection.messages.map((message) => message.info.id),
-        ["sys-1", "u-1", "skill-message", "shell-1", "location-1", "host-synthetic", "a-1"],
+        [
+            "msg_sys-1",
+            "msg_u-1",
+            "msg_skill-message",
+            "msg_shell-1",
+            "msg_location-1",
+            "msg_host-synthetic",
+            "msg_a-1",
+        ],
     )
-    const assistant = projection.messages.find((message) => message.info.id === "a-1")
+    const assistant = projection.messages.find((message) => message.info.id === "msg_a-1")
     assert.ok(assistant)
     assert.equal(assistant.parts[0]?.type, "step-start")
     assert.equal(assistant.parts[1]?.type, "reasoning")
     assert.equal(assistant.parts[2]?.type, "text")
-    const userEntry = projection.entries.find((entry) => entry.sourceMessageId === "u-1")
+    const userEntry = projection.entries.find((entry) => entry.sourceMessageId === "msg_u-1")
     assert.ok(userEntry)
     assert.equal(userEntry.origins.filter((origin) => origin.kind === "attachment").length, 4)
     assert.equal(
@@ -203,8 +250,8 @@ test("normalizes every public source category and derives assistant step markers
 
 test("correlates executed and separate role-tool results by call ID", () => {
     const projected = [
-        userSource("u-2", "request"),
-        assistantSource("a-2", [
+        userSource("msg_u-2", "request"),
+        assistantSource("msg_a-2", [
             {
                 type: "tool",
                 id: "executed-call",
@@ -216,9 +263,9 @@ test("correlates executed and separate role-tool results by call ID", () => {
                     content: [{ type: "text", text: "provider output" }],
                     time: { start: 2, end: 3 },
                     metadata: { source: "provider" },
-                    providerState: { checkpoint: "call" },
-                    providerResultState: { checkpoint: "result" },
                 },
+                providerState: { checkpoint: "call" },
+                providerResultState: { checkpoint: "result" },
                 time: { created: 2 },
             },
             {
@@ -232,17 +279,17 @@ test("correlates executed and separate role-tool results by call ID", () => {
                     content: [{ type: "text", text: "host output" }],
                     time: { start: 2, end: 3 },
                     metadata: { source: "host" },
-                    providerState: { checkpoint: "call" },
-                    providerResultState: { checkpoint: "result" },
                 },
+                providerState: { checkpoint: "call" },
+                providerResultState: { checkpoint: "result" },
                 time: { created: 2 },
             },
         ]),
     ]
     const outgoing = [
-        Message.make({ id: "u-2", role: "user", content: "request" }),
+        Message.make({ id: "msg_u-2", role: "user", content: "request" }),
         Message.make({
-            id: "a-2",
+            id: "msg_a-2",
             role: "assistant",
             content: [
                 {
@@ -280,9 +327,9 @@ test("correlates executed and separate role-tool results by call ID", () => {
             ],
         }),
     ]
-    const projection = normalize(projected, outgoing)
+    const projection = normalize(validatePublicMessages(projected), outgoing)
     assert.equal(projection.valid, true)
-    const entry = projection.entries.find((candidate) => candidate.sourceMessageId === "a-2")
+    const entry = projection.entries.find((candidate) => candidate.sourceMessageId === "msg_a-2")
     assert.ok(entry)
     assert.deepEqual(entry.toolCallIds, ["executed-call", "host-call"])
     const executed = entry.origins.find((origin) => origin.callId === "executed-call")
@@ -332,7 +379,7 @@ test("records running, completed, failed, and provider-checkpoint compaction pro
     const projected = [
         {
             type: "compaction",
-            id: "running-compaction",
+            id: "msg_running-compaction",
             time: { created: 1 },
             status: "running",
             reason: "auto",
@@ -341,34 +388,36 @@ test("records running, completed, failed, and provider-checkpoint compaction pro
         },
         {
             type: "compaction",
-            id: "completed-compaction",
+            id: "msg_completed-compaction",
             time: { created: 2 },
             status: "completed",
             reason: "auto",
             summary: "summary",
             recent: "recent",
             providerContext: {
-                providerID: "provider-a",
-                provider: "provider-a",
-                modelID: "model-a",
-                route: "responses",
-                protocol: "openai-responses",
-                endpoint: "https://provider.example/v1/responses",
                 version: 1,
-                provenance: {},
+                provenance: {
+                    providerID: "provider-a",
+                    provider: "provider-a",
+                    modelID: "model-a",
+                    route: "responses",
+                    protocol: "openai-responses",
+                    endpoint: "https://provider.example/v1/responses",
+                },
                 messages: [],
             },
+            providerState: { checkpoint: "compaction" },
         },
         {
             type: "compaction",
-            id: "failed-compaction",
+            id: "msg_failed-compaction",
             time: { created: 3 },
             status: "failed",
             reason: "manual",
             error: { type: "error", message: "failed" },
         },
     ]
-    const projection = normalize(projected, [checkpoint])
+    const projection = normalize(validatePublicMessages(projected), [checkpoint])
     assert.equal(projection.valid, true)
     assert.equal(projection.messages.length, 1)
     assert.equal(
@@ -380,7 +429,7 @@ test("records running, completed, failed, and provider-checkpoint compaction pro
         undefined,
     )
     const providerEntry = projection.entries.find(
-        (entry) => entry.sourceMessageId === "completed-compaction",
+        (entry) => entry.sourceMessageId === "msg_completed-compaction",
     )
     assert.ok(providerEntry)
     assert.equal(providerEntry.sourceType, "provider-checkpoint")
@@ -390,8 +439,8 @@ test("records running, completed, failed, and provider-checkpoint compaction pro
 
 test("normalizes valid tool lifecycle states and preserves provider/file result data", () => {
     const projected = [
-        userSource("tools-user", "run the tools"),
-        assistantSource("tools-assistant", [
+        userSource("msg_tools-user", "run the tools"),
+        assistantSource("msg_tools-assistant", [
             {
                 type: "tool",
                 id: "running-call",
@@ -400,10 +449,10 @@ test("normalizes valid tool lifecycle states and preserves provider/file result 
                 state: {
                     status: "running",
                     input: { path: "a.ts" },
-                    time: { start: 1 },
                     metadata: { phase: "running" },
-                    providerState: { cursor: "run" },
                 },
+                providerState: { cursor: "run" },
+                time: { created: 1 },
             },
             {
                 type: "tool",
@@ -413,10 +462,9 @@ test("normalizes valid tool lifecycle states and preserves provider/file result 
                 state: {
                     status: "streaming",
                     input: '{"path":"b.ts"}',
-                    time: { start: 2 },
-                    metadata: { phase: "streaming" },
-                    providerState: { cursor: "stream" },
                 },
+                providerState: { cursor: "stream" },
+                time: { created: 2 },
             },
             {
                 type: "tool",
@@ -426,11 +474,11 @@ test("normalizes valid tool lifecycle states and preserves provider/file result 
                 state: {
                     status: "error",
                     input: { path: "c.ts" },
-                    error: { name: "ToolError", message: "provider failed" },
-                    time: { start: 3, end: 4 },
-                    metadata: { phase: "error" },
-                    providerResultState: { retryable: true },
+                    error: { type: "ToolError", message: "provider failed" },
+                    content: [{ type: "text", text: "provider failed" }],
                 },
+                providerResultState: { retryable: true },
+                time: { created: 3, ran: 4, completed: 5 },
             },
             {
                 type: "tool",
@@ -448,18 +496,18 @@ test("normalizes valid tool lifecycle states and preserves provider/file result 
                             name: "out.txt",
                         },
                     ],
-                    time: { start: 5, end: 6 },
                     metadata: { phase: "file" },
-                    providerState: { cursor: "file" },
-                    providerResultState: { checksum: "abc" },
                 },
+                providerState: { cursor: "file" },
+                providerResultState: { checksum: "abc" },
+                time: { created: 5, ran: 6, completed: 7 },
             },
         ]),
     ]
     const outgoing = [
-        Message.make({ id: "tools-user", role: "user", content: "run the tools" }),
+        Message.make({ id: "msg_tools-user", role: "user", content: "run the tools" }),
         Message.make({
-            id: "tools-assistant",
+            id: "msg_tools-assistant",
             role: "assistant",
             content: [
                 {
@@ -500,7 +548,7 @@ test("normalizes valid tool lifecycle states and preserves provider/file result 
                     id: "error-call",
                     name: "error-tool",
                     result: { type: "error" as const, value: "provider failed" },
-                    providerResultState: { retryable: true },
+                    providerMetadata: { provider: { resultState: { retryable: true } } },
                 },
             ],
         }),
@@ -522,16 +570,16 @@ test("normalizes valid tool lifecycle states and preserves provider/file result 
                             },
                         ],
                     },
-                    providerResultState: { checksum: "abc" },
+                    providerMetadata: { provider: { resultState: { checksum: "abc" } } },
                 },
             ],
         }),
     ]
 
-    const projection = normalize(projected, outgoing)
+    const projection = normalize(validatePublicMessages(projected), outgoing)
     assert.equal(projection.valid, true)
     const entry = projection.entries.find(
-        (candidate) => candidate.sourceMessageId === "tools-assistant",
+        (candidate) => candidate.sourceMessageId === "msg_tools-assistant",
     )
     assert.ok(entry)
     assert.deepEqual(entry.toolCallIds, [
@@ -541,8 +589,9 @@ test("normalizes valid tool lifecycle states and preserves provider/file result 
         "file-call",
     ])
     assert.equal(
-        entry.origins.find((origin) => origin.callId === "running-call")?.normalizedInput,
-        '{"path":"a.ts"}',
+        entry.origins.find((origin) => origin.callId === "running-call")?.normalizedInputHash
+            ?.length,
+        64,
     )
     assert.equal(entry.origins.find((origin) => origin.callId === "error-call")?.opaque, true)
     assert.equal(entry.origins.find((origin) => origin.callId === "file-call")?.opaque, true)

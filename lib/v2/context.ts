@@ -4,13 +4,12 @@ import type { PluginConfig } from "../config"
 import { compressPermission } from "../compress-permission"
 import { buildProtectedToolsExtension } from "../prompts/extensions/system"
 import { renderSystemPrompt, type PromptStore } from "../prompts"
-import {
-    commitPreparedMessageTransformTransaction,
-    prepareMessageTransformTransaction,
-} from "../hooks"
+import { commitPreparedMessageTransformState, prepareMessageTransformTransaction } from "../hooks"
 import type { HostPermissionRule, HostPermissionSnapshot } from "../host-permissions"
 import type { SessionState, SessionStateRegistry } from "../state"
 import type { Logger } from "../logger"
+import { saveSessionState } from "../state/persistence"
+import { DeferredMutationEffects } from "../state/transaction"
 import type { V2HostAdapter } from "./host"
 import {
     applyV2ContextPatch,
@@ -27,6 +26,12 @@ export interface V2ContextEvent {
     messages: AiMessageValue[]
 }
 
+interface PreparedV2ContextCommit {
+    prepared: Awaited<ReturnType<typeof prepareMessageTransformTransaction>>
+    messages: AiMessageValue[]
+    systemPart?: SystemPart
+}
+
 function modelLimitFromInventory(
     inventory: readonly { providerId: string; modelId: string; contextLimit?: number }[],
     model: V2ProjectionModel,
@@ -39,13 +44,12 @@ function modelLimitFromInventory(
 
 const AUXILIARY_AGENT_NAMES = new Set(["title", "summary", "compaction"])
 
-async function refreshV2AgentPermissions(
+async function fetchV2AgentPermissions(
     host: V2HostAdapter,
-    hostPermissions: HostPermissionSnapshot,
     agent: string,
     logger: Logger,
-): Promise<void> {
-    if (!host.agentPermissions) return
+): Promise<readonly HostPermissionRule[] | undefined> {
+    if (!host.agentPermissions) return undefined
 
     let rules: readonly HostPermissionRule[]
     try {
@@ -57,10 +61,7 @@ async function refreshV2AgentPermissions(
         })
         rules = [{ action: "*", resource: "*", effect: "deny" }]
     }
-    hostPermissions.v2Agents = {
-        ...(hostPermissions.v2Agents ?? {}),
-        [agent]: rules,
-    }
+    return rules
 }
 
 /**
@@ -82,7 +83,18 @@ export function createV2ContextHandler(
             if (!Array.isArray(event.messages) || !Array.isArray(event.system)) return
             if (AUXILIARY_AGENT_NAMES.has(event.agent)) return
             if (!isActive()) return
-            await refreshV2AgentPermissions(host, hostPermissions, event.agent, logger)
+            // Fetch first, then perform the lifecycle check before touching the
+            // shared permission snapshot.  A setup unload can complete while a
+            // public host call is awaiting; late results must not hydrate a
+            // dead plugin instance.
+            const agentRules = await fetchV2AgentPermissions(host, event.agent, logger)
+            if (!isActive()) return
+            if (agentRules) {
+                hostPermissions.v2Agents = {
+                    ...(hostPermissions.v2Agents ?? {}),
+                    [event.agent]: agentRules,
+                }
+            }
 
             let requestModelLimit: number | undefined
             let modelLimitKnown = false
@@ -93,7 +105,6 @@ export function createV2ContextHandler(
             }[] = []
             try {
                 inventory = await host.models.list()
-                await registry.hydrateModelLimits({ list: async () => inventory })
             } catch (error) {
                 logger.warn("V2 model catalog lookup failed", {
                     sessionId: event.sessionID,
@@ -101,20 +112,19 @@ export function createV2ContextHandler(
                     error: error instanceof Error ? error.message : String(error),
                 })
             }
-            // Resolve after hydration so a transient catalog omission/failure
+            // Catalog results are already in memory.  Check lifecycle before
+            // synchronously recording them; unlike the old async hydrator this
+            // cannot mutate the catalog after unload.
+            if (!isActive()) return
+            for (const entry of inventory) {
+                registry.recordModelLimit(entry.providerId, entry.modelId, entry.contextLimit)
+            }
+
+            // Resolve after recording so a transient catalog omission/failure
             // cannot discard a valid cached limit. A direct inventory fallback
             // is retained for lightweight registries used by tests.
             requestModelLimit = registry.resolveModelLimit(event.model.providerID, event.model.id)
-            if (requestModelLimit === undefined) {
-                requestModelLimit = modelLimitFromInventory(inventory, event.model)
-                if (requestModelLimit !== undefined) {
-                    registry.recordModelLimit(
-                        event.model.providerID,
-                        event.model.id,
-                        requestModelLimit,
-                    )
-                }
-            }
+            requestModelLimit ??= modelLimitFromInventory(inventory, event.model)
             modelLimitKnown = requestModelLimit !== undefined
 
             const loadProjection = async () => {
@@ -137,11 +147,13 @@ export function createV2ContextHandler(
                 return projection
             }
 
+            const effects = new DeferredMutationEffects()
+
             const run = async (
                 state: SessionState,
                 projection: Awaited<ReturnType<typeof loadProjection>>,
-            ) => {
-                if (!projection.valid || !isActive()) return
+            ): Promise<PreparedV2ContextCommit | undefined> => {
+                if (!projection.valid || !isActive()) return undefined
                 const prepared = await prepareMessageTransformTransaction(
                     projection.messages,
                     state,
@@ -159,6 +171,7 @@ export function createV2ContextHandler(
                             duration: 5000,
                         }),
                     true,
+                    effects,
                 )
                 // A non-resuming command notice remains in projected session
                 // history for the user, but must be removed from every later
@@ -180,10 +193,10 @@ export function createV2ContextHandler(
                         sessionId: event.sessionID,
                         reason: patch.rejection.message,
                     })
-                    return
+                    return undefined
                 }
 
-                if (!isActive()) return
+                if (!isActive()) return undefined
 
                 let systemPrompt: string | undefined
                 if (
@@ -197,25 +210,41 @@ export function createV2ContextHandler(
                     )
                 }
 
-                // No event/state/effect mutation occurs until the projection,
-                // patch, final schemas, and system text have all succeeded.
+                // Build event values before the synchronous accepted boundary;
+                // initialization and transform effects stay staged until the
+                // registry accepts this result.
+                const systemPart = systemPrompt ? SystemPartSchema.make(systemPrompt) : undefined
+                return { prepared, messages: patch.messages, systemPart }
+            }
+
+            const flushEffects = async (state: SessionState): Promise<void> => {
+                if (effects.persistenceRequested) {
+                    if (!isActive()) return
+                    try {
+                        await saveSessionState(state, logger)
+                    } catch (error) {
+                        logger.warn("Failed to persist V2 context state", {
+                            sessionId: event.sessionID,
+                            error: error instanceof Error ? error.message : String(error),
+                        })
+                    }
+                }
                 if (!isActive()) return
-                event.messages = patch.messages
-                if (systemPrompt) event.system.push(SystemPartSchema.make(systemPrompt))
-                await commitPreparedMessageTransformTransaction(
-                    prepared,
-                    state,
-                    logger,
-                    undefined,
-                    isActive,
-                )
+                try {
+                    await effects.run(isActive)
+                } catch (error) {
+                    logger.warn("Deferred V2 context effect failed", {
+                        sessionId: event.sessionID,
+                        error: error instanceof Error ? error.message : String(error),
+                    })
+                }
             }
 
             // Reserve before projected history is fetched/normalized, then keep
             // initialization, transformation, patch validation, and commit in
             // that one reservation.
             if (registry.withSessionMutationAndInitialize) {
-                await registry.withSessionMutationAndInitialize(
+                const committed = await registry.withSessionMutationAndInitialize(
                     host.sessions,
                     event.sessionID,
                     loadProjection,
@@ -223,12 +252,62 @@ export function createV2ContextHandler(
                         isActive() && projection.valid ? projection.messages : undefined,
                     config,
                     run,
+                    {
+                        effects,
+                        isActive,
+                        commitResult: (result) => result !== undefined,
+                        commit: (_state, result) => {
+                            if (!result) throw new Error("V2 context commit has no result")
+                            const originalMessages = event.messages
+                            const originalMessageValues = [...event.messages]
+                            const originalSystemValues = [...event.system]
+                            try {
+                                if (
+                                    !commitPreparedMessageTransformState(
+                                        result.prepared,
+                                        _state,
+                                        undefined,
+                                    )
+                                ) {
+                                    throw new Error("V2 context commit became inactive")
+                                }
+                                event.messages = result.messages
+                                if (result.systemPart) event.system.push(result.systemPart)
+                            } catch (error) {
+                                // The registry restores live ACP state when a
+                                // synchronous commit throws.  Restore the
+                                // externally visible event as well so a
+                                // partially applied message/system commit can
+                                // never escape to the host.
+                                try {
+                                    event.messages = originalMessages
+                                } catch {}
+                                try {
+                                    originalMessages.splice(
+                                        0,
+                                        originalMessages.length,
+                                        ...originalMessageValues,
+                                    )
+                                } catch {}
+                                try {
+                                    event.system.splice(
+                                        0,
+                                        event.system.length,
+                                        ...originalSystemValues,
+                                    )
+                                } catch {}
+                                throw error
+                            }
+                        },
+                        postCommit: flushEffects,
+                    },
                 )
+                if (committed === undefined) return
             } else {
                 // Compatibility for lightweight registry doubles from older
                 // V2 fixtures. Real registries always use the atomic path.
                 const projection = await loadProjection()
-                if (!projection.valid) return
+                if (!projection.valid || !isActive()) return
                 await registry.getOrCreate(
                     host.sessions,
                     event.sessionID,
@@ -236,7 +315,15 @@ export function createV2ContextHandler(
                     config,
                 )
                 const state = registry.get(event.sessionID)
-                if (state) await run(state, projection)
+                if (state) {
+                    const result = await run(state, projection)
+                    if (result === undefined || !isActive()) return
+                    if (!commitPreparedMessageTransformState(result.prepared, state, undefined))
+                        return
+                    event.messages = result.messages
+                    if (result.systemPart) event.system.push(result.systemPart)
+                    await flushEffects(state)
+                }
             }
         } catch (error) {
             logger.warn("V2 context hook failed closed", {

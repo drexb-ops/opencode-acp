@@ -1,7 +1,7 @@
 import "./test-env"
 import assert from "node:assert/strict"
 import test from "node:test"
-import { mkdtempSync, readFileSync, rmSync } from "node:fs"
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Message, SystemPart } from "@opencode/ai"
@@ -26,11 +26,13 @@ function config(storagePath: string, debug = false): PluginConfig {
         enabled: true,
         autoUpdate: false,
         debug,
+        logLevel: "silent",
+        allowSubAgents: true,
         pruneNotification: "off",
         pruneNotificationType: "chat",
         storagePath,
         commands: { enabled: true, protectedTools: [] },
-        experimental: { allowSubAgents: false, customPrompts: false },
+        experimental: { customPrompts: false },
         protectedFilePatterns: [],
         compress: {
             mode: "message",
@@ -56,6 +58,8 @@ function config(storagePath: string, debug = false): PluginConfig {
             majorGcThresholdPercent: "100%",
             batchCleanup: { lowThreshold: "60%", highThreshold: "75%", forceThreshold: "90%" },
         },
+        qualityGate: { enabled: false, algorithm: "rouge-recall-v1", algorithms: {} },
+        messageFilters: { enabled: false, filters: {} },
     }
 }
 
@@ -262,6 +266,122 @@ test("primary V2 context hook patches messages then appends a structured system 
     }
 })
 
+test("fresh V2 patch rejection removes the initialized placeholder and allows a later valid request", async () => {
+    const projected = [
+        { type: "system", id: "fresh-system", time: { created: 1 }, text: "opaque system" },
+        { type: "user", id: "fresh-user", time: { created: 2 }, text: "request" },
+    ]
+    const originalMessages = [
+        Message.make({ role: "system", content: "opaque system" }),
+        Message.make({ id: "fresh-user", role: "user", content: "request" }),
+    ]
+    const run = runHandler(projected, originalMessages, modelA, [])
+    const originalSystem = run.event.system
+    const originalMessageValues = [...originalMessages]
+    const originalSystemValues = [...originalSystem]
+    const changedMessages = [
+        Message.make({ role: "system", content: "newer opaque system" }),
+        originalMessages[1]!,
+    ]
+    let messageReads = 0
+    let debugEffects = 0
+    const notifications: string[] = []
+    run.logger.saveContext = async () => {
+        debugEffects++
+    }
+    run.adapter.notifications = {
+        notify: (input) => {
+            notifications.push(input.message)
+        },
+    }
+    Object.defineProperty(run.event, "messages", {
+        configurable: true,
+        get() {
+            messageReads++
+            return messageReads === 3 ? changedMessages : originalMessages
+        },
+        set() {
+            throw new Error("rejected patch must not assign event.messages")
+        },
+    })
+
+    try {
+        await run.handler(run.event)
+
+        assert.equal(run.registry.get("session"), undefined)
+        assert.equal(run.registry.size, 0)
+        assert.strictEqual(run.event.messages, originalMessages)
+        assert.deepEqual(run.event.messages, originalMessageValues)
+        assert.strictEqual(run.event.system, originalSystem)
+        assert.deepEqual(run.event.system, originalSystemValues)
+        assert.equal(existsSync(join(run.storage, "session.json")), false)
+        assert.equal(debugEffects, 0)
+        assert.deepEqual(notifications, [])
+
+        Object.defineProperty(run.event, "messages", {
+            configurable: true,
+            writable: true,
+            value: originalMessages,
+        })
+        const validEvent = context("session", modelA, [
+            Message.make({ role: "system", content: "opaque system" }),
+            Message.make({ id: "fresh-user", role: "user", content: "request" }),
+        ])
+        await run.handler(validEvent)
+        assert.ok(run.registry.get("session"))
+        assert.equal(validEvent.system.length, 1)
+    } finally {
+        rmSync(run.storage, { recursive: true, force: true })
+    }
+})
+
+test("V2 auxiliary agents skip projection, catalog, state, and effects", async () => {
+    for (const agent of ["title", "summary", "compaction"] as const) {
+        const run = runHandler(
+            [{ type: "user", id: `${agent}-user`, time: { created: 1 }, text: "request" }],
+            [Message.make({ id: `${agent}-user`, role: "user", content: "request" })],
+            modelA,
+            [],
+        )
+        const projectedCalls: string[] = []
+        const catalogCalls: string[] = []
+        const notifications: string[] = []
+        run.adapter.projectedContext = async (sessionID) => {
+            projectedCalls.push(sessionID)
+            return []
+        }
+        run.adapter.models.list = async () => {
+            catalogCalls.push("catalog")
+            return []
+        }
+        run.adapter.notifications = {
+            notify: (input) => {
+                notifications.push(input.message)
+            },
+        }
+        const messages = [Message.make({ id: `${agent}-user`, role: "user", content: "request" })]
+        const system = [SystemPart.make("host system")]
+        const event = { ...context("session", modelA, messages), agent, system }
+        const messageValues = [...event.messages]
+        const systemValues = [...event.system]
+
+        try {
+            await run.handler(event)
+            assert.deepEqual(projectedCalls, [])
+            assert.deepEqual(catalogCalls, [])
+            assert.equal(run.registry.get("session"), undefined)
+            assert.equal(run.registry.size, 0)
+            assert.strictEqual(event.messages, messages)
+            assert.deepEqual(event.messages, messageValues)
+            assert.strictEqual(event.system, system)
+            assert.deepEqual(event.system, systemValues)
+            assert.deepEqual(notifications, [])
+        } finally {
+            rmSync(run.storage, { recursive: true, force: true })
+        }
+    }
+})
+
 test("V2 context serializes history projection and commit order per session", async () => {
     const storage = mkdtempSync(join(tmpdir(), "acp-v2-context-atomic-"))
     const logger = new Logger(false, "silent")
@@ -381,7 +501,52 @@ test("completed V2 compaction resets transient state while retaining active comp
         parameters: {},
         turn: 1,
     })
-    state.prune.messages.activeBlockIds.add(7)
+    state.stats.pruneTokenCounter = 123
+    state.stats.totalPruneTokens = 456
+    const preservedBlock: CompressionBlock = {
+        blockId: 7,
+        runId: 3,
+        active: true,
+        deactivatedByUser: false,
+        compressedTokens: 120,
+        effectiveCompressedTokens: 120,
+        summaryTokens: 24,
+        durationMs: 17,
+        mode: "range",
+        tier: 1,
+        topic: "preserved compaction block",
+        batchTopic: "compaction fixture",
+        startId: "m00001",
+        endId: "m00001",
+        anchorMessageId: "before",
+        compressMessageId: "before-compress",
+        compressCallId: "before-compress-call",
+        includedBlockIds: [],
+        consumedBlockIds: [],
+        parentBlockIds: [],
+        directMessageIds: ["before"],
+        directToolIds: [],
+        effectiveMessageIds: ["before"],
+        effectiveToolIds: [],
+        createdAt: 4,
+        summary: "preserved summary",
+        survivedCount: 2,
+        generation: "young",
+    }
+    state.prune.messages.blocksById.set(preservedBlock.blockId, preservedBlock)
+    state.prune.messages.activeBlockIds.add(preservedBlock.blockId)
+    state.prune.messages.activeByAnchorMessageId.set(
+        preservedBlock.anchorMessageId,
+        preservedBlock.blockId,
+    )
+    state.prune.messages.byMessageId.set("before", {
+        tokenCount: preservedBlock.compressedTokens,
+        allBlockIds: [preservedBlock.blockId],
+        activeBlockIds: [preservedBlock.blockId],
+    })
+    state.prune.messages.nextBlockId = 8
+    state.prune.messages.nextRunId = 4
+    state.prune.messages.membershipsVerified = true
     const compaction = {
         type: "compaction",
         id: "compact-1",
@@ -420,9 +585,25 @@ test("completed V2 compaction resets transient state while retaining active comp
     )
     await handler(initial.event)
     try {
-        assert.notEqual(initial.registry.get("session")?.nudges.lastPerMessageNudgeTokens, 42)
-        assert.equal(initial.registry.get("session")?.toolParameters.size, 0)
-        assert.equal(initial.registry.get("session")?.prune.messages.activeBlockIds.has(7), true)
+        const afterState = initial.registry.get("session")
+        assert.ok(afterState)
+        const afterBlock = afterState.prune.messages.blocksById.get(preservedBlock.blockId)
+        assert.ok(afterBlock)
+        assert.equal(afterBlock.blockId, preservedBlock.blockId)
+        assert.equal(afterBlock.summary, preservedBlock.summary)
+        assert.equal(afterBlock.startId, preservedBlock.startId)
+        assert.equal(afterBlock.endId, preservedBlock.endId)
+        assert.equal(afterBlock.active, true)
+        assert.equal(afterState.prune.messages.activeBlockIds.has(preservedBlock.blockId), true)
+        assert.deepEqual(afterState.prune.messages.byMessageId.get("before"), {
+            tokenCount: preservedBlock.compressedTokens,
+            allBlockIds: [preservedBlock.blockId],
+            activeBlockIds: [preservedBlock.blockId],
+        })
+        assert.equal(afterState.stats.pruneTokenCounter, 123)
+        assert.equal(afterState.stats.totalPruneTokens, 456)
+        assert.notEqual(afterState.nudges.lastPerMessageNudgeTokens, 42)
+        assert.equal(afterState.toolParameters.size, 0)
     } finally {
         rmSync(initial.storage, { recursive: true, force: true })
     }
@@ -613,5 +794,137 @@ test("V2 rejected patch rolls back live state, event, persistence, and deferred 
         assert.deepEqual(deferredEffects, [])
     } finally {
         rmSync(storage, { recursive: true, force: true })
+    }
+})
+
+test("V2 context does not hydrate permissions after an awaited lookup crosses unload", async () => {
+    const run = runHandler(
+        [{ type: "user", id: "preflight-user", time: { created: 1 }, text: "request" }],
+        [Message.make({ id: "preflight-user", role: "user", content: "request" })],
+        modelA,
+        [],
+    )
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+        release = resolve
+    })
+    let started!: () => void
+    const startedSignal = new Promise<void>((resolve) => {
+        started = resolve
+    })
+    let active = true
+    run.adapter.agentPermissions = async () => {
+        started()
+        await gate
+        return [{ action: "*", resource: "*", effect: "allow" }]
+    }
+    const permissions = { global: undefined, agents: {}, v2Agents: {} }
+    const handler = createV2ContextHandler(
+        run.adapter,
+        run.registry,
+        run.logger,
+        run.config,
+        run.prompts,
+        permissions,
+        () => active,
+    )
+    const event = context("session", modelA, [
+        Message.make({ id: "preflight-user", role: "user", content: "request" }),
+    ])
+    const originalMessages = event.messages
+    const pending = handler(event)
+    await startedSignal
+    active = false
+    release()
+    await pending
+
+    try {
+        assert.deepEqual(permissions.v2Agents, {})
+        assert.equal(run.registry.get("session"), undefined)
+        assert.equal(run.registry.resolveModelLimit(modelA.providerID, modelA.id), undefined)
+        assert.strictEqual(event.messages, originalMessages)
+        assert.equal(event.system.length, 0)
+    } finally {
+        rmSync(run.storage, { recursive: true, force: true })
+    }
+})
+
+test("V2 context does not record a catalog result after unload", async () => {
+    const run = runHandler(
+        [{ type: "user", id: "catalog-user", time: { created: 1 }, text: "request" }],
+        [Message.make({ id: "catalog-user", role: "user", content: "request" })],
+        modelA,
+        [],
+    )
+    run.adapter.agentPermissions = undefined
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+        release = resolve
+    })
+    let started!: () => void
+    const startedSignal = new Promise<void>((resolve) => {
+        started = resolve
+    })
+    let active = true
+    run.adapter.models.list = async () => {
+        started()
+        await gate
+        return [{ providerId: modelA.providerID, modelId: modelA.id, contextLimit: 123_456 }]
+    }
+    const handler = createV2ContextHandler(
+        run.adapter,
+        run.registry,
+        run.logger,
+        run.config,
+        run.prompts,
+        { global: undefined, agents: {}, v2Agents: {} },
+        () => active,
+    )
+    const pending = handler(
+        context("catalog-session", modelA, [
+            Message.make({ id: "catalog-user", role: "user", content: "request" }),
+        ]),
+    )
+    await startedSignal
+    active = false
+    release()
+    await pending
+
+    try {
+        assert.equal(run.registry.resolveModelLimit(modelA.providerID, modelA.id), undefined)
+        assert.equal(run.registry.get("catalog-session"), undefined)
+    } finally {
+        rmSync(run.storage, { recursive: true, force: true })
+    }
+})
+
+test("V2 context restores event messages and system when synchronous external commit throws", async () => {
+    const run = runHandler(
+        [{ type: "user", id: "commit-error-user", time: { created: 1 }, text: "request" }],
+        [Message.make({ id: "commit-error-user", role: "user", content: "request" })],
+    )
+    const event = run.event
+    const originalMessages = event.messages
+    const originalSystem = event.system
+    let attempted = false
+    Object.defineProperty(event, "messages", {
+        configurable: true,
+        get: () => originalMessages,
+        set: () => {
+            attempted = true
+            throw new Error("host refused context replacement")
+        },
+    })
+
+    try {
+        await run.handler(event)
+        assert.equal(attempted, true)
+        assert.equal(run.registry.get("session"), undefined)
+        assert.strictEqual(event.messages, originalMessages)
+        assert.deepEqual(event.messages, [originalMessages[0]])
+        assert.strictEqual(event.system, originalSystem)
+        assert.deepEqual(event.system, [])
+    } finally {
+        rmSync(run.storage, { recursive: true, force: true })
     }
 })

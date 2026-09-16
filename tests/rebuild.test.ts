@@ -1,5 +1,8 @@
 import "./test-env"
 import assert from "node:assert/strict"
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { join } from "node:path"
+import { tmpdir } from "node:os"
 import test from "node:test"
 import { rebuildCompressionState, restoreForkCompressionState } from "../lib/state/rebuild"
 import { createSessionState, ensureSessionInitialized } from "../lib/state/state"
@@ -9,10 +12,13 @@ import type { PluginConfig } from "../lib/config"
 import type { SessionState, WithParts } from "../lib/state/types"
 import {
     loadSessionState,
+    normalizeMessageBoundary,
+    normalizePersistedMessageIds,
     saveSessionState,
     type PersistedSessionState,
 } from "../lib/state/persistence"
 import { serializePruneMessagesState } from "../lib/state/utils"
+import { buildSearchContext, resolveBoundaryIds } from "../lib/compress/search"
 
 const logger = new Logger(false)
 
@@ -23,10 +29,12 @@ function buildConfig(overrides: Partial<PluginConfig> = {}): PluginConfig {
         enabled: true,
         autoUpdate: true,
         debug: false,
+        logLevel: "info",
+        allowSubAgents: true,
         pruneNotification: "off",
         pruneNotificationType: "chat",
         commands: { enabled: true, protectedTools: [] },
-        experimental: { allowSubAgents: false, customPrompts: false },
+        experimental: { customPrompts: false },
         protectedFilePatterns: [],
         compress: {
             permission: "allow",
@@ -53,6 +61,8 @@ function buildConfig(overrides: Partial<PluginConfig> = {}): PluginConfig {
             majorGcThresholdPercent: "100%",
             batchCleanup: { lowThreshold: "60%", highThreshold: "75%", forceThreshold: "90%" },
         },
+        qualityGate: { enabled: false, algorithm: "rouge-recall-v1", algorithms: {} },
+        messageFilters: { enabled: false, filters: {} },
     }
     return { ...base, ...overrides }
 }
@@ -303,6 +313,7 @@ test("parent-state transfer restores a fork when historical compress input is ab
 
     assert.equal(restored, 1)
     assert.equal(forkState.prune.messages.blocksById.size, 1)
+    assert.equal(forkState.prune.messages.nextBlockId, 2)
     assert.ok(forkState.prune.messages.byMessageId.get("fork-u1")?.activeBlockIds.includes(1))
     assert.ok(forkState.prune.messages.byMessageId.get("fork-a1")?.activeBlockIds.includes(1))
     assert.equal(forkState.prune.messages.blocksById.get(1)?.anchorMessageId, "fork-u1")
@@ -350,6 +361,112 @@ test("parent-state transfer rejects a mismatched fork without partial state", ()
     assert.equal(restored, 0)
     assert.equal(forkState.prune.messages.blocksById.size, 0)
     assert.equal(forkState.prune.messages.byMessageId.size, 0)
+})
+
+test("parent-state transfer normalizes legacy message block boundaries without changing block refs", () => {
+    const parentState = freshState()
+    const parentMessages: WithParts[] = [
+        makeUserMessage("parent-legacy-u1", "original request"),
+        makeAssistantMessage("parent-legacy-a1", [makeTextPart("original response")]),
+        makeAssistantMessage("parent-legacy-compress", [
+            makeCompressPart("parent-legacy-call", {
+                topic: "Legacy boundaries",
+                content: [{ startId: "m00001", endId: "m00002", summary: "Parent summary." }],
+            }),
+        ]),
+    ]
+    const config = buildConfig()
+    assert.equal(rebuildCompressionState(parentState, parentMessages, config, logger), 1)
+
+    const legacy = persistedState(parentState)
+    const parentBlock = legacy.prune.messages.blocksById["1"]!
+    legacy.prune.messages.blocksById["1"] = {
+        ...parentBlock,
+        startId: "m0001",
+        endId: "m0002",
+    }
+    const normalized = normalizePersistedMessageIds(legacy)
+    assert.equal(normalized.prune.messages.blocksById["1"]?.startId, "m00001")
+    assert.equal(normalized.prune.messages.blocksById["1"]?.endId, "m00002")
+    assert.equal(normalizeMessageBoundary("b1"), "b1")
+    assert.equal(normalizeMessageBoundary("opaque-boundary"), "opaque-boundary")
+
+    const forkMessages: WithParts[] = [
+        makeUserMessage("fork-legacy-u1", "original request"),
+        makeAssistantMessage("fork-legacy-a1", [makeTextPart("original response")]),
+        makeAssistantMessage("fork-legacy-compress", [
+            {
+                type: "tool",
+                tool: "compress",
+                callID: "fork-legacy-call",
+                state: { status: "completed", output: "compression copied without input" },
+            },
+        ] as WithParts["parts"]),
+    ]
+    const forkState = freshState()
+    assert.equal(
+        restoreForkCompressionState(forkState, forkMessages, legacy, parentMessages, logger),
+        1,
+    )
+    const forkBlock = forkState.prune.messages.blocksById.get(1)
+    assert.equal(forkBlock?.startId, "m00001")
+    assert.equal(forkBlock?.endId, "m00002")
+    assert.equal(forkBlock?.anchorMessageId, "fork-legacy-u1")
+    assert.ok(forkState.prune.messages.byMessageId.get("fork-legacy-u1"))
+    assert.ok(forkState.prune.messages.byMessageId.get("fork-legacy-a1"))
+})
+
+test("ordinary restart normalizes four-digit refs before loading blocks and range consumers", async () => {
+    const storage = mkdtempSync(join(tmpdir(), "acp-legacy-restart-"))
+    const sessionId = `legacy-restart-${Date.now()}-${process.pid}`
+    const first = makeUserMessage("restart-u1", "first")
+    const second = makeAssistantMessage("restart-a1", [makeTextPart("second")])
+    const compression = makeAssistantMessage("restart-compress", [
+        makeCompressPart("restart-call", {
+            topic: "restart",
+            content: [{ startId: "m00001", endId: "m00002", summary: "restart summary" }],
+        }),
+    ])
+    const history: WithParts[] = [first, second, compression]
+    const sourceState = freshState()
+    const config = buildConfig({ storagePath: storage })
+    sourceState.sessionId = sessionId
+    assert.equal(rebuildCompressionState(sourceState, history, config, logger), 1)
+
+    const persisted = persistedState(sourceState)
+    persisted.messageIds = {
+        byRawId: { "restart-u1": "m0001", "restart-a1": "m0002" },
+        byRef: { m0001: "restart-u1", m0002: "restart-a1" },
+        nextRef: 3,
+    }
+    persisted.prune.messages.blocksById["1"] = {
+        ...persisted.prune.messages.blocksById["1"]!,
+        startId: "m0001",
+        endId: "m0002",
+    }
+    writeFileSync(join(storage, `${sessionId}.json`), JSON.stringify(persisted), "utf8")
+
+    const sessions = {
+        get: async () => ({ parentID: null }),
+        messages: async () => history,
+        parentMessages: async () => history,
+    }
+    const restarted = freshState()
+    try {
+        await ensureSessionInitialized(sessions, restarted, sessionId, logger, history, config)
+        const block = restarted.prune.messages.blocksById.get(1)
+        assert.equal(block?.startId, "m00001")
+        assert.equal(block?.endId, "m00002")
+        assert.equal(restarted.messageIds.byRawId.get("restart-u1"), "m00001")
+        assert.equal(restarted.messageIds.byRef.get("m00002"), "restart-a1")
+
+        const search = buildSearchContext(restarted, history)
+        const resolved = resolveBoundaryIds(search, restarted, "m00001", "m00002")
+        assert.equal(resolved.startReference.messageId, "restart-u1")
+        assert.equal(resolved.endReference.messageId, "restart-a1")
+    } finally {
+        rmSync(storage, { recursive: true, force: true })
+    }
 })
 
 test("session initialization restores matching parent state before replay fallback", async () => {

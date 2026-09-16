@@ -82,7 +82,60 @@ function block(overrides: Partial<CompressionBlock> = {}): CompressionBlock {
 }
 
 function config(storagePath: string): PluginConfig {
-    return { storagePath } as PluginConfig
+    return {
+        enabled: true,
+        autoUpdate: false,
+        debug: false,
+        logLevel: "silent",
+        allowSubAgents: true,
+        pruneNotification: "off",
+        pruneNotificationType: "toast",
+        storagePath,
+        commands: { enabled: true, protectedTools: [] },
+        experimental: { customPrompts: false },
+        protectedFilePatterns: [],
+        compress: {
+            mode: "range",
+            permission: "allow",
+            showCompression: false,
+            summaryBuffer: true,
+            candidates: false,
+            maxContextLimit: 150_000,
+            minContextLimit: 50_000,
+            contextLimitFallback: 128_000,
+            nudgeFrequency: 5,
+            minNudgeContextPercent: 5,
+            nudgeGrowthTokens: 5_000,
+            toolOutputNudgeThreshold: 5_000,
+            iterationNudgeThreshold: 15,
+            nudgeForce: "soft",
+            protectedTools: [],
+            protectTags: false,
+            protectUserMessages: false,
+            maxSummaryLengthHard: 20_000,
+            minCompressRange: 0,
+            minNudgeGrowthRatio: 0.45,
+            minNudgeGrowthFloor: 5_000,
+            emergencyThresholdPercent: "98%",
+            maxVisibleSegments: 50,
+            keepEmbedMaxChars: 2_000,
+            preserveRecentMessages: 20,
+            preserveRecentTokens: 0,
+            preserveLastUserMessage: true,
+            reasoning: { drop: true, threshold: 2_048 },
+            completionReserveTokens: 32_768,
+        },
+        gc: {
+            algorithm: "truncate",
+            promotionThreshold: 5,
+            maxBlockAge: 15,
+            maxOldGenSummaryLength: 3_000,
+            majorGcThresholdPercent: "100%",
+            batchCleanup: { lowThreshold: "60%", highThreshold: "75%", forceThreshold: "90%" },
+        },
+        qualityGate: { enabled: false, algorithm: "rouge-recall-v1", algorithms: {} },
+        messageFilters: { enabled: false, filters: {} },
+    }
 }
 
 function noParentSessions() {
