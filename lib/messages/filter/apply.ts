@@ -1,7 +1,13 @@
 import type { WithParts } from "../../state"
 import type { Logger } from "../../logger"
-import type { MessageFilter, MessageFilterContext, MessageFiltersConfig, FilterResult } from "./types"
+import type {
+    MessageFilter,
+    MessageFilterContext,
+    MessageFiltersConfig,
+    FilterResult,
+} from "./types"
 import { listMessageFilters } from "./registry"
+import { isAcpOpaquePart } from "../opaque"
 
 export interface ApplyResult {
     partsFiltered: number
@@ -57,7 +63,10 @@ export function applyMessageFilters(
             result.partsDropped++
             if (decision.reason) {
                 logger.debug("Message filter dropped text", {
-                    filter: filterName, reason: decision.reason, messageIndex: i, originalLength: originalText.length,
+                    filter: filterName,
+                    reason: decision.reason,
+                    messageIndex: i,
+                    originalLength: originalText.length,
                 })
             }
             return ""
@@ -67,8 +76,11 @@ export function applyMessageFilters(
             result.partsModified++
             if (decision.reason) {
                 logger.debug("Message filter modified text", {
-                    filter: filterName, reason: decision.reason, messageIndex: i,
-                    originalLength: originalText.length, newLength: decision.text.length,
+                    filter: filterName,
+                    reason: decision.reason,
+                    messageIndex: i,
+                    originalLength: originalText.length,
+                    newLength: decision.text.length,
                 })
             }
             return decision.text
@@ -82,6 +94,7 @@ export function applyMessageFilters(
         const msg = messages[i]
         const role = (msg.info as { role?: string }).role ?? "unknown"
         for (const part of msg.parts ?? []) {
+            if (isAcpOpaquePart(part)) continue
             const text = (part as { text?: string }).text
             if (typeof text !== "string" || text.length === 0) continue
             let current = text
@@ -103,7 +116,13 @@ export function applyMessageFilters(
                     continue
                 }
                 if (decision.action === "keep") continue
-                current = applyDecision(part as { text?: string }, decision, filter.name, i, current)
+                current = applyDecision(
+                    part as { text?: string },
+                    decision,
+                    filter.name,
+                    i,
+                    current,
+                )
                 filterCtx.text = current
             }
         }
@@ -121,6 +140,7 @@ export function applyMessageFilters(
             const parts = msg.parts ?? []
             for (let p = parts.length - 1; p >= 0; p--) {
                 const part = parts[p]
+                if (isAcpOpaquePart(part)) continue
                 const text = (part as { text?: string }).text
                 if (typeof text !== "string" || text.length === 0) continue
                 const filterCtx = buildCtx(text, role, i)

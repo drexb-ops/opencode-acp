@@ -3,14 +3,14 @@
 - Task ID: `2026-09-15_opencode-v2`
 - Home Repo: `opencode-acp`
 - Status: InProgress
-- Updated: 2026-09-15 22:32 UTC
+- Updated: 2026-09-16 00:23 UTC
 
 ## 1. Summary
 
 - **What was done**: Investigated the production plugin failure, mapped ACP's V1
   host dependencies, verified the exact published OpenCode 2.0.3 plugin API,
   recorded the approved V1/V2 compatibility design, and implemented the shared
-  host/tool contracts plus Phase 3 state serialization and transactions.
+  host/tool contracts, transactional state, and V2 primary context adapter.
 - **Why**: ACP currently fails before initialization on OpenCode V2 because its
   default export and all host integrations use the V1 plugin API.
 - **Behavior / compatibility changes**: No intentional V1 behavior changes;
@@ -28,7 +28,8 @@
 | `b42d827`   | Record the integrated pre-change verification baseline        |
 | `b569ccd`   | Add the dual V1/V2 entrypoint and dependency foundation       |
 | `5d21e10`   | Add shared host services and host-neutral tool definitions    |
-| This commit | Serialize session mutations and stage transform effects       |
+| `9a349ec`   | Serialize session mutations and stage transform effects       |
+| This commit | Add V2 projection, validated patching, and primary context    |
 
 ### Phase 1
 
@@ -177,3 +178,31 @@
 - **DEFERRED to Phase 9**: Docker installed-artifact E2E coverage for the
   nudge-triggered compression path, nudge-state verification, and multi-turn
   growth accumulation. This follow-up is recorded, not claimed complete here.
+
+## 8. Phase 4/5 — V2 projection and primary context hook
+
+- Added a loss-aware V2 projected-history normalizer with source/content
+  provenance, output spans, tool-call/result correlation, turn markers, opaque
+  attachment/system/provider-checkpoint boundaries, and stable fingerprints.
+- Added validated patching that edits the already-lowered `@opencode/ai`
+  messages in place conceptually (one replacement array), preserving provider
+  metadata/cache/native/structured/file content and uncorrelated host messages.
+  Ambiguous or opaque mutations reject without changing the event or live state.
+- Added the focused V2 session/catalog adapter and registered only the primary
+  `session.context` hook. The hook resolves `event.model` limits, runs the
+  shared transform under the Phase 3 guard, renders the system prompt from the
+  working state, then commits event/state/deferred effects in order.
+- V2 sanitation is limited to outbound historical assistant text; persisted
+  history and provider streams are untouched. V2 notices remain explicit
+  non-throwing placeholders until the later RPC/TUI phase.
+- Split projection types, shared lowering helpers, normalization, and patching
+  into focused modules after lead review. Opaque validation retains original
+  object identity instead of hashing provider payloads.
+- Added focused projection, patch, host/fork, rollback, and context tests.
+  **PASS**: 16/16 focused V2 tests, typecheck, build, targeted formatting, and
+  the final full suite at 1,318/1,318 tests.
+- Lead-review follow-up: split the V2 projection API into a small barrel plus
+  `projection/{types,shared,normalize,patch}.ts`; replaced opaque payload hashes
+  with message/content reference checks; centralized `isAcpOpaquePart`; added
+  direct Promise-shape host tests, cached-model-limit fallback/switch coverage,
+  and an end-to-end rejected-context rollback test.

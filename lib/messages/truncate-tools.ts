@@ -3,6 +3,7 @@ import type { PluginConfig } from "../config"
 import { Logger } from "../logger"
 import { getCurrentTokenUsage, countTokens, extractCompletedToolOutput } from "../token-utils"
 import { resolveEffectiveContextLimit } from "../state/utils"
+import { isAcpOpaquePart } from "./opaque"
 
 const TRUNCATION_MARKER = "[truncated for context space"
 const MIN_OUTPUT_TOKENS = 1000
@@ -59,7 +60,10 @@ export function truncateLargeToolOutputs(
     // when provider usage already includes the system prompt. Users with
     // larger max_tokens can lower gc.majorGcThresholdPercent — the min()
     // keeps the stricter bound.
-    const configuredThreshold = parseGcThreshold(config.gc?.majorGcThresholdPercent, effective.limit)
+    const configuredThreshold = parseGcThreshold(
+        config.gc?.majorGcThresholdPercent,
+        effective.limit,
+    )
     const overhead = (state.systemPromptTokens ?? 0) + OUTPUT_RESERVE_TOKENS
     const threshold = Math.min(configuredThreshold, effective.limit - overhead)
     if (threshold <= 0) {
@@ -92,6 +96,7 @@ export function truncateLargeToolOutputs(
         for (let pi = 0; pi < parts.length; pi++) {
             const part = parts[pi]
             if (part?.type !== "tool") continue
+            if (isAcpOpaquePart(part)) continue
             if (part.state?.status !== "completed") continue
 
             const content = extractCompletedToolOutput(part)
@@ -122,9 +127,7 @@ export function truncateLargeToolOutputs(
         const prefix = content.slice(0, KEEP_PREFIX_CHARS)
         const suffix = content.slice(-KEEP_SUFFIX_CHARS)
         const truncated =
-            prefix +
-            `\n\n...${TRUNCATION_MARKER} — original ~${tokens} tokens]...\n\n` +
-            suffix
+            prefix + `\n\n...${TRUNCATION_MARKER} — original ~${tokens} tokens]...\n\n` + suffix
 
         part.state.output = truncated
         savedTokens += tokens - countTokens(truncated)

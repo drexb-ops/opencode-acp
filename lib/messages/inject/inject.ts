@@ -3,6 +3,7 @@ import type { Logger } from "../../logger"
 import type { PluginConfig } from "../../config"
 import type { RuntimePrompts } from "../../prompts/store"
 import { formatMessageIdTag, formatTokenSize, classifyMessageType } from "../../message-ids"
+import { isAcpOpaquePart } from "../opaque"
 import type { CompressionPriorityMap } from "../priority"
 import { compressPermission } from "../../compress-permission"
 import { countMessageCharacters } from "../../token-utils"
@@ -1040,7 +1041,7 @@ export const injectMessageIds = (
         if (message.info.role === "user") {
             let injected = false
             for (const part of message.parts) {
-                if (part.type === "text") {
+                if (part.type === "text" && !isAcpOpaquePart(part)) {
                     injected = appendToTextPart(part, tag) || injected
                 }
             }

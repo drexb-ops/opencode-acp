@@ -9,6 +9,7 @@ import {
     extractCompletedToolOutput,
     getCurrentTokenUsage,
 } from "../token-utils"
+import { isAcpOpaquePart } from "./opaque"
 
 /**
  * Default completion reserve in tokens. opencode falls back to max_tokens=32000
@@ -164,6 +165,7 @@ export function enforceContextBudget(
         const parts = Array.isArray(msg.parts) ? msg.parts : []
         for (const part of parts) {
             if (part?.type !== "tool") continue
+            if (isAcpOpaquePart(part)) continue
             if (part.state?.status !== "completed") continue
             if (part.tool === "compress") continue
             if (protectedTools.has(part.tool)) continue
@@ -195,9 +197,7 @@ export function enforceContextBudget(
         const prefix = c.content.slice(0, KEEP_PREFIX_CHARS)
         const suffix = c.content.slice(-KEEP_SUFFIX_CHARS)
         const truncated =
-            prefix +
-            `\n\n...${TRUNCATION_MARKER} — original ~${c.tokens} tokens]...\n\n` +
-            suffix
+            prefix + `\n\n...${TRUNCATION_MARKER} — original ~${c.tokens} tokens]...\n\n` + suffix
         // Content just over the 4000-char threshold: prefix and suffix
         // overlap and the marker line makes the "truncated" form LONGER.
         // Skip it (phase 2 may still clear it) instead of growing it.

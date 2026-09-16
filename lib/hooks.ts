@@ -54,7 +54,18 @@ function isInternalAgentRequest(messages: WithParts[]): boolean {
     return typeof agent === "string" && INTERNAL_AGENT_NAMES.has(agent)
 }
 
-async function runMessageTransformTransaction(
+export interface PreparedMessageTransformTransaction {
+    workingMessages: WithParts[]
+    workingState: SessionState
+    effects: DeferredMutationEffects
+}
+
+/**
+ * Prepare the shared message transform without committing any state, messages,
+ * persistence, or host-facing effects. V1 commits this immediately; V2 first
+ * validates its provider-message patch and then uses the same commit seam.
+ */
+export async function prepareMessageTransformTransaction(
     messages: WithParts[],
     state: SessionState,
     config: PluginConfig,
@@ -63,8 +74,9 @@ async function runMessageTransformTransaction(
     hostPermissions: HostPermissionSnapshot,
     requestModelLimit: number | undefined,
     modelLimitKnown: boolean | undefined,
-    debugNotify: (text: string) => void | Promise<void>,
-): Promise<void> {
+    debugNotify?: (text: string) => void | Promise<void>,
+    sanitizeAssistantTextOnly = false,
+): Promise<PreparedMessageTransformTransaction> {
     const workingMessages = structuredClone(messages) as WithParts[]
     const workingState = cloneSessionState(state)
     const effects = new DeferredMutationEffects()
@@ -83,13 +95,23 @@ async function runMessageTransformTransaction(
             modelLimitKnown,
             effects,
             debugNotify,
+            sanitizeAssistantTextOnly,
         },
     )
 
-    commitSessionState(state, workingState)
-    messages.splice(0, messages.length, ...workingMessages)
+    return { workingMessages, workingState, effects }
+}
 
-    if (effects.persistenceRequested) {
+export async function commitPreparedMessageTransformTransaction(
+    prepared: PreparedMessageTransformTransaction,
+    state: SessionState,
+    logger: Logger,
+    messages?: WithParts[],
+): Promise<void> {
+    commitSessionState(state, prepared.workingState)
+    if (messages) messages.splice(0, messages.length, ...prepared.workingMessages)
+
+    if (prepared.effects.persistenceRequested) {
         try {
             await saveSessionState(state, logger)
         } catch (error) {
@@ -100,13 +122,38 @@ async function runMessageTransformTransaction(
         }
     }
     try {
-        await effects.run()
+        await prepared.effects.run()
     } catch (error) {
         logger.warn("Deferred message transform effect failed", {
             sessionId: state.sessionId,
             error: error instanceof Error ? error.message : String(error),
         })
     }
+}
+
+async function runMessageTransformTransaction(
+    messages: WithParts[],
+    state: SessionState,
+    config: PluginConfig,
+    logger: Logger,
+    prompts: PromptStore,
+    hostPermissions: HostPermissionSnapshot,
+    requestModelLimit: number | undefined,
+    modelLimitKnown: boolean | undefined,
+    debugNotify: (text: string) => void | Promise<void>,
+): Promise<void> {
+    const prepared = await prepareMessageTransformTransaction(
+        messages,
+        state,
+        config,
+        logger,
+        prompts,
+        hostPermissions,
+        requestModelLimit,
+        modelLimitKnown,
+        debugNotify,
+    )
+    await commitPreparedMessageTransformTransaction(prepared, state, logger, messages)
 }
 
 export function createSystemPromptHandler(

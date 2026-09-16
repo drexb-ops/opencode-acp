@@ -12,6 +12,7 @@ import {
     injectMessageIds,
     prune,
     stripHallucinations,
+    stripHallucinationsFromString,
     stripStaleMetadata,
     syncCompressionBlocks,
 } from "./index"
@@ -31,6 +32,7 @@ import { syncToolCache, updatePerTurnState } from "../state"
 import { applyMessageFilters } from "./filter/apply"
 import { hideConsumedCompressCalls } from "../compress/hide-consumed"
 import { hideFailedCompressCalls } from "../compress/hide-failed"
+import { isAcpOpaquePart } from "./opaque"
 
 /** Inputs resolved by the host adapter before entering a state transaction. */
 export interface MessageTransformOptions {
@@ -39,6 +41,8 @@ export interface MessageTransformOptions {
     effects: DeferredMutationEffects
     /** Host-facing debug notification; the transform only stages its call. */
     debugNotify?: (text: string) => void | Promise<void>
+    /** V2 has no post-generation hook; only historical assistant text is sanitized. */
+    sanitizeAssistantTextOnly?: boolean
 }
 
 /**
@@ -113,7 +117,22 @@ export async function runMessageTransform(
         return
     }
 
-    stripHallucinations(messages)
+    if (options.sanitizeAssistantTextOnly) {
+        for (const message of messages) {
+            if (message.info.role !== "assistant") continue
+            for (const part of message.parts) {
+                if (
+                    part.type === "text" &&
+                    !isAcpOpaquePart(part) &&
+                    typeof part.text === "string"
+                ) {
+                    part.text = stripHallucinationsFromString(part.text)
+                }
+            }
+        }
+    } else {
+        stripHallucinations(messages)
+    }
 
     const dropReasoningModel = (
         lastUserMessage?.info as { model?: { providerID?: string; modelID?: string } } | undefined

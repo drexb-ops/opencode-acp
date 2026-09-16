@@ -2,6 +2,7 @@ import { createHash } from "node:crypto"
 import type { SessionState, WithParts } from "../state"
 import { isMessageCompacted } from "../state/utils"
 import type { AssistantMessage, Message, UserMessage } from "@opencode-ai/sdk/v2"
+import { isAcpOpaquePart } from "./opaque"
 
 const SUMMARY_ID_HASH_LENGTH = 16
 
@@ -115,7 +116,7 @@ export const appendToLastTextPart = (message: WithParts, injection: string): boo
 const findLastTextPart = (message: WithParts): TextPart | null => {
     for (let i = message.parts.length - 1; i >= 0; i--) {
         const part = message.parts[i]
-        if (part.type === "text") {
+        if (part.type === "text" && !isAcpOpaquePart(part)) {
             return part
         }
     }
@@ -152,6 +153,9 @@ export const appendToAllToolParts = (message: WithParts, tag: string): boolean =
 }
 
 const appendToToolPart = (part: ToolPart, tag: string): boolean => {
+    if (isAcpOpaquePart(part)) {
+        return false
+    }
     if (part.state?.status !== "completed" || typeof part.state.output !== "string") {
         return false
     }
