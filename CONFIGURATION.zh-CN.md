@@ -4,6 +4,53 @@
 
 Active Context Pruning (ACP) 所有可配置参数的完整参考手册。
 
+## 宿主与运行时兼容性
+
+同一个 `opencode-acp` 包支持 OpenCode V1 `>=1.18.29` 和 OpenCode V2
+`>=2.0.3`：
+
+- **V1：** 仍支持旧版 `plugin` 配置。
+
+    ```json
+    {
+        "plugin": {
+            "opencode-acp": "stable"
+        }
+    }
+    ```
+
+- **V2：** 使用原生 `plugins` 配置。
+
+    ```json
+    {
+        "plugins": ["opencode-acp@stable"]
+    }
+    ```
+
+包根路径和 `./server` 解析到同一个双运行时定义（包含 `id`、V2 的 `setup`
+和 V1 的 `server`）。OpenCode V2 会自动发现该包的 TUI 入口，因此用户只需
+配置一次此包，不要另外添加 server 和 TUI 入口。
+
+两个运行时都保留相同的五个工具（`compress`、`decompress`、`search_context`、
+`acp_status` 和 `acp_context_recap`）以及 `/acp`、`/dcp` 命令。文件系统会话
+状态、`storagePath`、prompt 覆盖路径、消息/块引用和内部 `dcp-*` 标签共享同一
+兼容格式；从 V1 切换到 V2 无需迁移状态，回滚到 V1 仍然安全。
+
+在 V2 中，五个工具是 Code Mode 之外的直接模型工具（`codemode: false`）。通知
+通过带类型的 server RPC 发送到原生 TUI toast。没有 TUI 监听器的 server-only
+或 headless 进程会继续运行，但不会显示 toast。OpenCode V2.0.3 不向 server
+plugin 暴露创建原生权限请求的能力：有效 `allow` 会执行，`deny` 会隐藏/阻止
+工具，`ask` 会在修改状态前安全失败并返回可操作的结果；V2 的 `ask` 不会交互式
+提示。
+
+OpenCode V2.0.3 无法在 assistant 完成文本持久化或显示前重写它。ACP 只在历史
+assistant 文本重新组装到发往模型的上下文时清理模型臆造的 ACP/DCP 标签；不会
+重写持久化历史或已显示的 transcript。
+
+设置 `BILLION_CONTEXT_PROXY` 或在 provider 设置中包含准确的 `/bili/` 路由标记
+都会禁用 ACP。V2 的 catalog 刷新事件会重新检查该路由并刷新 ACP 的工具和命令；
+移除 proxy 后可以重新启用 ACP。
+
 ## 配置文件位置
 
 ACP 从最多三层配置文件中读取（后加载的覆盖先加载的）：
@@ -53,14 +100,14 @@ ACP 从最多三层配置文件中读取（后加载的覆盖先加载的）：
 - **类型：** `boolean`
 - **默认值：** `true`
 - **状态：** ACTIVE
-- **说明：** 启动时自动检查并安装 ACP 更新，跟踪安装时所用的 dist-tag/规范（`opencode-acp@stable` 跟随 `stable` 标签；`^1.14.0` 等范围规范跟随 `latest`）。版本锁定的规范永不更新。
+- **说明：** 启动时检查 npm 安装的 ACP，并且只更新可自动更新的规范。安装时所用的 dist-tag/规范决定通道（`opencode-acp@stable` 跟随 `stable`；`@latest` 和 `^1.14.0` 等范围规范跟随 `latest`）。发现新版本后，ACP 会删除安装 wrapper，让 OpenCode 在下次启动时重新安装；需重启 OpenCode 才能完成。版本锁定或非 registry 规范永不更新。插件卸载时会取消 registry 请求、计时器和延迟通知，并抑制卸载后的回调。
 
 #### `debug`
 
 - **类型：** `boolean`
 - **默认值：** `false`
 - **状态：** ACTIVE
-- **说明：** 启用调试模式。设为 `true` 时，ACP 在每次压缩后发送聊天通知，显示块详情，并将 `logLevel` 置为 `debug`（INFO/DEBUG 日志与按请求的上下文快照，`~/.config/opencode/logs/acp/`）。设为 `true` 时此开关优先于 `logLevel`。
+- **说明：** 启用调试模式。设为 `true` 时，ACP 在每次压缩后发送详细通知，显示块详情，并将 `logLevel` 置为 `debug`（INFO/DEBUG 日志与按请求的上下文快照，`~/.config/opencode/logs/acp/`）。设为 `true` 时此开关优先于 `logLevel`。
 
 #### `logLevel`
 
@@ -74,7 +121,7 @@ ACP 从最多三层配置文件中读取（后加载的覆盖先加载的）：
 - **类型：** `string`
 - **默认值：** 未设置 — `$XDG_DATA_HOME/opencode/storage/plugin/acp`（即 `~/.local/share/opencode/storage/plugin/acp`）
 - **状态：** ACTIVE
-- **说明：** 会话状态文件（`{sessionId}.json`，含压缩块、提示状态、token 统计）的持久化目录。路径语义：
+- **说明：** V1 和 V2 共用的会话状态文件（`{sessionId}.json`，含压缩块、提示状态、token 统计）持久化目录。路径语义：
     - 绝对路径 → 原样使用
     - `~` / `~/...` → 相对于主目录展开
     - 相对路径 → 相对于项目目录（opencode 启动目录）解析
@@ -98,7 +145,11 @@ ACP 从最多三层配置文件中读取（后加载的覆盖先加载的）：
 - **状态：** ACTIVE
 - **说明：** 压缩通知的投递方式。
     - `"toast"` — 瞬时弹窗提示（推荐；非阻塞）
-    - `"chat"` — 注入为聊天消息（部分 provider 拒绝空消息时可能冻结会话）
+    - `"chat"` — 已废弃的兼容值；ACP 会发出警告并回退为 toast，不再注入聊天消息
+
+    在 V2 中，server 通知通过带类型的 RPC bridge 发送，并由自动发现的 TUI
+    入口显示为原生 toast。仅运行 server 或 headless 模式会继续运行，但不会显示
+    toast。
 
 #### `protectedFilePatterns`
 
@@ -163,8 +214,8 @@ ACP 从最多三层配置文件中读取（后加载的覆盖先加载的）：
 - **状态：** ACTIVE
 - **说明：** `compress` 工具的权限级别。
     - `"allow"` — 自动批准压缩调用
-    - `"ask"` — 每次压缩前提示用户确认
-    - `"deny"` — 阻止所有压缩调用
+    - `"ask"` — V1 在每次压缩前提示用户确认。OpenCode V2.0.3 不向 server plugin 暴露创建原生权限请求的能力，因此 V2 会在修改状态前安全失败并返回可操作的结果；不会交互式提示。
+    - `"deny"` — 阻止所有压缩调用。在 V2 中，ACP 工具不会提供给模型且会阻止执行。
 
 #### `compress.showCompression`
 
@@ -190,7 +241,7 @@ ACP 从最多三层配置文件中读取（后加载的覆盖先加载的）：
 #### `compress.maxContextLimit`
 
 - **类型：** `number | \`${number}%\``
-- **默认值：** `"55%"`
+- **默认值：** `"80%"`
 - **状态：** ACTIVE
 - **说明：** 上下文使用率上限（以模型上下文窗口的百分比或绝对 token 数表示）。超过此值时，ACP 提示模型进行压缩。示例：`"55%"` 或 `100000`。
 

@@ -10,7 +10,6 @@
 
 ---
 
-
 ## 📄 论文 / 预印本
 
 - **[模型驱动的分层增量压缩:面向长寿命编码 Agent 的免训练多代上下文管理](./paper/模型驱动的分层增量压缩-免训练多代上下文管理.md)**(中文版,v0.2)
@@ -56,11 +55,11 @@ ACP 将上下文管理的所有权限全部交给模型自己，而不依靠外�
 
 按客户端选:
 
-| 客户端 | 用这个 |
-|---|---|
-| **pi** | [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi)(进程内扩展) |
-| **opencode** | [`opencode-acp`](https://github.com/ranxianglei/opencode-acp)(进程内扩展) |
-| **omp** | [`billion-context`](https://github.com/ranxianglei/billion-context),`bili omp`(内置插件) |
+| 客户端                        | 用这个                                                                                                              |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| **pi**                        | [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi)(进程内扩展)                               |
+| **opencode**                  | [`opencode-acp`](https://github.com/ranxianglei/opencode-acp)(进程内扩展)                                           |
+| **omp**                       | [`billion-context`](https://github.com/ranxianglei/billion-context),`bili omp`(内置插件)                            |
 | **其余所有**(没有上下文 hook) | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili <client>`(启动器,优先)或 `/bili/` 前缀 |
 
 ---
@@ -88,25 +87,78 @@ ACP 将上下文管理的所有权限全部交给模型自己，而不依靠外�
 
 ## 安装
 
+同一个 `opencode-acp` 包支持两代 OpenCode 运行时：
+
+- **OpenCode V1（`>=1.18.29`）** — 可以继续使用旧版 `plugin` 配置：
+
+    ```json
+    {
+        "plugin": {
+            "opencode-acp": "stable"
+        }
+    }
+    ```
+
+- **OpenCode V2（`>=2.0.3`）** — 使用原生 `plugins` 配置：
+
+    ```json
+    {
+        "plugins": ["opencode-acp@stable"]
+    }
+    ```
+
+包根路径和 `opencode-acp/server` 解析到同一个双运行时定义：V2 定义包含
+`id: "opencode-acp"` 和 `setup`，V1 入口仍通过 `server` 提供。在 V2
+中，OpenCode 还会自动发现该包的 TUI 入口。只配置一次此包；不要另外配置
+server 或 TUI 入口。
+
+V1 CLI 安装器的命令如下：
+
 ```bash
 opencode plugin opencode-acp@stable --global
 ```
 
-或者添加到你的 opencode 配置中：
-
-```json
-{
-    "plugin": {
-        "opencode-acp": "stable"
-    }
-}
-```
-
 ---
+
+## 运行时兼容性
+
+V1 和 V2 使用相同的 ACP 功能面：五个工具 `compress`、`decompress`、
+`search_context`、`acp_status` 和 `acp_context_recap`，以及 `/acp` 和
+`/dcp` 命令。会话状态默认仍以文件形式持久化到
+`~/.local/share/opencode/storage/plugin/acp/{sessionId}.json`。自定义
+`storagePath`、`~/.config/opencode/acp-prompts/` 下的 prompt 覆盖路径、
+消息/块引用和内部 `dcp-*` 标签保持兼容。在 V1 与 V2 之间切换无需迁移状态，
+回滚到 V1 仍然安全。
+
+在 V2 中，五个工具作为 Code Mode 之外的直接模型工具注册（`codemode: false`）。
+通知由 server 通过带类型的 ACP RPC 事件发送到原生 TUI toast。如果没有 TUI
+监听器（例如仅运行 server 或 headless 模式），不会显示 toast，但 ACP 仍会继续运行。
+
+OpenCode V2.0.3 不向 server plugin 暴露创建原生权限请求的能力。有效权限为
+`allow` 时工具正常执行；为 `deny` 时工具不会提供给模型且会阻止执行；为 `ask`
+时，ACP 会在修改状态前安全失败，并返回可操作的结果，要求选择 `allow` 或
+`deny`。V2 不会为 `ask` 打开交互式提示；V1 的权限行为不变。
+
+OpenCode V2.0.3 没有在 assistant 完成文本持久化或显示前重写它的能力。因此，
+ACP 只会在历史 assistant 文本重新组装到发往模型的上下文时，清理模型臆造的
+ACP/DCP 标签；不会重写持久化历史或已显示的 transcript。
+
+设置 `BILLION_CONTEXT_PROXY` 时，ACP 会自行禁用。如果 provider 设置包含准确的
+`/bili/` 路由标记，ACP 也会自行禁用。在 V2 中，catalog 刷新事件会重新检查该
+路由并更新 ACP 的工具和命令，因此移除 proxy 后无需重启 server 即可重新启用 ACP。
+
+启用 `autoUpdate`（默认值）时，ACP 会在启动时检查 npm 安装且可自动更新的规范。
+发现新版本后，ACP 会删除安装 wrapper，让 OpenCode 在下次启动时重新安装，并通过
+通知通道发送重启提示（TUI 可用时显示为 toast）；版本锁定的规范不会更新。插件
+卸载时会取消未完成的检查和延迟通知。
 
 ## 工作原理
 
-ACP 把上下文压缩工具直接交给模型。模型对上下文压缩**负全责**。模型的主要工具是 **compress** 和 **decompress**，辅以 **acp_status**（上下文监控）和 **search_context**（搜索已压缩内容）。压缩采用**三级 LSM-tree 架构**（T1 捕获 → T2 蒸馏 → T3 浓缩），使上下文在数年内保持有界。当上下文达到 100% 时，系统自动触发 GC 截断作为兜底。
+ACP 把上下文压缩工具直接交给模型。模型对上下文压缩**负全责**。五个工具是
+**compress**、**decompress**、**search_context**、**acp_status** 和
+**acp_context_recap**。压缩采用**三级 LSM-tree 架构**（T1 捕获 → T2 蒸馏 →
+T3 浓缩），使上下文在数年内保持有界。当上下文达到 100% 时，系统自动触发 GC
+截断作为兜底。
 
 ### 生命周期 — 三级压缩
 
@@ -123,11 +175,11 @@ stateDiagram-v2
     Tier1 --> GC_Truncated : GC（100% 上下文）
 ```
 
-| 层级 | 名称 | 输入 | 输出 | 压缩比 | 触发时机 |
-|------|------|------|------|--------|----------|
-| **T1** | 捕获 | 原始对话 | 详细摘要 | ~45× | 上下文超过 `maxContextLimit` |
-| **T2** | 蒸馏 | T1 摘要（≥ `nudgeGrowthTokens`） | 精炼的决策/结果 | ~10× | T1 摘要累积超过阈值 |
-| **T3** | 浓缩 | T2 摘要（≥ `nudgeGrowthTokens`） | 纯事实（每块 1-3 条） | ~5× | T2 摘要累积超过阈值 |
+| 层级   | 名称 | 输入                             | 输出                  | 压缩比 | 触发时机                     |
+| ------ | ---- | -------------------------------- | --------------------- | ------ | ---------------------------- |
+| **T1** | 捕获 | 原始对话                         | 详细摘要              | ~45×   | 上下文超过 `maxContextLimit` |
+| **T2** | 蒸馏 | T1 摘要（≥ `nudgeGrowthTokens`） | 精炼的决策/结果       | ~10×   | T1 摘要累积超过阈值          |
+| **T3** | 浓缩 | T2 摘要（≥ `nudgeGrowthTokens`） | 纯事实（每块 1-3 条） | ~5×    | T2 摘要累积超过阈值          |
 
 **触发机制：**
 
@@ -141,17 +193,17 @@ stateDiagram-v2
 
 **会话容量** — 一个会话从空 → T1 → T2 → T3 → 上下文极限，总共可以处理多少 token（真实校准：500 次 API 调用/天，~9.6K 新 token/调用，T1=45x/T2=10x/T3=3x）：
 
-| 上下文上限 | 1 个月 | 3 个月 | 到极限 | 极限时间 |
-|-----------|--------|--------|--------|---------|
-| 1M | 19 亿 tok | 105 亿 tok | **689 亿 tok** | 第 259 天（~8.6 月） |
-| 400K | 19 亿 tok | 103 亿 tok | **103 亿 tok** | 第 89 天（~3 月） |
-| 400K（200 调用/天） | 5.6 亿 tok | 25 亿 tok | **95 亿 tok** | 第 212 天（~7 月） |
+| 上下文上限          | 1 个月     | 3 个月     | 到极限         | 极限时间             |
+| ------------------- | ---------- | ---------- | -------------- | -------------------- |
+| 1M                  | 19 亿 tok  | 105 亿 tok | **689 亿 tok** | 第 259 天（~8.6 月） |
+| 400K                | 19 亿 tok  | 103 亿 tok | **103 亿 tok** | 第 89 天（~3 月）    |
+| 400K（200 调用/天） | 5.6 亿 tok | 25 亿 tok  | **95 亿 tok**  | 第 212 天（~7 月）   |
 
 **Token 节省** — 无 ACP 时上下文无限增长，约 100 次 API 调用后崩溃（~0.2 天）。有 ACP 时上下文被压缩在有界范围：
 
-| 指标 | 无 ACP | 有 ACP（1M 模型） |
-|------|--------|-----------------|
-| 会话寿命 | ~0.2 天 | 259 天（**长 1295 倍**） |
+| 指标          | 无 ACP   | 有 ACP（1M 模型）        |
+| ------------- | -------- | ------------------------ |
+| 会话寿命      | ~0.2 天  | 259 天（**长 1295 倍**） |
 | 总 token 产出 | ~5200 万 | 689 亿（**多 1325 倍**） |
 
 核心价值：ACP 不是减少每次调用的 token 成本，而是**让一个会话能处理 1000 倍以上的工作量**。
@@ -220,12 +272,12 @@ stateDiagram-v2
 
 ACP 提供 `/acp` 斜杠命令（为向后兼容也接受 `/dcp`）：
 
-| 命令                    | 说明                                                                                                                |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `/acp`                  | 显示压缩状态（同 `/acp stats`）；`/acp help` 查看命令列表                                                                            |
-| `/acp context`          | 按类别（system、user、assistant、tools 等）显示 token 用量明细，以及通过剪枝节省的量                                |
-| `/acp stats`            | 压缩状态：压缩块、上下文用量、推荐范围（与 `acp_status` 工具同一报告）                                                          |
-| `/acp export`           | 导出活动压缩块到 markdown 文件。选项：`--output <path>`、`--tier t1,t2,t3`、`--stdout`、`--append`                   |
+| 命令           | 说明                                                                                               |
+| -------------- | -------------------------------------------------------------------------------------------------- |
+| `/acp`         | 显示压缩状态（同 `/acp stats`）；`/acp help` 查看命令列表                                          |
+| `/acp context` | 按类别（system、user、assistant、tools 等）显示 token 用量明细，以及通过剪枝节省的量               |
+| `/acp stats`   | 压缩状态：压缩块、上下文用量、推荐范围（与 `acp_status` 工具同一报告）                             |
+| `/acp export`  | 导出活动压缩块到 markdown 文件。选项：`--output <path>`、`--tier t1,t2,t3`、`--stdout`、`--append` |
 
 ---
 
@@ -265,7 +317,9 @@ ACP 使用自己的配置文件，按以下顺序搜索：
     "$schema": "https://raw.githubusercontent.com/ranxianglei/opencode-acp/master/dcp.schema.json",
     // Enable or disable the plugin
     "enabled": true,
-    // 自动更新 npm 安装的 ACP：跟踪安装所用 dist-tag/规范（@stable 跟随 stable，@latest 跟随 latest）。
+    // 启动时检查 npm 安装的 ACP 更新。安装所用 dist-tag/规范决定更新通道
+    // （@stable 跟随 stable，@latest 和范围规范跟随 latest）。
+    // 更新会删除安装 wrapper；重启 OpenCode 后才会重新安装。
     // 版本锁定的规范不会被更新。
     "autoUpdate": true,
     // 文件日志级别: "debug" | "info" | "warn" | "error" | "silent"
@@ -274,8 +328,8 @@ ACP 使用自己的配置文件，按以下顺序搜索：
     "logLevel": "info",
     // 启用完整 DEBUG 日志 + 按请求快照（优先于 logLevel）
     "debug": false,
-    // Notification display: "off", "minimal", or "detailed"
-    "pruneNotification": "detailed",
+    // 通知显示："off"、"minimal" 或 "detailed"
+    "pruneNotification": "off",
     // Notification type: "chat" (deprecated, falls back to toast) or "toast" (system toast)
     "pruneNotificationType": "toast",
     // Slash commands configuration
@@ -290,7 +344,7 @@ ACP 使用自己的配置文件，按以下顺序搜索：
     "allowSubAgents": true,
     // Experimental settings
     "experimental": {
-        // Enable user-editable prompt overrides under dcp-prompts directories
+        // Enable user-editable prompt overrides under acp-prompts directories
         // When false (default), prompt override files/directories are ignored
         "customPrompts": false,
     },
@@ -301,7 +355,9 @@ ACP 使用自己的配置文件，按以下顺序搜索：
     "compress": {
         // Compression mode: "range" (compress spans into block summaries)
         // or experimental "message" (compress individual raw messages)
-        // Permission mode: "allow" (no prompt), "ask" (prompt), "deny" (tool not registered)
+        // Permission mode: "allow" (no prompt), "ask", or "deny" (tool not registered).
+        // On V2.0.3, server plugins cannot create native permission requests, so
+        // "ask" fails closed with an actionable result; choose allow or deny.
         "permission": "allow",
         // Show compression content in a chat notification
         "showCompression": true,
@@ -310,11 +366,11 @@ ACP 使用自己的配置文件，按以下顺序搜索：
         // Soft upper threshold: above this, ACP keeps injecting strong
         // compression nudges (based on nudgeFrequency), so compression is
         // much more likely. Accepts: number or "X%" of model context window.
-        "maxContextLimit": "55%",
+        "maxContextLimit": "80%",
         // Soft lower threshold for reminder nudges: below this, turn/iteration
         // reminders are off (compression less likely). At/above this, reminders
         // are on. Accepts: number or "X%" of model context window.
-        "minContextLimit": "45%",
+        "minContextLimit": "80%",
         // Optional per-model override for maxContextLimit by providerID/modelID.
         // If present, this wins over the global maxContextLimit.
         // Accepts: number or "X%".
@@ -372,7 +428,7 @@ ACP 使用自己的配置文件，按以下顺序搜索：
         // 低于阈值的小思考保留。
         "reasoning": {
             "drop": true,
-            "threshold": 2048
+            "threshold": 2048,
         },
     },
     // 垃圾回收与批量清理
@@ -404,7 +460,7 @@ ACP 使用自己的配置文件，按以下顺序搜索：
                 // 当 ROUGE-1 F1 低于此值时（与 top20Recall 经 AND 合并）L2 失败
                 "layer2MaxRougeF1": 0.05,
                 // 当 top-20 关键词召回低于此值时（与 rougeF1 经 AND 合并）L2 失败
-                "layer2MaxTop20Recall": 0.20,
+                "layer2MaxTop20Recall": 0.2,
             },
         },
     },
@@ -439,12 +495,12 @@ ACP 使用自己的配置文件，按以下顺序搜索：
             "anthropic": {
                 "nudgeGrowthTokens": 20000,
                 "models": {
-                    "claude-sonnet-4.6": { "maxContextLimit": "70%", "nudgeForce": "strong" }
-                }
+                    "claude-sonnet-4.6": { "maxContextLimit": "70%", "nudgeForce": "strong" },
+                },
             },
-            "openai": { "nudgeGrowthTokens": 40000 }
-        }
-    }
+            "openai": { "nudgeGrowthTokens": 40000 },
+        },
+    },
 }
 ```
 

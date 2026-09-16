@@ -4,6 +4,58 @@
 
 Complete reference for all configurable parameters in Active Context Pruning (ACP).
 
+## Host and Runtime Compatibility
+
+One `opencode-acp` package supports OpenCode V1 `>=1.18.29` and OpenCode V2
+`>=2.0.3`:
+
+- **V1:** the legacy `plugin` configuration remains supported.
+
+    ```json
+    {
+        "plugin": {
+            "opencode-acp": "stable"
+        }
+    }
+    ```
+
+- **V2:** use the native `plugins` configuration.
+
+    ```json
+    {
+        "plugins": ["opencode-acp@stable"]
+    }
+    ```
+
+The package root and `./server` resolve to the same dual definition (`id`, V2
+`setup`, and V1 `server`). OpenCode V2 automatically discovers the package's
+TUI entrypoint, so users should configure the package once rather than adding
+separate server and TUI entries.
+
+Both runtimes retain the same five tools (`compress`, `decompress`,
+`search_context`, `acp_status`, and `acp_context_recap`) and the `/acp` and
+`/dcp` commands. Filesystem session state, `storagePath`, prompt override paths,
+message/block references, and internal `dcp-*` tags are shared; switching from
+V1 to V2 requires no state migration, and rollback to V1 remains safe.
+
+On V2, the five tools are direct model tools outside Code Mode (`codemode: false`).
+Notifications travel through typed server RPC to the native TUI toast. A
+server-only or headless process without a TUI listener continues without a
+toast. OpenCode V2.0.3 does not expose native permission-request creation to
+server plugins: effective `allow` executes, `deny` hides/blocks the tools, and
+`ask` fails closed before state mutation with an actionable result. V2 `ask` is
+not interactive.
+
+OpenCode V2.0.3 cannot rewrite completed assistant text before persistence or
+display. ACP sanitizes hallucinated ACP/DCP tags only when historical assistant
+text is assembled into outbound model context; persisted history and the
+displayed transcript are not rewritten.
+
+`BILLION_CONTEXT_PROXY` and provider settings containing the exact `/bili/`
+route marker disable ACP. V2 catalog refresh events re-check that route and
+refresh ACP's tools and commands, allowing ACP to re-enable when the proxy is
+removed.
+
 ## Config File Locations
 
 ACP reads config from up to three layers (later layers override earlier):
@@ -53,14 +105,14 @@ Status legend: **ACTIVE** = currently used | **DEPRECATED** = kept for backward 
 - **Type:** `boolean`
 - **Default:** `true`
 - **Status:** ACTIVE
-- **Description:** Automatically check for and install ACP updates on startup, tracking the dist-tag/spec the plugin was installed with (`opencode-acp@stable` follows the `stable` tag; range specs like `^1.14.0` follow `latest`). Version-locked specs are never updated.
+- **Description:** On startup, check npm-installed ACP packages and update only auto-updatable specs. The installed dist-tag/spec selects the channel (`opencode-acp@stable` follows `stable`; `@latest` and range specs such as `^1.14.0` follow `latest`). When a newer version is found, ACP removes the install wrapper so OpenCode reinstalls it on the next startup; restart OpenCode to finish. Version-locked or non-registry specs are never updated. Plugin unload cancels the registry request, timers, and delayed notification, and suppresses late callbacks.
 
 #### `debug`
 
 - **Type:** `boolean`
 - **Default:** `false`
 - **Status:** ACTIVE
-- **Description:** Enable debug mode. When `true`, ACP sends a chat notification after each compression showing block details, and sets `logLevel` to `debug` (INFO/DEBUG logs plus per-request context snapshots at `~/.config/opencode/logs/acp/`). This flag overrides `logLevel` when set to `true`.
+- **Description:** Enable debug mode. When `true`, ACP sends a detailed notification after each compression showing block details, and sets `logLevel` to `debug` (INFO/DEBUG logs plus per-request context snapshots at `~/.config/opencode/logs/acp/`). This flag overrides `logLevel` when set to `true`.
 
 #### `logLevel`
 
@@ -74,7 +126,7 @@ Status legend: **ACTIVE** = currently used | **DEPRECATED** = kept for backward 
 - **Type:** `string`
 - **Default:** unset — `$XDG_DATA_HOME/opencode/storage/plugin/acp` (i.e. `~/.local/share/opencode/storage/plugin/acp`)
 - **Status:** ACTIVE
-- **Description:** Directory where per-session state files (`{sessionId}.json` — compression blocks, nudge state, token stats) are persisted. Path semantics:
+- **Description:** Directory where per-session state files (`{sessionId}.json` — compression blocks, nudge state, token stats) are persisted for both V1 and V2. Path semantics:
     - Absolute path → used as-is
     - `~` / `~/...` → expanded against the home directory
     - Relative path → resolved against the project directory (where opencode was started)
@@ -98,7 +150,11 @@ Status legend: **ACTIVE** = currently used | **DEPRECATED** = kept for backward 
 - **Status:** ACTIVE
 - **Description:** Delivery method for compression notifications.
     - `"toast"` — Transient toast popup (recommended; non-blocking)
-    - `"chat"` — Inject as a chat message (may freeze session on providers that reject empty messages)
+    - `"chat"` — Deprecated compatibility value; ACP warns and falls back to a toast instead of injecting a chat message
+
+    On V2, server notifications use a typed RPC bridge and are shown by the
+    automatically discovered TUI entrypoint as native toasts. Server-only and
+    headless use continues without a toast.
 
 #### `protectedFilePatterns`
 
@@ -163,8 +219,8 @@ Core compression behavior.
 - **Status:** ACTIVE
 - **Description:** Permission level for the `compress` tool.
     - `"allow"` — Auto-approve compression calls
-    - `"ask"` — Prompt user before each compression
-    - `"deny"` — Block all compression calls
+    - `"ask"` — On V1, prompt the user before each compression. OpenCode V2.0.3 does not expose native permission-request creation to server plugins, so V2 fails closed before state mutation and returns an actionable result; it does not prompt interactively.
+    - `"deny"` — Block all compression calls. On V2, ACP tools are not advertised and execution is blocked.
 
 #### `compress.showCompression`
 

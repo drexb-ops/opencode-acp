@@ -12,125 +12,87 @@ npm test
 # Equivalent to:
 node --import tsx --test tests/*.test.ts
 
+# Check repository-wide formatting (see the focused workflow below)
+npm run format:check
+
 # Run a single test file
 node --import tsx --test tests/token-counting.test.ts
 
 # Run multiple specific files
 node --import tsx --test tests/message-ids.test.ts tests/message-utils.test.ts
+
+# Run the V2 adapter/runtime suites
+node --import tsx --test tests/v2-*.test.ts
+
+# Typecheck and build the package
+npm run typecheck
+npm run build
+
+# Verify the packed package (build + verification in one command)
+npm run check:package
+
+# Or run the package verifier after an existing build
+npm run verify:package
+
+# Inspect the npm pack file list (ignore lifecycle scripts)
+npm pack --dry-run --json --ignore-scripts
 ```
 
-**Current baseline:** 134 passing tests across 16 test files (with 3 known failures in `config-validation.test.ts`).
+Test totals are intentionally not hardcoded here: `npm test` discovers the
+current `tests/*.test.ts` set, which changes as coverage grows. The in-process
+suite includes V1/V2 contract and adapter tests, transaction and persistence
+tests, and full message-pipeline tests.
 
-No CI/CD is configured. Tests run locally.
+The V2 adapter targets the exact `@opencode/plugin@2.0.3` API and the package
+claims OpenCode V1 `>=1.18.29`. `npm run verify:package` checks the built and
+packed entrypoint shape, import graph, manifest/lock consistency, exclusions,
+and credential-like filenames; it does not install the tarball into an
+OpenCode host. Installed-artifact V1/V2 E2E coverage from Phase 9 is still
+pending on this branch, so the commands above must not be reported as proof of
+that host-level matrix.
 
 ---
 
 ## Test Framework
 
-| Layer | Technology | Import |
-|-------|-----------|--------|
-| Test runner | Node.js built-in (`node:test`) | `import test from "node:test"` |
-| Assertions | Node.js built-in (`node:assert/strict`) | `import assert from "node:assert/strict"` |
-| TypeScript | `tsx` (on-the-fly transpilation) | `--import tsx` flag |
+| Layer       | Technology                              | Import                                    |
+| ----------- | --------------------------------------- | ----------------------------------------- |
+| Test runner | Node.js built-in (`node:test`)          | `import test from "node:test"`            |
+| Assertions  | Node.js built-in (`node:assert/strict`) | `import assert from "node:assert/strict"` |
+| TypeScript  | `tsx` (on-the-fly transpilation)        | `--import tsx` flag                       |
 
 No external test libraries (Jest, Vitest, Mocha) are used. Everything is the Node.js built-in test runner.
 
 ### Key Assertion Patterns
 
 ```typescript
-assert.equal(actual, expected)               // Strict equality
-assert.deepEqual(actual, expected)            // Deep structural equality
-assert.match(string, /regex/)                // Regex match
-assert.doesNotMatch(string, /regex/)         // Regex non-match
-assert.rejects(asyncFn, /error pattern/)     // Promise rejection
+assert.equal(actual, expected) // Strict equality
+assert.deepEqual(actual, expected) // Deep structural equality
+assert.match(string, /regex/) // Regex match
+assert.doesNotMatch(string, /regex/) // Regex non-match
+assert.rejects(asyncFn, /error pattern/) // Promise rejection
 ```
 
 ---
 
-## Test Categories
+## Architecture-level coverage
 
-### Unit Tests — Pure Functions
+Coverage is organized by behavior rather than a fixed test count. The following
+table names representative suites; `npm test` remains the source of truth for
+the complete set.
 
-Zero external dependencies. Test deterministic logic in isolation.
+| Area                                      | Representative suites                                                                                                                                                                                                     | Coverage                                                                                                                                             |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Compression engine and summaries          | `compress-*.test.ts`, `batch-compress.test.ts`, `compression-groups.test.ts`, `decompress-logic.test.ts`, `recap.test.ts`, `quality-gate-*.test.ts`, `tier-*.test.ts`                                                     | Range/message compression, batch lifecycle, decompression, recap/status, quality gates, tier detection, and summary handling                         |
+| Message transformation and context safety | `e2e-message-transform.test.ts`, `e2e-blocks-nudges.test.ts`, `inject*.test.ts`, `prune.test.ts`, `sync.test.ts`, `reasoning-strip.test.ts`, `truncate-tools.test.ts`, `enforce-budget.test.ts`, `message-filter.test.ts` | IDs and tags, nudges, pruning, synchronization, reasoning removal, tool-output limits, budget enforcement, and third-party filters                   |
+| Persistence and state transactions        | `persistence.test.ts`, `storage-path.test.ts`, `registry.test.ts`, `state-transaction.test.ts`, `compress-rollback.test.ts`, `rebuild.test.ts`, `model-switch-limits.test.ts`, `context-limit-fallback.test.ts`           | Filesystem state, custom paths, concurrent initialization, serialized mutations, rollback, fork/rebuild recovery, and model-limit changes            |
+| Shared/V1 host behavior                   | `host-tool-contract.test.ts`, `hooks-permission.test.ts`, `host-permissions.test.ts`, `plugin-entrypoint.test.ts`, `update.test.ts`, `bili-proxy*.test.ts`                                                                | Shared tool contracts, V1 hooks, permissions, dual entrypoint shape, update lifecycle, and proxy self-disable                                        |
+| V2 projection and runtime adapters        | `v2-message-projection.test.ts`, `v2-context*.test.ts`, `v2-tools.test.ts`, `v2-commands.test.ts`, `v2-timing.test.ts`, `v2-proxy.test.ts`, `v2-notifications.test.ts`, `v2-lifecycle.test.ts`                            | Loss-aware projection and validated patches, direct tools, commands, timing, permission fallbacks, proxy refresh, RPC/TUI notifications, and cleanup |
+| Properties and regressions                | `property-*.test.ts`, `compression-candidates-property.test.ts`, `nudge-loop-fix.test.ts`, `tier-detection-fix.test.ts`, `regex-tag-leak.test.ts`, `tool-pair-integrity.test.ts`, `trigger-policy-integration.test.ts`    | Invariants, generated inputs, historical bug regressions, tool-pair atomicity, and trigger-policy behavior                                           |
+| In-process end-to-end flows               | `e2e-message-transform.test.ts`, `e2e-blocks-nudges.test.ts`, `e2e-tier-compression.test.ts`, `e2e-tier-simulation.test.ts`                                                                                               | Full in-process transform and tier flows; these are not installed-artifact host tests                                                                |
 
-| Test File | Source Module | What It Tests |
-|-----------|--------------|---------------|
-| `token-counting.test.ts` | `lib/token-utils.ts` | `countAllMessageTokens`, `countToolTokens`, `estimateTokensBatch`, `extractToolContent`, `extractCompletedToolOutput` |
-| `message-ids.test.ts` | `lib/message-ids.ts`, `lib/state/state.ts` | `assignMessageRefs`, `updatePerTurnState` (ID reset after native compaction) |
-| `message-utils.test.ts` | `lib/messages/query.ts` | `isIgnoredUserMessage` |
-| `message-priority.test.ts` | `lib/messages/priority.ts`, `lib/messages/inject/inject.ts`, `lib/messages/inject/utils.ts`, `lib/messages/prune.ts`, `lib/messages/utils.ts` | `buildPriorityMap`, `injectMessageIds`, `applyAnchoredNudges`, `prune`, `stripHallucinationsFromString` |
-| `input-budget.test.ts` | `lib/messages/inject/utils.ts` | `computeInputBudget` |
-| `host-permissions.test.ts` | `lib/host-permissions.ts` | `compressDisabledByOpencode`, `hasExplicitToolPermission`, `resolveEffectiveCompressPermission` |
-| `update.test.ts` | `lib/update.ts` | `isVersionNewer`, `isAutoUpdatableSpec`, `updateRemoveDir` |
-
-### Functional Tests — Module Behavior with Mock Data
-
-Mocked dependencies (client, filesystem). Test real module logic end-to-end.
-
-| Test File | Source Module | What It Tests |
-|-----------|--------------|---------------|
-| `compress-message.test.ts` | `lib/compress/message.ts` | `createCompressMessageTool` — batch compression, protected content, error handling, notification |
-| `compress-range.test.ts` | `lib/compress/range.ts` | `createCompressRangeTool` — subagent sessions, protected tags, batch notifications, overlap rejection |
-| `compress-range-placeholders.test.ts` | `lib/compress/range-utils.ts`, `lib/compress/state.ts` | `parseBlockPlaceholders`, `injectBlockPlaceholders`, `validateSummaryPlaceholders`, `appendMissingBlockSummaries`, `wrapCompressedSummary` |
-| `compression-groups.test.ts` | `lib/compress/message.ts`, `lib/compress/range.ts`, `lib/commands/decompress.ts`, `lib/commands/recompress.ts` | Grouped run lifecycle: compress → decompress → recompress across both modes |
-| `compression-targets.test.ts` | `lib/commands/compression-targets.ts` | `getActiveCompressionTargets` — grouping by `runId`, duration aggregation |
-| `hooks-permission.test.ts` | `lib/hooks.ts` | `createChatMessageTransformHandler`, `createCommandExecuteHandler`, `createTextCompleteHandler`, `createEventHandler` — permission enforcement, hallucination stripping, event timing |
-| `prompts.test.ts` | `lib/prompts/store.ts`, `lib/prompts/system.ts` | `PromptStore` — defaults, overrides, file-based loading |
-| `token-usage.test.ts` | `lib/messages/inject/utils.ts`, `lib/compress/state.ts`, `lib/token-utils.ts` | `isContextOverLimits`, `wrapCompressedSummary`, `getCurrentTokenUsage` — context threshold calculation |
-
-### E2E Tests — Full Pipeline
-
-Not yet implemented. Will test the complete message transform pipeline from `hooks.ts` through all stages.
-
----
-
-## Current Test Coverage
-
-### Modules WITH Tests
-
-| Source Module | Test File(s) | Key Functions Covered |
-|--------------|-------------|----------------------|
-| `lib/token-utils.ts` | `token-counting.test.ts`, `token-usage.test.ts` | `countAllMessageTokens`, `countToolTokens`, `estimateTokensBatch`, `extractToolContent`, `extractCompletedToolOutput`, `getCurrentTokenUsage` |
-| `lib/message-ids.ts` | `message-ids.test.ts` | `assignMessageRefs` |
-| `lib/state/state.ts` | `registry.test.ts`, `message-ids.test.ts` | `SessionStateRegistry`, `updatePerTurnState`, `ensureSessionInitialized` |
-| `lib/state/utils.ts` | (indirect via other tests) | `isMessageCompacted`, `serializePruneMessagesState` |
-| `lib/messages/query.ts` | `message-utils.test.ts` | `isIgnoredUserMessage` |
-| `lib/messages/shape.ts` | `message-utils.test.ts` | `isMessageWithInfo` (indirect) |
-| `lib/messages/priority.ts` | `message-priority.test.ts` | `buildPriorityMap` |
-| `lib/messages/inject/inject.ts` | `message-priority.test.ts` | `injectMessageIds` |
-| `lib/messages/inject/utils.ts` | `input-budget.test.ts`, `token-usage.test.ts`, `message-priority.test.ts` | `computeInputBudget`, `isContextOverLimits`, `applyAnchoredNudges` |
-| `lib/messages/prune.ts` | `message-priority.test.ts` | `prune` |
-| `lib/messages/utils.ts` | `message-priority.test.ts` | `stripHallucinationsFromString` |
-| `lib/compress/message.ts` | `compress-message.test.ts`, `compression-groups.test.ts` | `createCompressMessageTool` |
-| `lib/compress/range.ts` | `compress-range.test.ts`, `compression-groups.test.ts` | `createCompressRangeTool` |
-| `lib/compress/range-utils.ts` | `compress-range-placeholders.test.ts` | `parseBlockPlaceholders`, `injectBlockPlaceholders`, `validateSummaryPlaceholders`, `appendMissingBlockSummaries` |
-| `lib/compress/state.ts` | `compress-range-placeholders.test.ts`, `token-usage.test.ts` | `wrapCompressedSummary` |
-| `lib/commands/compression-targets.ts` | `compression-targets.test.ts` | `getActiveCompressionTargets` |
-| `lib/commands/decompress.ts` | `compression-groups.test.ts` | `handleDecompressCommand` |
-| `lib/commands/recompress.ts` | `compression-groups.test.ts` | `handleRecompressCommand` |
-| `lib/hooks.ts` | `hooks-permission.test.ts` | `createChatMessageTransformHandler`, `createCommandExecuteHandler`, `createTextCompleteHandler`, `createEventHandler` |
-| `lib/prompts/store.ts` | `prompts.test.ts` | `PromptStore` |
-| `lib/host-permissions.ts` | `host-permissions.test.ts` | `compressDisabledByOpencode`, `resolveEffectiveCompressPermission` |
-| `lib/update.ts` | `update.test.ts` | `isVersionNewer`, `isAutoUpdatableSpec`, `updateRemoveDir` |
-
-### Modules WITHOUT Tests
-
-| Source Module | Key Untested Functions | Complexity |
-|-------------|----------------------|------------|
-| `lib/config.ts` | Config merging, defaults, validation | ~1125 lines, largest file |
-| `lib/state/persistence.ts` | `saveSessionState`, `loadSessionState`, `ensureSessionInitialized` | ~295 lines, filesystem I/O |
-| `lib/state/utils.ts` (direct) | `isMessageCompacted`, `serializePruneMessagesState`, `deserializePruneMessagesState`, `getActiveSummaryTokenUsage` | ~358 lines |
-| `lib/messages/prune.ts` | `filterCompressedRanges`, `stripStepMarkers` (post-removal) | ~263 lines |
-| `lib/messages/sync.ts` | `syncCompressionBlocks` — deactivate orphaned blocks | ~130 lines |
-| `lib/messages/inject/inject.ts` | `injectCompressNudges`, `injectMessageIds` | ~280 lines |
-| `lib/gc/truncate.ts` | `runTruncateGC`, `truncateSummary` | ~83 lines, pure logic |
-| `lib/compress-permission.ts` | `compressPermission`, `syncCompressPermissionState` | ~25 lines |
-| `lib/protected-patterns.ts` | `matchesGlob`, `isFilePathProtected`, `isToolNameProtected`, `getFilePathsFromParameters` | ~128 lines, pure logic |
-| `lib/commands/context.ts` | Context usage display command | Slash command handler |
-| `lib/commands/stats.ts` | Compression statistics command | Slash command handler |
-| `lib/commands/manual.ts` | Manual mode toggle command | Slash command handler |
-| `lib/commands/help.ts` | Help display command | Slash command handler |
-| `lib/ui/notification.ts` | `buildMinimalMessage`, `buildDetailedMessage` | ~357 lines |
+Installed-artifact V1/V2 E2E is a separate Phase 9 deliverable and remains
+pending on this branch.
 
 ---
 
@@ -140,39 +102,82 @@ All tests construct mock data inline using helper functions. There are no shared
 
 ### Building `PluginConfig`
 
-Every test file creates its own `buildConfig()` helper. The pattern is consistent:
+Every test file creates its own config helper. Keep it synchronized with the
+current `PluginConfig` shape, including the required top-level fields and the
+state/quality/filter sections:
 
 ```typescript
 import type { PluginConfig } from "../lib/config"
 
-function buildConfig(mode: "message" | "range" = "message"): PluginConfig {
+function buildConfig(permission: "allow" | "ask" | "deny" = "allow"): PluginConfig {
     return {
         enabled: true,
+        autoUpdate: false,
         debug: false,
+        logLevel: "silent",
+        allowSubAgents: false,
         pruneNotification: "off",
         pruneNotificationType: "toast",
         commands: { enabled: true, protectedTools: [] },
-        allowSubAgents: false,
         experimental: { customPrompts: false },
         protectedFilePatterns: [],
         compress: {
-            mode,
-            permission: "allow",
+            permission,
             showCompression: false,
+            summaryBuffer: true,
+            candidates: false,
             maxContextLimit: 150000,
             minContextLimit: 50000,
+            contextLimitFallback: 128000,
             nudgeFrequency: 5,
+            minNudgeContextPercent: 5,
+            nudgeGrowthTokens: 5000,
+            toolOutputNudgeThreshold: 5000,
             iterationNudgeThreshold: 15,
             nudgeForce: "soft",
-            protectedTools: ["task"],
+            protectedTools: [],
             protectTags: false,
             protectUserMessages: false,
+            maxSummaryLengthHard: 20000,
+            minCompressRange: 5000,
+            minNudgeGrowthRatio: 0.45,
+            minNudgeGrowthFloor: 5000,
+            emergencyThresholdPercent: "98%",
+            maxVisibleSegments: 50,
+            keepEmbedMaxChars: 2000,
+            preserveRecentMessages: 20,
+            preserveRecentTokens: 20000,
+            preserveLastUserMessage: true,
+            reasoning: { drop: true, threshold: 2048 },
+            completionReserveTokens: 32768,
+        },
+        gc: {
+            algorithm: "truncate",
+            promotionThreshold: 5,
+            maxBlockAge: 15,
+            maxOldGenSummaryLength: 3000,
+            majorGcThresholdPercent: "100%",
+            batchCleanup: {
+                lowThreshold: "60%",
+                highThreshold: "75%",
+                forceThreshold: "90%",
+            },
+        },
+        qualityGate: {
+            enabled: false,
+            algorithm: "rouge-recall-v1",
+            algorithms: {},
+        },
+        messageFilters: {
+            enabled: false,
+            filters: {},
         },
     }
 }
 ```
 
-Variations: Some tests add the `gc` field, `summaryBuffer`, or `modelMaxLimits` depending on what they test.
+Individual tests may override `storagePath`, model-limit maps, provider/model
+overrides, or other fields for the behavior under test.
 
 ### Building `WithParts` Messages
 
@@ -318,7 +323,12 @@ state.prune.messages.blocksById.set(1, {
 Or use the `buildBlock()` helper from `compression-targets.test.ts`:
 
 ```typescript
-function buildBlock(blockId: number, runId: number, mode: "range" | "message", durationMs: number): CompressionBlock {
+function buildBlock(
+    blockId: number,
+    runId: number,
+    mode: "range" | "message",
+    durationMs: number,
+): CompressionBlock {
     return {
         blockId,
         runId,
@@ -440,25 +450,65 @@ import { createSessionState, type WithParts } from "../lib/state"
 function buildConfig(): PluginConfig {
     return {
         enabled: true,
+        autoUpdate: false,
         debug: false,
+        logLevel: "silent",
+        allowSubAgents: false,
         pruneNotification: "off",
         pruneNotificationType: "toast",
         commands: { enabled: true, protectedTools: [] },
-        allowSubAgents: false,
         experimental: { customPrompts: false },
         protectedFilePatterns: [],
         compress: {
-            mode: "range",
             permission: "allow",
             showCompression: false,
+            summaryBuffer: true,
+            candidates: false,
             maxContextLimit: 150000,
             minContextLimit: 50000,
+            contextLimitFallback: 128000,
             nudgeFrequency: 5,
+            minNudgeContextPercent: 5,
+            nudgeGrowthTokens: 5000,
+            toolOutputNudgeThreshold: 5000,
             iterationNudgeThreshold: 15,
             nudgeForce: "soft",
             protectedTools: [],
             protectTags: false,
             protectUserMessages: false,
+            maxSummaryLengthHard: 20000,
+            minCompressRange: 5000,
+            minNudgeGrowthRatio: 0.45,
+            minNudgeGrowthFloor: 5000,
+            emergencyThresholdPercent: "98%",
+            maxVisibleSegments: 50,
+            keepEmbedMaxChars: 2000,
+            preserveRecentMessages: 20,
+            preserveRecentTokens: 20000,
+            preserveLastUserMessage: true,
+            reasoning: { drop: true, threshold: 2048 },
+            completionReserveTokens: 32768,
+        },
+        gc: {
+            algorithm: "truncate",
+            promotionThreshold: 5,
+            maxBlockAge: 15,
+            maxOldGenSummaryLength: 3000,
+            majorGcThresholdPercent: "100%",
+            batchCleanup: {
+                lowThreshold: "60%",
+                highThreshold: "75%",
+                forceThreshold: "90%",
+            },
+        },
+        qualityGate: {
+            enabled: false,
+            algorithm: "rouge-recall-v1",
+            algorithms: {},
+        },
+        messageFilters: {
+            enabled: false,
+            filters: {},
         },
     }
 }
@@ -496,45 +546,39 @@ test("yourFunction handles edge case Z", () => {
 
 ---
 
-## Module Test Priority Table
+## Choosing a test level
 
-Prioritize by ease of testing and impact. Pure functions first, then mock-data tests, then integration.
+Use the lowest level that can prove the behavior, then add contract or pipeline
+coverage when host integration is involved:
 
-### Tier 1 — Pure Functions (Zero Dependencies)
+1. **Pure/unit:** deterministic token, ID, shape, query, policy, protection,
+   filtering, nudge, and quality-gate logic.
+2. **Contract/mock:** shared tool definitions, V1 translation, V2 projection and
+   patch validation, commands, permissions, notifications, and timing with
+   mocked host services.
+3. **Filesystem/lifecycle:** config layers, persistence, custom storage paths,
+   state transactions, registry initialization, update cleanup, and plugin
+   setup/unload.
+4. **In-process pipeline:** message transforms and tier flows using the
+   `e2e-*.test.ts` suites; preserve tool-call/result pairs and provider-owned
+   fields in assertions.
+5. **Installed artifact:** build and pack once, then run isolated host checks.
+   The dual-host V1/V2 artifact suite is the pending Phase 9 work on this
+   branch and is not covered by `npm test`.
 
-Quick wins. No mocking needed. Test input → output directly.
+---
 
-| Module | Functions to Test | Why Easy |
-|--------|-------------------|----------|
-| `lib/protected-patterns.ts` | `matchesGlob`, `isFilePathProtected`, `isToolNameProtected`, `getFilePathsFromParameters` | Pure string matching, no I/O |
-| `lib/gc/truncate.ts` | `runTruncateGC`, `truncateSummary` | Pure array transformation, inputs/outputs are plain objects |
-| `lib/compress-permission.ts` | `compressPermission`, `syncCompressPermissionState` | Simple delegation, tiny module |
-| `lib/messages/shape.ts` | `isMessageWithInfo`, `filterMessages` | Pure type guards |
-| `lib/messages/query.ts` | `isIgnoredUserMessage`, `getLastUserMessage`, `messageHasCompress`, `isProtectedUserMessage` | Pure predicates, just need `WithParts` objects |
+## Formatting
 
-### Tier 2 — Mock Data Required
+`npm run format:check` checks the entire repository. The current branch inherits
+formatting failures outside this focused change, so do not mass-format unrelated
+history. Run Prettier only on the Markdown files you changed, then check the
+same set:
 
-Need `SessionState`, `PluginConfig`, or `WithParts[]` construction. Still no I/O.
-
-| Module | Functions to Test | Mock Data Needed |
-|--------|-------------------|------------------|
-| `lib/messages/prune.ts` | `filterCompressedRanges`, `stripStepMarkers` | `SessionState` with blocks, `WithParts[]`, `Logger` |
-| `lib/messages/sync.ts` | `syncCompressionBlocks` | `SessionState` with blocks, `WithParts[]` (partial message list) |
-| `lib/messages/inject/inject.ts` | `injectCompressNudges` | Full `SessionState` + config + messages + prompts |
-| `lib/state/utils.ts` | `isMessageCompacted`, `serializePruneMessagesState`, `deserializePruneMessagesState` | `SessionState`, plain objects |
-| `lib/messages/priority.ts` | `buildPriorityMap` | Covered, but more edge cases possible |
-
-### Tier 3 — Filesystem or Integration
-
-Need temp directories, file I/O, or multi-module orchestration.
-
-| Module | Functions to Test | Why Hard |
-|--------|-------------------|----------|
-| `lib/config.ts` | Config loading, merging, validation | Filesystem reads, JSONC parsing |
-| `lib/state/persistence.ts` | `saveSessionState`, `loadSessionState`, `ensureSessionInitialized` | File I/O, JSON serialization |
-| `lib/commands/*.ts` | Command handlers | Full client mock needed, output formatting |
-| `lib/ui/notification.ts` | `buildMinimalMessage`, `buildDetailedMessage` | Needs full `SessionState` with blocks and stats |
-| `lib/hooks.ts` | Full pipeline integration | Orchestrates all other modules |
+```bash
+npx prettier --write README.md README.zh-CN.md CONFIGURATION.md CONFIGURATION.zh-CN.md TESTING.md
+npx prettier --check README.md README.zh-CN.md CONFIGURATION.md CONFIGURATION.zh-CN.md TESTING.md
+```
 
 ---
 

@@ -10,7 +10,6 @@ The model decides <em>when</em> and <em>what</em> to compress — not a hard lim
 
 ---
 
-
 ## 📄 Paper / Preprint
 
 - **[Model-Driven Incremental Hierarchical Compression: Training-Free Multi-Generational Context Management for Long-Lived Coding Agents](./paper/model-driven-incremental-hierarchical-compression-training-free-multi-generational-context-management-for-long-lived-coding-agents.md)** (English, v0.2)
@@ -64,11 +63,11 @@ This brings two concrete effects:
 
 Pick by your client:
 
-| Client | Use |
-|---|---|
-| **pi** | [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi) (in-process extension) |
-| **opencode** | [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) (in-process extension) |
-| **omp** | [`billion-context`](https://github.com/ranxianglei/billion-context) via `bili omp` (built-in plugin) |
+| Client                                | Use                                                                                                                            |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| **pi**                                | [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi) (in-process extension)                               |
+| **opencode**                          | [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) (in-process extension)                                           |
+| **omp**                               | [`billion-context`](https://github.com/ranxianglei/billion-context) via `bili omp` (built-in plugin)                           |
 | **everything else** (no context hook) | [`billion-context`](https://github.com/ranxianglei/billion-context) — `bili <client>` (launcher, preferred) or `/bili/` prefix |
 
 ---
@@ -101,28 +100,84 @@ across all other sessions.
 
 ## Installation
 
+One `opencode-acp` package supports both OpenCode runtime generations:
+
+- **OpenCode V1 (`>=1.18.29`)** — keep the legacy `plugin` configuration:
+
+    ```json
+    {
+        "plugin": {
+            "opencode-acp": "stable"
+        }
+    }
+    ```
+
+- **OpenCode V2 (`>=2.0.3`)** — use the native `plugins` configuration:
+
+    ```json
+    {
+        "plugins": ["opencode-acp@stable"]
+    }
+    ```
+
+The package root and `opencode-acp/server` resolve to the same dual definition:
+the V2 definition has `id: "opencode-acp"` and `setup`, while the V1
+entrypoint remains available as `server`. On V2, OpenCode also automatically
+discovers the package's TUI entrypoint. Configure the package once; do not add
+separate server or TUI entries.
+
+For the V1 CLI installer, use:
+
 ```bash
 opencode plugin opencode-acp@stable --global
 ```
 
-Or add to your opencode config:
-
-```json
-{
-    "plugin": {
-        "opencode-acp": "stable"
-    }
-}
-```
-
 ---
+
+## Runtime compatibility
+
+V1 and V2 use the same ACP surface: the five tools `compress`, `decompress`,
+`search_context`, `acp_status`, and `acp_context_recap`, plus the `/acp` and
+`/dcp` commands. Session state remains persisted as files at
+`~/.local/share/opencode/storage/plugin/acp/{sessionId}.json` by default. A
+custom `storagePath`, prompt override paths under
+`~/.config/opencode/acp-prompts/`, message/block references, and internal
+`dcp-*` tags remain compatible. Switching between V1 and V2 requires no state
+migration, and rolling back to V1 remains safe.
+
+On V2, the five tools are registered as direct model tools outside Code Mode
+(`codemode: false`). Notifications travel from the server through a typed ACP
+RPC event to the native TUI toast. If no TUI listener is present (for example,
+in server-only or headless use), no toast is shown and ACP continues to run.
+
+OpenCode V2.0.3 does not expose native permission-request creation to server
+plugins. Effective `allow` executes ACP tools; `deny` does not advertise them
+and blocks execution; `ask` fails closed before state mutation and returns an
+actionable result telling you to choose `allow` or `deny`. `ask` does not open
+an interactive prompt on V2. The V1 permission behavior is unchanged.
+
+OpenCode V2.0.3 cannot rewrite completed assistant text before persistence or
+display. ACP instead sanitizes hallucinated ACP/DCP tags when historical
+assistant text is assembled into outbound model context. It does not rewrite
+persisted history or the displayed transcript.
+
+If `BILLION_CONTEXT_PROXY` is set, ACP self-disables. It also self-disables
+when provider settings contain the exact `/bili/` route marker. On V2, catalog
+refresh events re-check that route and update ACP's tools and commands, so
+removing the proxy can re-enable ACP without a server restart.
+
+With `autoUpdate` enabled (the default), npm-installed auto-updatable specs are
+checked at startup. When a newer version is found, ACP removes the install
+wrapper so OpenCode reinstalls it on the next startup and sends a restart
+notice (a toast when the TUI is available); version-locked specs are not
+updated. Unloading the plugin cancels the pending check and delayed notice.
 
 ## How It Works
 
-ACP hands the context-compression tool directly to the model. The model is
-**100% responsible** for context compression. The model's primary tools are
-**compress** and **decompress**, supported by **acp_status** (context monitoring)
-and **search_context** (search compressed content). Compression uses a
+ACP hands the context-compression tools directly to the model. The model is
+**100% responsible** for context compression. Its five tools are **compress**,
+**decompress**, **search_context**, **acp_status**, and
+**acp_context_recap**. Compression uses a
 **three-tier LSM-tree architecture** (T1 capture → T2 distill → T3 condense)
 that keeps context bounded for years. A hardcoded 100% GC fallback acts as a
 safety net when the context window is completely full.
@@ -144,11 +199,11 @@ stateDiagram-v2
     Tier1 --> GC_Truncated : GC at 100% context
 ```
 
-| Tier | Name | Input | Output | Compression ratio | When it fires |
-|------|------|-------|--------|-------------------|---------------|
-| **T1** | Capture | Raw conversation | Detailed summary | ~45× | Context exceeds `maxContextLimit` |
-| **T2** | Distill | T1 summaries (≥ `nudgeGrowthTokens`) | Condensed decisions/outcomes | ~10× | T1 summaries accumulate past threshold |
-| **T3** | Condense | T2 summaries (≥ `nudgeGrowthTokens`) | Bare facts (1-3 per block) | ~5× | T2 summaries accumulate past threshold |
+| Tier   | Name     | Input                                | Output                       | Compression ratio | When it fires                          |
+| ------ | -------- | ------------------------------------ | ---------------------------- | ----------------- | -------------------------------------- |
+| **T1** | Capture  | Raw conversation                     | Detailed summary             | ~45×              | Context exceeds `maxContextLimit`      |
+| **T2** | Distill  | T1 summaries (≥ `nudgeGrowthTokens`) | Condensed decisions/outcomes | ~10×              | T1 summaries accumulate past threshold |
+| **T3** | Condense | T2 summaries (≥ `nudgeGrowthTokens`) | Bare facts (1-3 per block)   | ~5×               | T2 summaries accumulate past threshold |
 
 **How triggers work:**
 
@@ -170,19 +225,19 @@ impact).
 T2 → T3 → context limit (real-calibrated: 500 API calls/day, ~9.6K new tokens/call,
 T1=45x/T2=10x/T3=3x):
 
-| Context limit | 1 month | 3 months | At limit | Limit reached |
-|---------------|---------|----------|----------|---------------|
-| 1M | 1.9B tok | 10.5B tok | **68.9B tok** | day 259 (~8.6 mo) |
-| 400K | 1.9B tok | 10.3B tok | **10.3B tok** | day 89 (~3 mo) |
-| 400K (200 calls/day) | 559M tok | 2.5B tok | **9.5B tok** | day 212 (~7 mo) |
+| Context limit        | 1 month  | 3 months  | At limit      | Limit reached     |
+| -------------------- | -------- | --------- | ------------- | ----------------- |
+| 1M                   | 1.9B tok | 10.5B tok | **68.9B tok** | day 259 (~8.6 mo) |
+| 400K                 | 1.9B tok | 10.3B tok | **10.3B tok** | day 89 (~3 mo)    |
+| 400K (200 calls/day) | 559M tok | 2.5B tok  | **9.5B tok**  | day 212 (~7 mo)   |
 
 **Token savings** — without ACP, context grows unbounded and the session crashes
 after ~100 API calls (~0.2 days). With ACP, context is bounded by compression:
 
-| Metric | Without ACP | With ACP (1M model) |
-|--------|-------------|---------------------|
-| Session lifetime | ~0.2 days | 259 days (**1295x** longer) |
-| Total tokens processed | ~52M | 68.9B (**1325x** more work) |
+| Metric                 | Without ACP | With ACP (1M model)         |
+| ---------------------- | ----------- | --------------------------- |
+| Session lifetime       | ~0.2 days   | 259 days (**1295x** longer) |
+| Total tokens processed | ~52M        | 68.9B (**1325x** more work) |
 
 The core value: ACP doesn't just reduce per-call token cost — it enables a single
 session to process **1000x more total work** by keeping context bounded across
@@ -265,12 +320,12 @@ ensures key context information is not lost.
 
 ACP provides an `/acp` slash command (also accepts `/dcp` for backward compatibility):
 
-| Command                 | Description                                                                                                                                |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| `/acp`                  | Show compression status (same as `/acp stats`). Use `/acp help` for the command list                                                       |
-| `/acp context`          | Token usage breakdown by category (system, user, assistant, tools, etc.) and how much has been saved through pruning                       |
-| `/acp stats`            | Compression status: blocks, context usage, ranges (same report as the `acp_status` tool)                                                   |
-| `/acp export`           | Export active compression blocks to a markdown file. Options: `--output <path>`, `--tier t1,t2,t3`, `--stdout`, `--append`                |
+| Command        | Description                                                                                                                |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `/acp`         | Show compression status (same as `/acp stats`). Use `/acp help` for the command list                                       |
+| `/acp context` | Token usage breakdown by category (system, user, assistant, tools, etc.) and how much has been saved through pruning       |
+| `/acp stats`   | Compression status: blocks, context usage, ranges (same report as the `acp_status` tool)                                   |
+| `/acp export`  | Export active compression blocks to a markdown file. Options: `--output <path>`, `--tier t1,t2,t3`, `--stdout`, `--append` |
 
 ---
 
@@ -310,8 +365,9 @@ Each level overrides the previous, so project settings take priority over global
     "$schema": "https://raw.githubusercontent.com/ranxianglei/opencode-acp/master/dcp.schema.json",
     // Enable or disable the plugin
     "enabled": true,
-    // Automatically update npm-installed ACP when a newer version is available
-    // on the installed dist-tag/spec (@stable follows stable, @latest follows latest).
+    // Check npm-installed ACP for updates on startup. The installed dist-tag/spec
+    // determines the channel (@stable follows stable, @latest and ranges follow latest).
+    // An update removes the install wrapper; restart OpenCode to reinstall it.
     // Version-locked plugin specs are not updated.
     "autoUpdate": true,
     // File log verbosity: "debug" | "info" | "warn" | "error" | "silent".
@@ -336,7 +392,7 @@ Each level overrides the previous, so project settings take priority over global
     "allowSubAgents": true,
     // Experimental settings
     "experimental": {
-        // Enable user-editable prompt overrides under dcp-prompts directories
+        // Enable user-editable prompt overrides under acp-prompts directories
         // When false (default), prompt override files/directories are ignored
         "customPrompts": false,
     },
@@ -347,7 +403,9 @@ Each level overrides the previous, so project settings take priority over global
     "compress": {
         // Compression mode: "range" (compress spans into block summaries)
         // or experimental "message" (compress individual raw messages)
-        // Permission mode: "allow" (no prompt), "ask" (prompt), "deny" (tool not registered)
+        // Permission mode: "allow" (no prompt), "ask", or "deny" (tool not registered).
+        // On V2.0.3, server plugins cannot create native permission requests, so
+        // "ask" fails closed with an actionable result; choose allow or deny.
         "permission": "allow",
         // Show compression content in a chat notification
         "showCompression": true,
@@ -420,7 +478,7 @@ Each level overrides the previous, so project settings take priority over global
         // touched. Small thinkings under the threshold are kept.
         "reasoning": {
             "drop": true,
-            "threshold": 2048
+            "threshold": 2048,
         },
     },
     // Garbage collection — hardcoded 100% fallback only
@@ -453,7 +511,7 @@ Each level overrides the previous, so project settings take priority over global
                 // L2 fails (combined with top20Recall via AND) when below this.
                 "layer2MaxRougeF1": 0.05,
                 // L2 fails (combined with rougeF1 via AND) when below this.
-                "layer2MaxTop20Recall": 0.20,
+                "layer2MaxTop20Recall": 0.2,
             },
         },
     },
@@ -489,12 +547,12 @@ Any `compress` field can be overridden per provider and per model via the nested
             "anthropic": {
                 "nudgeGrowthTokens": 20000,
                 "models": {
-                    "claude-sonnet-4.6": { "maxContextLimit": "70%", "nudgeForce": "strong" }
-                }
+                    "claude-sonnet-4.6": { "maxContextLimit": "70%", "nudgeForce": "strong" },
+                },
             },
-            "openai": { "nudgeGrowthTokens": 40000 }
-        }
-    }
+            "openai": { "nudgeGrowthTokens": 40000 },
+        },
+    },
 }
 ```
 
