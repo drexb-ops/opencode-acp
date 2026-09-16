@@ -3,8 +3,8 @@
 - Task ID: `2026-09-15_opencode-v2`
 - Home Repo: `opencode-acp`
 - Status: ReadyForPR
-- Updated: 2026-09-16 20:42 UTC
-- Final audited range: `707e360..working-tree` (commit recorded after integration)
+- Updated: 2026-09-16 20:43 UTC
+- Final audited range: `707e360..f392fb8`
 - References: #395, #404, #407, #415
 
 ## 1. Summary
@@ -39,7 +39,7 @@
 | `5eaafdb` | Document OpenCode V1/V2 compatibility                          |
 | `0cccee3` | Resolve lifecycle, state recovery, and projection audit issues |
 | `707e360` | Add and verify installed-artifact V1/V2 E2E                    |
-| Pending   | Close final audit findings and record final verification       |
+| `f392fb8` | Close final audit findings and record final verification       |
 
 ### Phase 1
 
@@ -484,6 +484,6 @@
 | Reviewer B — test/artifact safety | `ses_f54a10c54fferJdnE2EeYWIj7G` | Same complete inventory; independent initial review plus closure refreshes                    | No P0/P1/P2 findings; second complete independent AGENTS.md review |
 
 - **PASS**: the dual-agent source and test review requirement is satisfied for
-  the complete `707e360..working-tree` corrective delta. Both reviewers used
+  the complete `707e360..f392fb8` corrective delta. Both reviewers used
   current direct source for final sign-off. No merge, publish, version bump, or
   changelog change was performed.
