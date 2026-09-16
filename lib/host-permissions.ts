@@ -4,9 +4,21 @@ export type PermissionValue = PermissionAction | Record<string, PermissionAction
 
 export type PermissionConfig = Record<string, PermissionValue> | undefined
 
+/** The ordered rule shape exposed by OpenCode V2 AgentInfo.permissions. */
+export interface HostPermissionRule {
+    action: string
+    resource: string
+    effect: PermissionAction
+}
+
 export interface HostPermissionSnapshot {
     global: PermissionConfig
     agents: Record<string, PermissionConfig>
+    /**
+     * V2 keeps the original ordered rules alongside the legacy object view.
+     * Object grouping cannot preserve cross-action last-match semantics.
+     */
+    v2Agents?: Record<string, readonly HostPermissionRule[]>
 }
 
 type PermissionRule = {
@@ -43,6 +55,21 @@ const wildcardMatch = (value: string, pattern: string): boolean => {
 
     const flags = process.platform === "win32" ? "si" : "s"
     return new RegExp(`^${escaped}$`, flags).test(normalizedValue)
+}
+
+/** Match an OpenCode V2 action using its ordered last-match semantics. */
+export const resolveV2Permission = (
+    rules: readonly HostPermissionRule[],
+    action: string,
+    resource = "*",
+): PermissionAction | undefined => {
+    for (let index = rules.length - 1; index >= 0; index -= 1) {
+        const rule = rules[index]
+        if (rule && wildcardMatch(action, rule.action) && wildcardMatch(resource, rule.resource)) {
+            return rule.effect
+        }
+    }
+    return undefined
 }
 
 const getPermissionRules = (permissionConfigs: PermissionConfig[]): PermissionRule[] => {
@@ -83,6 +110,12 @@ export const resolveEffectiveCompressPermission = (
 ): PermissionAction => {
     if (basePermission === "deny") {
         return "deny"
+    }
+
+    const v2Rules = agentName ? hostPermissions.v2Agents?.[agentName] : undefined
+    if (v2Rules) {
+        const permission = resolveV2Permission(v2Rules, "compress")
+        return permission ?? basePermission
     }
 
     return compressDisabledByOpencode(

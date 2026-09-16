@@ -3,7 +3,7 @@
 - Task ID: `2026-09-15_opencode-v2`
 - Home Repo: `opencode-acp`
 - Status: InProgress
-- Updated: 2026-09-16 00:23 UTC
+- Updated: 2026-09-16 01:17 UTC
 
 ## 1. Summary
 
@@ -29,7 +29,8 @@
 | `b569ccd`   | Add the dual V1/V2 entrypoint and dependency foundation       |
 | `5d21e10`   | Add shared host services and host-neutral tool definitions    |
 | `9a349ec`   | Serialize session mutations and stage transform effects       |
-| This commit | Add V2 projection, validated patching, and primary context    |
+| `42637b6`   | Add V2 projection, validated patching, and primary context    |
+| This commit | Add V2 tools, commands, permissions, timing, and proxy state  |
 
 ### Phase 1
 
@@ -201,6 +202,29 @@
 - Added focused projection, patch, host/fork, rollback, and context tests.
   **PASS**: 16/16 focused V2 tests, typecheck, build, targeted formatting, and
   the final full suite at 1,318/1,318 tests.
+
+## 9. Phase 6 — V2 runtime surface
+
+- Registered all five shared ACP definitions as direct V2 tools with complete
+  schemas, structured content/attachments, progress metadata, and the shared
+  per-session state guard.
+- Added ordered V2 agent permission evaluation. Deny and unresolved policy fail
+  closed; OpenCode 2.0.3 `ask` returns a non-throwing actionable denial result
+  before state acquisition because Promise tool errors cannot enter the native
+  permission flow safely.
+- Extracted shared command dispatch and registered `/acp` plus `/dcp` through a
+  replayable V2 transform. Results use unique ACP-owned synthetic messages with
+  `resume:false` and are removed from every later model request.
+- Added session-aware V2 compression timing hooks. Identical message/call IDs in
+  different sessions remain independent while sharing the registry timing map.
+- Added V2 provider/model `/bili/` detection and one cleanup-safe catalog event
+  monitor. Proxy transitions replay existing tool/command transforms without
+  adding duplicate registrations and preserve the last valid state on errors.
+- **PASS**: 61/61 lead-focused V1/V2 runtime tests, typecheck, build, targeted
+  formatting, and diff checks. The coding subagent's full suite passed at
+  1,337/1,337 before the final permission/timing-only refinements.
+- **DEFERRED**: combined setup/unload registration accounting and notification
+  transport are covered in Phase 7 lifecycle/RPC work.
 - Lead-review follow-up: split the V2 projection API into a small barrel plus
   `projection/{types,shared,normalize,patch}.ts`; replaced opaque payload hashes
   with message/content reference checks; centralized `isAcpOpaquePart`; added

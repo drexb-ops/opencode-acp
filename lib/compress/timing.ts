@@ -12,8 +12,12 @@ export interface CompressionTimingState {
     pendingByCallId: Map<string, PendingCompressionDuration>
 }
 
-export function buildCompressionTimingKey(messageId: string, callId: string): string {
-    return `${messageId}:${callId}`
+export function buildCompressionTimingKey(
+    messageId: string,
+    callId: string,
+    sessionId?: string,
+): string {
+    return sessionId ? `${sessionId}:${messageId}:${callId}` : `${messageId}:${callId}`
 }
 
 export function resolveCompressionDuration(

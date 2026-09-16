@@ -14,7 +14,9 @@ import type {
     V2ProjectionOptions,
 } from "./types"
 
-const ACP_OWNED_ID_PATTERN = /^(?:msg_dcp_summary_|msg_dcp_text_|msg_acp_recap_)[0-9a-f]{16}$/
+const ACP_OWNED_ID_PATTERN =
+    /^(?:msg_dcp_summary_|msg_dcp_text_|msg_acp_recap_|msg_acp_notice_)[0-9a-f]{16}$/
+const ACP_OWNED_NOTICE_ID_PATTERN = /^msg_acp_notice_[0-9a-f]{16}$/
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
     return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -107,6 +109,10 @@ export function hash(value: unknown): string {
 
 export function isAcpOwnedId(value: string | undefined): boolean {
     return value !== undefined && ACP_OWNED_ID_PATTERN.test(value)
+}
+
+export function isAcpOwnedNoticeId(value: string | undefined): boolean {
+    return value !== undefined && ACP_OWNED_NOTICE_ID_PATTERN.test(value)
 }
 
 export function aiMessageId(message: unknown): string | undefined {

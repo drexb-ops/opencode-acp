@@ -45,6 +45,8 @@ export interface NoticeMetadata {
     modelId?: string
     agent?: string
     variant?: string
+    /** Marks V2 synthetic history entries owned by ACP. */
+    acpOwned?: boolean
 }
 
 /**

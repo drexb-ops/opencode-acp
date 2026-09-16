@@ -8,7 +8,7 @@ import {
     commitPreparedMessageTransformTransaction,
     prepareMessageTransformTransaction,
 } from "../hooks"
-import type { HostPermissionSnapshot } from "../host-permissions"
+import type { HostPermissionRule, HostPermissionSnapshot } from "../host-permissions"
 import type { SessionState, SessionStateRegistry } from "../state"
 import type { Logger } from "../logger"
 import type { V2HostAdapter } from "./host"
@@ -17,6 +17,7 @@ import {
     normalizeV2ProjectedHistory,
     type V2ProjectionModel,
 } from "./projection"
+import { isAcpOwnedNoticeId } from "./projection/shared"
 
 export interface V2ContextEvent {
     readonly sessionID: string
@@ -38,6 +39,30 @@ function modelLimitFromInventory(
 
 const AUXILIARY_AGENT_NAMES = new Set(["title", "summary", "compaction"])
 
+async function refreshV2AgentPermissions(
+    host: V2HostAdapter,
+    hostPermissions: HostPermissionSnapshot,
+    agent: string,
+    logger: Logger,
+): Promise<void> {
+    if (!host.agentPermissions) return
+
+    let rules: readonly HostPermissionRule[]
+    try {
+        rules = await host.agentPermissions(agent)
+    } catch (error) {
+        logger.warn("V2 agent permission lookup failed closed", {
+            agent,
+            error: error instanceof Error ? error.message : String(error),
+        })
+        rules = [{ action: "*", resource: "*", effect: "deny" }]
+    }
+    hostPermissions.v2Agents = {
+        ...(hostPermissions.v2Agents ?? {}),
+        [agent]: rules,
+    }
+}
+
 /**
  * Build the primary V2 context hook. The callback deliberately owns one
  * registry guard for the complete operation; system rendering happens inside
@@ -55,6 +80,7 @@ export function createV2ContextHandler(
         try {
             if (!Array.isArray(event.messages) || !Array.isArray(event.system)) return
             if (AUXILIARY_AGENT_NAMES.has(event.agent)) return
+            await refreshV2AgentPermissions(host, hostPermissions, event.agent, logger)
             const projected = await host.projectedContext(event.sessionID)
             const projection = normalizeV2ProjectedHistory(projected, event.messages, {
                 sessionID: event.sessionID,
@@ -123,6 +149,16 @@ export function createV2ContextHandler(
                             duration: 5000,
                         }),
                     true,
+                )
+                // A non-resuming command notice remains in projected session
+                // history for the user, but must be removed from every later
+                // provider request. The patcher then removes only this
+                // ACP-owned source message from the original V2 messages.
+                prepared.workingMessages = prepared.workingMessages.filter(
+                    (message) =>
+                        !isAcpOwnedNoticeId(
+                            typeof message.info.id === "string" ? message.info.id : undefined,
+                        ),
                 )
                 const patch = applyV2ContextPatch(
                     projection,

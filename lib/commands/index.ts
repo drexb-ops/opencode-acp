@@ -1,3 +1,5 @@
 export { handleContextCommand } from "./context"
 export { handleStatsCommand } from "./stats"
 export type { StatsCommandContext } from "./stats"
+export { buildAcpHelpText, dispatchAcpCommand } from "./dispatch"
+export type { AcpCommandContext } from "./dispatch"

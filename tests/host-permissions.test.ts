@@ -4,6 +4,7 @@ import {
     compressDisabledByOpencode,
     hasExplicitToolPermission,
     resolveEffectiveCompressPermission,
+    resolveV2Permission,
 } from "../lib/host-permissions"
 
 test("wildcard deny disables compress", () => {
@@ -101,4 +102,72 @@ test("explicit permission detection works without Object.hasOwn", () => {
     } finally {
         Object.hasOwn = originalHasOwn
     }
+})
+
+test("V2 ordered rules use the last matching whole-resource action", () => {
+    assert.equal(
+        resolveV2Permission([{ action: "compress", resource: "*", effect: "allow" }], "compress"),
+        "allow",
+    )
+    assert.equal(
+        resolveV2Permission(
+            [
+                { action: "*", resource: "*", effect: "deny" },
+                { action: "compress", resource: "*", effect: "allow" },
+            ],
+            "compress",
+        ),
+        "allow",
+    )
+    assert.equal(
+        resolveV2Permission(
+            [
+                { action: "compress", resource: "*", effect: "allow" },
+                { action: "compress", resource: "*", effect: "ask" },
+            ],
+            "compress",
+        ),
+        "ask",
+    )
+    assert.equal(
+        resolveV2Permission(
+            [
+                { action: "compress", resource: "*", effect: "ask" },
+                { action: "compress", resource: "*", effect: "deny" },
+            ],
+            "compress",
+        ),
+        "deny",
+    )
+})
+
+test("V2 resource-specific rules do not wholly disable a direct tool", () => {
+    assert.equal(
+        resolveV2Permission(
+            [{ action: "compress", resource: "/tmp/*", effect: "deny" }],
+            "compress",
+        ),
+        undefined,
+    )
+    assert.equal(
+        resolveV2Permission(
+            [
+                { action: "compress", resource: "*", effect: "deny" },
+                { action: "compress", resource: "/tmp/*", effect: "allow" },
+            ],
+            "compress",
+        ),
+        "deny",
+    )
+    assert.equal(
+        resolveV2Permission(
+            [
+                { action: "compress", resource: "*", effect: "deny" },
+                { action: "compress", resource: "/tmp/*", effect: "allow" },
+            ],
+            "compress",
+            "/tmp/result.txt",
+        ),
+        "allow",
+    )
 })

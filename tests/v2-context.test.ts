@@ -396,6 +396,61 @@ test("V2 sanitation is outbound-only for historical assistant text", async () =>
     }
 })
 
+test("V2 ACP-owned command notices stay in history but never reach outbound context", async () => {
+    const noticeID = "msg_acp_notice_0123456789abcdef"
+    const projected = [
+        {
+            type: "synthetic",
+            id: noticeID,
+            time: { created: 1 },
+            text: "[ACP Status] command output",
+            metadata: { acpOwned: true },
+        },
+        { type: "user", id: "notice-user", time: { created: 2 }, text: "continue" },
+    ]
+    const outgoing = [
+        Message.make({ id: noticeID, role: "user", content: "[ACP Status] command output" }),
+        Message.make({ id: "notice-user", role: "user", content: "continue" }),
+    ]
+    const run = runHandler(projected, outgoing)
+    await run.handler(run.event)
+    try {
+        assert.equal(
+            run.event.messages.some((message) => message.id === noticeID),
+            false,
+        )
+        assert.equal(
+            run.event.messages.some((message) => message.id === "notice-user"),
+            true,
+        )
+    } finally {
+        rmSync(run.storage, { recursive: true, force: true })
+    }
+})
+
+test("V2 denied agent permissions suppress the ACP prompt and nudges", async () => {
+    const projected = [{ type: "user", id: "denied-user", time: { created: 1 }, text: "request" }]
+    const run = runHandler(projected, [
+        Message.make({ id: "denied-user", role: "user", content: "request" }),
+    ])
+    run.adapter.agentPermissions = async () => [{ action: "*", resource: "*", effect: "deny" }]
+    await run.handler(run.event)
+    try {
+        assert.equal(run.registry.get("session")?.compressPermission, "deny")
+        assert.equal(run.event.system.length, 0)
+        assert.equal(
+            run.event.messages.some((message) =>
+                message.content.some(
+                    (part) => part.type === "text" && /compress tool/i.test(part.text),
+                ),
+            ),
+            false,
+        )
+    } finally {
+        rmSync(run.storage, { recursive: true, force: true })
+    }
+})
+
 test("V2 rejected patch rolls back live state, event, persistence, and deferred effects", async () => {
     const storage = mkdtempSync(join(tmpdir(), "acp-v2-rejection-"))
     const logger = new Logger(false, "silent")
