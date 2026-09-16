@@ -3,7 +3,7 @@
 - Task ID: `2026-09-15_opencode-v2`
 - Home Repo: `opencode-acp`
 - Status: InProgress
-- Updated: 2026-09-16 01:45 UTC
+- Updated: 2026-09-16 02:06 UTC
 
 ## 1. Summary
 
@@ -31,7 +31,8 @@
 | `9a349ec`   | Serialize session mutations and stage transform effects       |
 | `42637b6`   | Add V2 projection, validated patching, and primary context    |
 | `3a8c21e`   | Add V2 tools, commands, permissions, timing, and proxy state  |
-| This commit | Add typed notifications and managed runtime cleanup           |
+| `6ef5085`   | Add typed notifications and managed runtime cleanup           |
+| This commit | Publish and verify server, TUI, and RPC package entrypoints   |
 
 ### Phase 1
 
@@ -246,6 +247,23 @@
   passed at 1,351/1,351 tests.
 - **DEFERRED**: publishing `./tui` and `./rpc`, multi-entry JavaScript builds,
   and packed-artifact verification remain Phase 8 work.
+
+## 11. Phase 8 — Package entrypoints and verification
+
+- Published exact condition exports for root, `./server`, `./tui`, and `./rpc`;
+  root/server resolve the same dual definition.
+- Configured tsup and declaration emission for all three source entrypoints with
+  code-split runtime chunks and source/declaration maps.
+- Extended package verification to check manifest/lock consistency, all built
+  entrypoint shapes, source and packaged runtime import graphs, tarball
+  exclusions, and filename-only credential/private-key patterns.
+- Verification stages a temporary pack under `/tmp/opencode`, disables nested
+  lifecycle builds, and always removes temporary files.
+- **PASS**: `npm run check:package`, typecheck, targeted formatting, and diff
+  checks. The verified tarball contains 249 entries including all twelve
+  server/TUI/RPC JavaScript, declaration, and map files.
+- **DEFERRED**: installing the tarball into isolated V1/V2 host environments is
+  Phase 9.
 - Lead-review follow-up: split the V2 projection API into a small barrel plus
   `projection/{types,shared,normalize,patch}.ts`; replaced opaque payload hashes
   with message/content reference checks; centralized `isAcpOpaquePart`; added
