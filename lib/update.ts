@@ -3,6 +3,7 @@ import { readFile, rm } from "node:fs/promises"
 import { basename, dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 import type { NotificationSink } from "./host"
+import { isManagedNotificationSink } from "./notifications"
 
 type PackageJson = {
     name?: string
@@ -10,28 +11,53 @@ type PackageJson = {
     dependencies?: Record<string, string>
 }
 
-type UpdateResult =
+export type UpdateResult =
     | { updated: true; name: string; current: string; latest: string }
     | { updated: false; error: "remove_failed"; name: string; current: string; latest: string }
     | { updated: false }
 
 const PACKAGE_NAME = "opencode-acp"
 
+export type AutoUpdateCheck = (signal: AbortSignal, logger?: Logger) => Promise<UpdateResult>
+
+export interface AutoUpdateOptions {
+    /** Dependency seam for deterministic lifecycle tests; production uses the registry check. */
+    check?: AutoUpdateCheck
+}
+
 export function startAutoUpdate(
     notifications: NotificationSink,
     enabled: boolean,
     logger?: Logger,
-): void {
+    options?: AutoUpdateOptions,
+): () => Promise<void> {
     if (!enabled) {
         logger?.info("Auto-update disabled by config")
-        return
+        return async () => {}
     }
     logger?.info("Auto-update check starting")
 
     const controller = new AbortController()
+    let disposed = false
+    let delayedNoticeTimer: ReturnType<typeof setTimeout> | undefined
+    let cancelManagedNotice: (() => void) | undefined
     const timeout = setTimeout(() => controller.abort(), 10_000)
-    void checkAutoUpdate(controller.signal, logger)
+    const managedNotifications = isManagedNotificationSink(notifications)
+        ? notifications
+        : undefined
+
+    let checkPromise: Promise<UpdateResult>
+    try {
+        checkPromise = Promise.resolve(
+            (options?.check ?? checkAutoUpdate)(controller.signal, logger),
+        )
+    } catch (error) {
+        checkPromise = Promise.reject(error)
+    }
+
+    const pending = checkPromise
         .then((result) => {
+            if (disposed || controller.signal.aborted) return
             if (!result.updated) {
                 if ("error" in result) {
                     logger?.warn("Auto-update failed", {
@@ -48,17 +74,45 @@ export function startAutoUpdate(
                 from: result.current,
                 to: result.latest,
             })
-            setTimeout(() => {
-                void notifications.notify({
-                    title: "ACP update ready",
-                    message: `Updated ${result.name} from ${result.current} to ${result.latest}. Restart OpenCode to finish.`,
-                    variant: "info",
-                    duration: 7000,
-                })
-            }, 5000)
+            const input = {
+                title: "ACP update ready",
+                message: `Updated ${result.name} from ${result.current} to ${result.latest}. Restart OpenCode to finish.`,
+                variant: "info" as const,
+                duration: 7000,
+            }
+            if (managedNotifications) {
+                cancelManagedNotice = managedNotifications.notifyLater(input, 5000)
+            } else {
+                delayedNoticeTimer = setTimeout(() => {
+                    delayedNoticeTimer = undefined
+                    if (disposed || controller.signal.aborted) return
+                    try {
+                        void Promise.resolve(notifications.notify(input)).catch(() => {})
+                    } catch {}
+                }, 5000)
+            }
         })
         .catch(() => {})
         .finally(() => clearTimeout(timeout))
+
+    // Keep the promise observed so an abort or a filesystem race cannot create
+    // an unhandled rejection after the host has unloaded ACP.
+    void pending
+
+    let cleaned = false
+    return async () => {
+        if (cleaned) return
+        cleaned = true
+        disposed = true
+        controller.abort()
+        clearTimeout(timeout)
+        if (delayedNoticeTimer !== undefined) {
+            clearTimeout(delayedNoticeTimer)
+            delayedNoticeTimer = undefined
+        }
+        cancelManagedNotice?.()
+        cancelManagedNotice = undefined
+    }
 }
 
 async function checkAutoUpdate(signal: AbortSignal, logger?: Logger): Promise<UpdateResult> {
@@ -111,6 +165,8 @@ async function checkAutoUpdate(signal: AbortSignal, logger?: Logger): Promise<Up
         current: pkg.version,
         latest,
     })
+
+    if (signal.aborted) return { updated: false }
 
     try {
         await rm(target.removeDir, { recursive: true, force: true })

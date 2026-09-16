@@ -3,7 +3,7 @@
 - Task ID: `2026-09-15_opencode-v2`
 - Home Repo: `opencode-acp`
 - Status: InProgress
-- Updated: 2026-09-16 01:17 UTC
+- Updated: 2026-09-16 01:45 UTC
 
 ## 1. Summary
 
@@ -30,7 +30,8 @@
 | `5d21e10`   | Add shared host services and host-neutral tool definitions    |
 | `9a349ec`   | Serialize session mutations and stage transform effects       |
 | `42637b6`   | Add V2 projection, validated patching, and primary context    |
-| This commit | Add V2 tools, commands, permissions, timing, and proxy state  |
+| `3a8c21e`   | Add V2 tools, commands, permissions, timing, and proxy state  |
+| This commit | Add typed notifications and managed runtime cleanup           |
 
 ### Phase 1
 
@@ -225,6 +226,26 @@
   1,337/1,337 before the final permission/timing-only refinements.
 - **DEFERRED**: combined setup/unload registration accounting and notification
   transport are covered in Phase 7 lifecycle/RPC work.
+
+## 10. Phase 7 — Notifications and lifecycle
+
+- Added a typed `opencode-acp` RPC notification event and a V2 TUI entrypoint
+  that maps it to native toasts and returns its unsubscribe cleanup.
+- Added a managed notification sink. Immediate delivery is non-blocking;
+  delayed config/update notices are tracked and cancelled on unload.
+- Made auto-update return idempotent cleanup that aborts registry work, clears
+  both timeouts, suppresses late callbacks, and performs no request when
+  disabled.
+- Added V1 `dispose` for notification/update ownership and refactored V2 setup
+  to one reverse-order cleanup stack covering RPC, transforms, hooks, proxy
+  monitoring, update work, and timers. Partial setup and individual disposer
+  failures still attempt every remaining cleanup.
+- Hardened proxy event shutdown by aborting and returning its async iterator.
+- **PASS**: 97/97 lead-focused lifecycle/notification/runtime tests, typecheck,
+  build, targeted formatting, and diff checks. The coding subagent's full suite
+  passed at 1,351/1,351 tests.
+- **DEFERRED**: publishing `./tui` and `./rpc`, multi-entry JavaScript builds,
+  and packed-artifact verification remain Phase 8 work.
 - Lead-review follow-up: split the V2 projection API into a small barrel plus
   `projection/{types,shared,normalize,patch}.ts`; replaced opaque payload hashes
   with message/content reference checks; centralized `isAcpOpaquePart`; added

@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto"
 import type { Plugin as V2Api } from "@opencode/plugin"
-import type { HostServices, ModelInventoryEntry, SessionService } from "../host"
+import type { HostServices, ModelInventoryEntry, NotificationSink, SessionService } from "../host"
 import type { HostPermissionRule } from "../host-permissions"
 import { normalizeV2ProjectedHistory, type V2ProjectionOptions } from "./projection"
 
@@ -156,6 +156,7 @@ function createNoticeSink(context: V2Context) {
 export function createV2Host(
     context: V2Context,
     projectionOptions: V2ProjectionOptions = {},
+    notifications?: NotificationSink,
 ): V2HostAdapter {
     const sessions = createSessionService(context, projectionOptions)
     return {
@@ -167,8 +168,9 @@ export function createV2Host(
         sessionAgent: createSessionAgent(context),
         agentPermissions: createAgentPermissions(context),
         notices: createNoticeSink(context),
-        notifications: {
-            // Likewise, server-only V2 setup has no notification transport yet.
+        notifications: notifications ?? {
+            // Keep lightweight host fixtures and standalone callers usable when
+            // they do not install the server RPC bridge.
             notify: () => {},
         },
     }

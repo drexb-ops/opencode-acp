@@ -1,58 +1,107 @@
 import type { Plugin as V2Api } from "@opencode/plugin"
+import { AcpRpc } from "../../rpc"
 import { getConfig } from "../config"
+import { createManagedNotificationSink } from "../notifications"
 import { Logger } from "../logger"
 import { PromptStore } from "../prompts/store"
 import { SessionStateRegistry } from "../state"
 import type { HostPermissionSnapshot } from "../host-permissions"
+import { startAutoUpdate } from "../update"
 import { createV2ContextHandler } from "./context"
 import { createV2Host } from "./host"
 import { createV2CommandTransform } from "./commands"
+import { createV2NotificationBridge } from "./notifications"
 import { createV2ToolTransform } from "./tools"
 import { createV2CompressionTimingHandlers } from "./timing"
 import { initializeV2ProxyState, startV2ProxyMonitor, type V2ProxyState } from "./proxy"
 
+type Cleanup = () => Promise<void> | void
 type Registration = { dispose(): Promise<void> }
 
+function ownRegistration(resources: Cleanup[], registration: Registration): void {
+    resources.push(() => registration.dispose())
+}
+
+async function disposeAll(resources: Cleanup[], logger?: Logger): Promise<void> {
+    for (const cleanup of [...resources].reverse()) {
+        try {
+            await cleanup()
+        } catch (error) {
+            try {
+                void logger?.warn("V2 ACP resource cleanup failed", {
+                    error: error instanceof Error ? error.message : String(error),
+                })
+            } catch {}
+        }
+    }
+}
+
 /**
- * V2 setup for ACP's supported runtime surface. Registrations are deliberately
- * created once; catalog changes replay their existing transform callbacks via
- * the public reload methods instead of adding duplicate transforms.
+ * V2 setup for ACP's supported runtime surface. Every resource created by this
+ * function is pushed onto one stack and released in reverse order. This keeps
+ * partial setup failures equivalent to a normal unload and prevents catalog
+ * reloads from creating duplicate transforms.
  */
 export const setup: V2Api.Plugin["setup"] = async (context) => {
-    const notifications = {
-        // Configuration warnings are allowed to be dropped until the V2 RPC/TUI
-        // sink is implemented. Keeping this sink explicit makes config loading
-        // independent from any V1 client/auth machinery.
-        notify: () => {},
-    }
-    const config = getConfig({
-        directory: context.location.directory,
-        notifications,
-    })
+    const resources: Cleanup[] = []
+    let disposed = false
 
-    if (!config.enabled) return
-    if (process.env.BILLION_CONTEXT_PROXY) return
+    const bridge = createV2NotificationBridge()
+    const notifications = createManagedNotificationSink(bridge.sink)
+    resources.push(() => notifications.dispose())
 
-    const logger = new Logger(config.debug, config.debug ? "debug" : config.logLevel)
-    const registry = new SessionStateRegistry(logger, context.location.directory)
-    const prompts = new PromptStore(
-        logger,
-        context.location.directory,
-        config.experimental.customPrompts,
-        config.compress.candidates === true,
-    )
-    const host = createV2Host(context, {
-        directory: context.location.directory,
-    })
-    const hostPermissions: HostPermissionSnapshot = {
-        global: undefined,
-        agents: {},
-        v2Agents: {},
+    let logger: Logger | undefined
+    let disposePromise: Promise<void> | undefined
+    const dispose = async (): Promise<void> => {
+        if (disposePromise) return disposePromise
+        disposed = true
+        disposePromise = disposeAll(resources, logger)
+        return disposePromise
     }
-    const proxyState: V2ProxyState = { disabled: false }
-    const registrations: Registration[] = []
 
     try {
+        const config = getConfig({
+            directory: context.location.directory,
+            notifications,
+        })
+
+        if (!config.enabled || process.env.BILLION_CONTEXT_PROXY) {
+            await dispose()
+            return
+        }
+
+        logger = new Logger(config.debug, config.debug ? "debug" : config.logLevel)
+        bridge.setLogger(logger)
+
+        const registry = new SessionStateRegistry(logger, context.location.directory)
+        const prompts = new PromptStore(
+            logger,
+            context.location.directory,
+            config.experimental.customPrompts,
+            config.compress.candidates === true,
+        )
+
+        const rpcRegistration = await context.rpc.register(AcpRpc, {})
+        ownRegistration(resources, rpcRegistration)
+        bridge.connect(rpcRegistration.events.emit)
+        // Disconnect before disposing the registration so an in-flight or late
+        // notification cannot target a detached TUI client.
+        resources.push(() => bridge.disconnect())
+
+        const host = createV2Host(
+            context,
+            {
+                directory: context.location.directory,
+            },
+            notifications,
+        )
+        const hostPermissions: HostPermissionSnapshot = {
+            global: undefined,
+            agents: {},
+            v2Agents: {},
+        }
+        const proxyState: V2ProxyState = { disabled: false }
+
         // Resolve provider and model catalogs before any transform can be
         // replayed. A failed initial read leaves ACP enabled; subsequent
         // catalog.updated events can establish a valid disabled state.
@@ -65,14 +114,16 @@ export const setup: V2Api.Plugin["setup"] = async (context) => {
             config,
             prompts,
         }
-        const isEnabled = () => !proxyState.disabled
+        const isEnabled = () => !disposed && !proxyState.disabled
 
-        registrations.push(
+        ownRegistration(
+            resources,
             await context.tool.transform(
                 createV2ToolTransform(factoryContext, host, hostPermissions, isEnabled),
             ),
         )
-        registrations.push(
+        ownRegistration(
+            resources,
             await context.command.transform(
                 createV2CommandTransform(
                     host,
@@ -94,7 +145,8 @@ export const setup: V2Api.Plugin["setup"] = async (context) => {
             prompts,
             hostPermissions,
         )
-        registrations.push(
+        ownRegistration(
+            resources,
             await context.session.hook("context", async (event) => {
                 if (!isEnabled()) return
                 await contextHandler(event)
@@ -102,36 +154,33 @@ export const setup: V2Api.Plugin["setup"] = async (context) => {
         )
 
         const timing = createV2CompressionTimingHandlers(registry, logger)
-        registrations.push(
+        ownRegistration(
+            resources,
             await context.tool.hook("execute.before", async (event) => {
+                if (!isEnabled()) return
                 timing.before(event)
             }),
         )
-        registrations.push(
+        ownRegistration(
+            resources,
             await context.tool.hook("execute.after", async (event) => {
+                if (!isEnabled()) return
                 await timing.after(event)
             }),
         )
 
         const monitor = startV2ProxyMonitor(context, proxyState, logger, async () => {
+            if (disposed) return
             await Promise.all([context.tool.reload(), context.command.reload()])
         })
-        let stopped = false
+        resources.push(() => monitor.stop())
 
-        return async () => {
-            if (stopped) return
-            stopped = true
-            await monitor.stop()
-            for (const registration of [...registrations].reverse()) {
-                await registration.dispose()
-            }
-        }
+        const updateCleanup = startAutoUpdate(notifications, config.autoUpdate, logger)
+        resources.push(updateCleanup)
+
+        return dispose
     } catch (error) {
-        for (const registration of [...registrations].reverse()) {
-            try {
-                await registration.dispose()
-            } catch {}
-        }
+        await dispose()
         throw error
     }
 }

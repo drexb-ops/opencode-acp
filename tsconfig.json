@@ -19,6 +19,6 @@
         "sourceMap": true,
         "types": ["node"]
     },
-    "include": ["index.ts", "lib/**/*"],
+    "include": ["index.ts", "rpc.ts", "tui.ts", "lib/**/*"],
     "exclude": ["node_modules", "dist", "logs"]
 }

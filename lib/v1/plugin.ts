@@ -30,12 +30,16 @@ import {
 import { configureClientAuth, isSecureMode } from "../auth"
 import { findBiliProxyProviders } from "../bili-proxy"
 import { startAutoUpdate } from "../update"
+import { createManagedNotificationSink } from "../notifications"
 
 const server: Plugin = (async (ctx) => {
     const host = createV1Host(ctx)
-    const config = getConfig({ directory: ctx.directory, notifications: host.notifications })
+    const notifications = createManagedNotificationSink(host.notifications)
+    const runtimeHost = { ...host, notifications }
+    const config = getConfig({ directory: ctx.directory, notifications })
 
     if (!config.enabled) {
+        notifications.dispose()
         return {}
     }
 
@@ -43,6 +47,7 @@ const server: Plugin = (async (ctx) => {
         console.log(
             "[opencode-acp] disabled: BILLION_CONTEXT_PROXY detected — proxy handles compression",
         )
+        notifications.dispose()
         return {}
     }
 
@@ -102,10 +107,10 @@ const server: Plugin = (async (ctx) => {
 
     logger.info("DCP initialized")
 
-    startAutoUpdate(host.notifications, config.autoUpdate, logger)
+    const updateCleanup = startAutoUpdate(notifications, config.autoUpdate, logger)
 
     const compressToolContext: ToolFactoryContext = {
-        host,
+        host: runtimeHost,
         registry,
         logger,
         config,
@@ -123,6 +128,7 @@ const server: Plugin = (async (ctx) => {
         <TArgs extends unknown[]>(fn: (...args: TArgs) => Promise<void>) =>
         (...args: TArgs): Promise<void> =>
             disabledByBiliProxy ? Promise.resolve() : fn(...args)
+    let disposed = false
 
     return {
         "experimental.chat.system.transform": guard(
@@ -130,7 +136,7 @@ const server: Plugin = (async (ctx) => {
         ),
         "experimental.chat.messages.transform": guard(
             createChatMessageTransformHandler(
-                host,
+                runtimeHost,
                 registry,
                 logger,
                 config,
@@ -141,7 +147,7 @@ const server: Plugin = (async (ctx) => {
         "experimental.text.complete": guard(createTextCompleteHandler()),
         "command.execute.before": guard(
             createCommandExecuteHandler(
-                host,
+                runtimeHost,
                 registry,
                 logger,
                 config,
@@ -234,6 +240,12 @@ const server: Plugin = (async (ctx) => {
                     agent?.permission,
                 ]),
             )
+        },
+        dispose: async () => {
+            if (disposed) return
+            disposed = true
+            await updateCleanup()
+            notifications.dispose()
         },
     }
 }) satisfies Plugin

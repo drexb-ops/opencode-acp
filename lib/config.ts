@@ -3,6 +3,7 @@ import { join, dirname } from "path"
 import { homedir } from "os"
 import { parse } from "jsonc-parser/lib/esm/main.js"
 import type { NotificationSink } from "./host"
+import { isManagedNotificationSink } from "./notifications"
 import {
     VALID_CONFIG_KEYS,
     getInvalidConfigKeys,
@@ -290,16 +291,22 @@ function showConfigWarnings(
 
     if (!notifications) return
 
+    const input = {
+        title: `ACP: ${configType} warning`,
+        message: `${configPath}\n${messages.join("\n")}`,
+        variant: "warning" as const,
+        duration: 7000,
+    }
+    if (isManagedNotificationSink(notifications)) {
+        notifications.notifyLater(input, 7000)
+        return
+    }
+
+    // Keep compatibility for callers that provide the old minimal sink shape.
+    // Runtime-owned sinks use notifyLater above, so their timers remain tracked.
     setTimeout(() => {
         try {
-            void Promise.resolve(
-                notifications.notify({
-                    title: `ACP: ${configType} warning`,
-                    message: `${configPath}\n${messages.join("\n")}`,
-                    variant: "warning",
-                    duration: 7000,
-                }),
-            ).catch(() => {})
+            void Promise.resolve(notifications.notify(input)).catch(() => {})
         } catch {}
     }, 7000)
 }
@@ -759,11 +766,17 @@ function scheduleParseWarning(
 ): void {
     if (!notifications) return
 
+    const input = { title, message, variant: "warning" as const, duration: 7000 }
+    if (isManagedNotificationSink(notifications)) {
+        notifications.notifyLater(input, 7000)
+        return
+    }
+
+    // Compatibility fallback for external/simple sinks. ACP-owned sinks never
+    // take this branch and therefore never leave an unowned warning timer.
     setTimeout(() => {
         try {
-            void Promise.resolve(
-                notifications.notify({ title, message, variant: "warning", duration: 7000 }),
-            ).catch(() => {})
+            void Promise.resolve(notifications.notify(input)).catch(() => {})
         } catch {}
     }, 7000)
 }

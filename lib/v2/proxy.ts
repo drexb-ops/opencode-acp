@@ -42,9 +42,14 @@ export function startV2ProxyMonitor(
 ): { stop(): Promise<void> } {
     const controller = new AbortController()
     let stopped = false
+    const subscription = context.event.subscribe({ signal: controller.signal })
+    const iterator = subscription[Symbol.asyncIterator]()
     const eventLoop = (async () => {
         try {
-            for await (const event of context.event.subscribe({ signal: controller.signal })) {
+            for (;;) {
+                const result = await iterator.next()
+                if (result.done) return
+                const event = result.value
                 if (controller.signal.aborted || event.type !== "catalog.updated") continue
                 let nextDisabled: boolean
                 try {
@@ -79,6 +84,13 @@ export function startV2ProxyMonitor(
             if (stopped) return
             stopped = true
             controller.abort()
+            try {
+                await iterator.return?.()
+            } catch (error) {
+                logger.warn("V2 catalog iterator cleanup failed", {
+                    error: error instanceof Error ? error.message : String(error),
+                })
+            }
             await eventLoop
         },
     }

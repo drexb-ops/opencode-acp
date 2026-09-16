@@ -20,3 +20,5 @@ export {
     resolveModelInventory,
     resolveSessionService,
 } from "./legacy"
+export { createManagedNotificationSink, isManagedNotificationSink } from "../notifications"
+export type { ManagedNotificationSink } from "../notifications"
