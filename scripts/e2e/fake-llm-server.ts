@@ -21,6 +21,7 @@
  */
 
 import { readFileSync, writeFileSync, existsSync } from "fs"
+import { ACP_FAILURE_OUTPUT_PATTERN, isAcpToolName } from "../../lib/v2/projection/acp-failure"
 
 declare const Bun: {
     serve(options: {
@@ -751,7 +752,12 @@ function inspectToolResults(messages: any[]): ToolResultObservation[] {
         const text = extractMessageText(message)
         const id = typeof message?.tool_call_id === "string" ? message.tool_call_id : undefined
         const name = normalizeToolName(message?.name) ?? (id ? namesByCallId.get(id) : undefined)
+        // ACP tool failures are resolved results on V2 (no native error
+        // channel), so recognize them through the same anchored pattern the
+        // internal projection uses; the legacy regex covers other tools.
+        const acpFailure = isAcpToolName(name) && ACP_FAILURE_OUTPUT_PATTERN.test(text)
         const status =
+            acpFailure ||
             /(?:^|\n)\s*(?:error:|ACP cannot request|ACP tool execution is disabled|ACP .* execution failed|permission .* blocked|invalid .* input|COMPRESSION REJECTED|QUALITY GATE FAILURE)/i.test(
                 text,
             )

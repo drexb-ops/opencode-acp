@@ -23,17 +23,12 @@ import {
 } from "../host-permissions"
 import type { V2HostAdapter } from "./host"
 import type { V2OperationTracker } from "./lifecycle"
+import { ACP_FAILURE_METADATA_KEY, V2_ACP_TOOL_NAMES } from "./projection/acp-failure"
+
+export { V2_ACP_TOOL_NAMES }
 
 type V2Context = Parameters<V2Api.Plugin["setup"]>[0]
 export type V2ToolEditor = Parameters<Parameters<V2Context["tool"]["transform"]>[0]>[0]
-
-export const V2_ACP_TOOL_NAMES = [
-    "compress",
-    "decompress",
-    "search_context",
-    "acp_status",
-    "acp_context_recap",
-] as const
 
 type V2ToolContent = Exclude<NonNullable<V2ToolResult["content"]>, string>[number]
 
@@ -49,8 +44,11 @@ function errorMessage(error: unknown): string {
     return error instanceof Error ? error.message : String(error)
 }
 
+// The pinned Promise adapter has no safe native error channel, so resolved
+// results are the only failure channel the host records reliably. Mark every
+// one explicitly so the internal projection can recognize it as a failure.
 function errorResult(message: string, metadata: Record<string, unknown>): V2ToolResult {
-    return { content: message, metadata }
+    return { content: message, metadata: { [ACP_FAILURE_METADATA_KEY]: true, ...metadata } }
 }
 
 function resultMetadata(

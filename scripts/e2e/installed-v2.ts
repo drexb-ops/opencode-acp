@@ -953,6 +953,12 @@ async function stageNudgeGrowth(): Promise<void> {
         "first nudge has a real compress result observation",
         firstPostObservation.toolResultStatuses?.some((tool) => tool.name === "compress") === true,
     )
+    // A failed resolved V2 tool result must not count as compression success.
+    record(
+        "first nudge compress result is a genuine completed success",
+        firstPostObservation.toolResultStatuses?.find((tool) => tool.name === "compress")
+            ?.status === "completed",
+    )
     const firstCompressed = await waitForState(
         sessionID,
         "first nudge compression commit",
@@ -1034,6 +1040,12 @@ async function stageNudgeGrowth(): Promise<void> {
         secondNudgeObservation,
     )
     if (!secondPostObservation) throw new Error("second nudge produced no post-tool observation")
+    // A failed resolved V2 tool result must not count as compression success.
+    record(
+        "second nudge compress result is a genuine completed success",
+        secondPostObservation.toolResultStatuses?.find((tool) => tool.name === "compress")
+            ?.status === "completed",
+    )
     const secondCompressed = await waitForState(
         sessionID,
         "second nudge compression commit",
