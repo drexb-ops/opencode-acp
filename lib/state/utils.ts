@@ -11,6 +11,7 @@ import type { PluginConfig } from "../config"
 import { isIgnoredUserMessage, messageHasCompress } from "../messages/query"
 import { isMessageWithInfo } from "../messages/shape"
 import { countTokens } from "../token-utils"
+import { v2CompressionSummaryMessageId } from "../synthetic-ids"
 
 // [FIX Bug 3] Added summary check to match getCurrentTokenUsage exclusion logic
 export const isMessageCompacted = (state: SessionState, msg: WithParts): boolean => {
@@ -375,13 +376,15 @@ export function collectTurnNudgeAnchors(messages: WithParts[]): Set<string> {
 
 /**
  * Sum summary tokens of active blocks.
- * When visibleMessageIds is provided, only counts blocks whose compressMessageId
- * is still in the context (prevents over-counting from blocks whose compress
- * calls scrolled out via opencode compaction).
+ * When visibleMessageIds is provided, only counts blocks whose original compress
+ * message or deterministic recovered V2 summary is still in the context. This
+ * prevents historical blocks from reserving current budget after OpenCode
+ * compaction removes both their source range and summary carrier.
  */
 export function getActiveSummaryTokenUsage(
     state: SessionState,
     visibleMessageIds?: Set<string>,
+    recoveredV2Summaries = false,
 ): number {
     let total = 0
     for (const blockId of state.prune.messages.activeBlockIds) {
@@ -389,8 +392,20 @@ export function getActiveSummaryTokenUsage(
         if (!block || !block.active) {
             continue
         }
-        if (visibleMessageIds && block.compressMessageId) {
-            if (!visibleMessageIds.has(block.compressMessageId)) {
+        if (visibleMessageIds) {
+            if (block.compressMessageId) {
+                if (!visibleMessageIds.has(block.compressMessageId)) {
+                    continue
+                }
+            } else if (
+                recoveredV2Summaries
+                    ? !visibleMessageIds.has(v2CompressionSummaryMessageId(block.blockId))
+                    : !block.effectiveMessageIds.some((id) => visibleMessageIds.has(id))
+            ) {
+                // Missing historical compress calls contribute summary-buffer
+                // tokens in V2 only after materialization of the exact recovered
+                // summary. V1 keeps its legacy effective-source fallback because
+                // it has no deterministic recovery carrier.
                 continue
             }
         }

@@ -136,8 +136,8 @@ export interface Nudges {
      * Lock flag: prevents baseline leak after compress.
      *
      * When compress is detected in the current turn, the baseline is set to
-     * currentTokens ONLY on the first transform (before continuation work
-     * inflates it). Subsequent transforms in the same turn skip the update.
+     * semantic growthTokens ONLY on the first transform (before continuation
+     * work inflates it). Subsequent transforms in the same turn skip the update.
      * Reset to false when compress is NOT in the current turn.
      */
     compressBaselineSet: boolean

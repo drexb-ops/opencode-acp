@@ -891,12 +891,17 @@ run_v2_reliability() {
     start_v2
     E2E_ACTIVE_OBSERVATIONS="$V2_RELIABILITY_OBSERVATIONS"
     run_v2_stage reliability
+    step "restart only the owned V2 server and prove persisted reliability on the wire"
+    stop_owned_pid "$V2_PID"
+    V2_PID=""
+    start_v2
+    run_v2_stage reliability-post-restart
     unset E2E_ACTIVE_OBSERVATIONS
     stop_owned_pid "$FAKE_PID"
     FAKE_PID=""
     stop_owned_pid "$V2_PID"
     V2_PID=""
-    pass "installed V2 reliability proof removed original wire content while preserving summary and shell result"
+    pass "installed V2 reliability proof preserved persisted wire content across the owned V2/plugin restart"
 }
 
 run_v2_permission_case() {

@@ -95,6 +95,7 @@ export const injectCompressNudges = (
     candidateMessages?: WithParts[],
     effects?: DeferredMutationEffects,
     authoritativeCurrentTokens?: number,
+    authoritativeGrowthTokens?: number,
 ): void => {
     if (compressPermission(state, config) === "deny") {
         return
@@ -121,6 +122,12 @@ export const injectCompressNudges = (
         messages,
         authoritativeCurrentTokens,
     )
+    // V2 intentionally uses two token metrics. Provider-calibrated tokens drive
+    // user-facing limit/critical decisions, while a stable semantic metric
+    // drives persisted growth baselines and cadence. Switching a persisted
+    // baseline between those units can look like a huge compression and reset
+    // the nudge cycle even though no content was removed.
+    const growthTokens = authoritativeGrowthTokens ?? currentTokens
 
     const lastUserIdx = messages.findLastIndex(
         (m) => m.info.role === "user" && !isIgnoredUserMessage(m),
@@ -148,7 +155,7 @@ export const injectCompressNudges = (
             state.nudges.lastToolOutputNudgeTokens = undefined
             // Preserve tier cadence baselines instead of resetting to undefined
             // (undefined = "never fired" → T2/T3 re-trigger immediately after
-            // their own compress — issue #235). Set to currentTokens so the
+            // their own compress — issue #235). Set to growthTokens so the
             // growthFloor gate applies from here on.
             //
             // But only real distillations/condensations (block-ref boundaries)
@@ -158,8 +165,8 @@ export const injectCompressNudges = (
             // sessions (issue #364 P1).
             const captureOnly = isCaptureOnlyCompress(lastCompressMsg)
             if (!captureOnly) {
-                state.nudges.lastTier2NudgeTokens = currentTokens
-                state.nudges.lastTier3NudgeTokens = currentTokens
+                state.nudges.lastTier2NudgeTokens = growthTokens
+                state.nudges.lastTier3NudgeTokens = growthTokens
             }
 
             const currentTurnHasSuccessfulCompress = messages
@@ -172,7 +179,7 @@ export const injectCompressNudges = (
                 !state.nudges.compressBaselineSet
             ) {
                 const baseline = state.nudges.lastPerMessageNudgeTokens
-                const postCompress = currentTokens
+                const postCompress = growthTokens
                 const preCompress = preCompressTokens
 
                 if (
@@ -313,11 +320,11 @@ export const injectCompressNudges = (
         currentTokens >= emergencyThreshold
 
     if (
-        currentTokens !== undefined &&
+        growthTokens !== undefined &&
         state.nudges.lastPerMessageNudgeTokens !== undefined &&
-        currentTokens < state.nudges.lastPerMessageNudgeTokens - nudgeGrowthTokens
+        growthTokens < state.nudges.lastPerMessageNudgeTokens - nudgeGrowthTokens
     ) {
-        state.nudges.lastPerMessageNudgeTokens = currentTokens
+        state.nudges.lastPerMessageNudgeTokens = growthTokens
         state.nudges.lastNudgeShownTokens = undefined
         baselineCorrected = true
     }
@@ -330,7 +337,7 @@ export const injectCompressNudges = (
         state.nudges.lastNudgeShownTokens ?? state.nudges.lastPerMessageNudgeTokens
 
     const decision = computeShouldNudge({
-        currentTokens,
+        currentTokens: growthTokens,
         modelContextLimit,
         overMinLimit,
         overMaxLimit,
@@ -342,8 +349,8 @@ export const injectCompressNudges = (
     })
 
     const growthSinceBaseline =
-        currentTokens !== undefined && growthReference !== undefined
-            ? currentTokens - growthReference
+        growthTokens !== undefined && growthReference !== undefined
+            ? growthTokens - growthReference
             : undefined
     // Issue #342: a growth nudge must not fire below the configured floor.
     // The floor is minNudgeContextPercent (default 5% of the model context),
@@ -384,10 +391,10 @@ export const injectCompressNudges = (
 
     const effectiveTipsVariant = emergencyOverride ? "maxLimit" : decision.tipsVariant
 
-    if (state.nudges.lastPerMessageNudgeTokens === undefined && currentTokens !== undefined) {
+    if (state.nudges.lastPerMessageNudgeTokens === undefined && growthTokens !== undefined) {
         // Growth is measured from the session's starting context — the system
         // prompt is always present and is NOT growth.
-        state.nudges.lastPerMessageNudgeTokens = currentTokens
+        state.nudges.lastPerMessageNudgeTokens = growthTokens
         baselineReEstablished = true
     }
 
@@ -544,10 +551,10 @@ export const injectCompressNudges = (
         }
     }
 
-    if (state.nudges.lastPerMessageNudgeTokens === undefined && currentTokens !== undefined) {
+    if (state.nudges.lastPerMessageNudgeTokens === undefined && growthTokens !== undefined) {
         // Growth is measured from the session's starting context — the system
         // prompt is always present and is NOT growth.
-        state.nudges.lastPerMessageNudgeTokens = currentTokens
+        state.nudges.lastPerMessageNudgeTokens = growthTokens
         baselineReEstablished = true
     }
 
@@ -578,7 +585,7 @@ export const injectCompressNudges = (
             if (tc.tokens < nudgeGrowthTokens) continue
             const cadenceMet =
                 tc.lastNudge === undefined ||
-                (currentTokens !== undefined && currentTokens - tc.lastNudge >= growthFloor)
+                (growthTokens !== undefined && growthTokens - tc.lastNudge >= growthFloor)
             if (!cadenceMet) continue
 
             let candidates = [...state.prune.messages.activeBlockIds]
@@ -671,9 +678,9 @@ export const injectCompressNudges = (
                 candidateTokens,
             })
             if (tc.triggerTier === 2) {
-                state.nudges.lastTier2NudgeTokens = currentTokens
+                state.nudges.lastTier2NudgeTokens = growthTokens
             } else {
-                state.nudges.lastTier3NudgeTokens = currentTokens
+                state.nudges.lastTier3NudgeTokens = growthTokens
             }
             break
         }
@@ -753,10 +760,10 @@ export const injectCompressNudges = (
             const pct = (n: number) =>
                 n > 0 ? Math.max(1, Math.round((n / composition.total) * 100)) : 0
             const growth =
-                currentTokens !== undefined &&
+                growthTokens !== undefined &&
                 (state.nudges.lastNudgeShownTokens ?? state.nudges.lastPerMessageNudgeTokens) !==
                     undefined
-                    ? currentTokens -
+                    ? growthTokens -
                       (state.nudges.lastNudgeShownTokens ?? state.nudges.lastPerMessageNudgeTokens!)
                     : 0
             const growthStr = growth > 0 ? ` (+${fmt(growth)} since last nudge)` : ""
@@ -825,7 +832,7 @@ export const injectCompressNudges = (
         }
         // Intentionally do NOT update lastPerMessageNudgeTokens here — nudges
         // repeat every turn until the model actually compresses.
-        state.nudges.lastNudgeShownTokens = currentTokens
+        state.nudges.lastNudgeShownTokens = growthTokens
         {
             const visibleMessageIds = new Set<string>(messages.map((message) => message.info.id))
             const blockGuidance = buildCompressedBlockGuidance(state, {

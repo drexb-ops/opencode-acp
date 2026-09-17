@@ -185,6 +185,45 @@ test("V2 wire estimate counts current system, messages, and tool schemas exactly
     )
 })
 
+test("V2 tool accounting matches provider schemas and ignores runtime metadata", () => {
+    const inputSchema = {
+        type: "object",
+        properties: {
+            path: { type: "string", description: "File path" },
+        },
+        required: ["path"],
+    }
+    const canonicalTools = {
+        read: {
+            description: "Read one file.",
+            input: inputSchema,
+        },
+    }
+    const runtimeTools = {
+        read: {
+            name: "read",
+            description: "Read one file.",
+            input: inputSchema,
+            execute: () => "this is never sent to the provider",
+            options: {
+                executor: "executor metadata ".repeat(20_000),
+                internalID: "internal-id",
+            },
+            internalID: "runtime-id",
+        },
+    }
+
+    const canonical = estimateV2WireTokens({ system: [], messages: [], tools: canonicalTools })
+    const runtime = estimateV2WireTokens({ system: [], messages: [], tools: runtimeTools })
+
+    assert.equal(
+        runtime.toolTokens,
+        canonical.toolTokens,
+        "executor/options/internal IDs must not be counted as provider prompt content",
+    )
+    assert.equal(runtime.messageTokens, 0)
+})
+
 test("V2 projected budget falls after pruning an old tool result", () => {
     const oldOutput = "Build output line with useful diagnostics. ".repeat(1_500)
     const rawToolResult = {
@@ -594,6 +633,43 @@ test("V2 opaque branching traversal has one global node budget", () => {
 
     assert.ok(estimate.messageTokens > 0)
     assert.ok(indexedReads <= 1_024, `expected global traversal cap, read ${indexedReads} entries`)
+})
+
+test("V2 safety estimate fails closed for a huge value beyond the semantic collection bound", () => {
+    let highestRead = -1
+    const payload = new Proxy(
+        Array.from({ length: 65 }, (_, index) =>
+            index === 64 ? "omitted-provider-value ".repeat(50_000) : `entry-${index}`,
+        ),
+        {
+            get(target, property, receiver) {
+                if (typeof property === "string" && /^\d+$/.test(property)) {
+                    highestRead = Math.max(highestRead, Number(property))
+                }
+                return Reflect.get(target, property, receiver)
+            },
+        },
+    )
+    const message = projectedMessage("bounded-safety", [{ type: "provider-native", payload }])
+    const budget = createV2TokenBudget({
+        system: [],
+        messages: [
+            {
+                id: "bounded-safety",
+                role: "user",
+                content: [{ type: "provider-native", payload }],
+            },
+        ],
+        normalizedMessages: [message],
+        outgoingNormalizedMessageIds: ["bounded-safety"],
+    })
+
+    assert.ok(budget.estimateMessages([message]) < 1_000_000)
+    assert.ok(
+        budget.estimateSafetyMessages([message]) >= 1_000_000_000,
+        "hard guards must fail closed when a provider value is structurally omitted",
+    )
+    assert.ok(highestRead < 64, `omitted payload was accessed at index ${highestRead}`)
 })
 
 test("V2 source residual releases an atomically removed multipart source but keeps uncorrelated native cost", () => {

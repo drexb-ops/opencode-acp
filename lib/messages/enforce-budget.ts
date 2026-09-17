@@ -39,6 +39,85 @@ export interface EnforceBudgetResult {
 /** Optional request-scoped estimator supplied by a host adapter (V2). */
 export type WireTokenEstimator = (messages: WithParts[]) => number
 
+export interface ProviderReportedWireUsage {
+    tokens: number
+    assistantIndex: number
+}
+
+/**
+ * Return OpenCode's last provider-reported context usage plus messages added
+ * after that assistant turn. Historical/native compaction usage and usage from
+ * a different selected model are not valid calibration points.
+ */
+export function providerReportedWireUsage(
+    state: SessionState,
+    messages: WithParts[],
+    currentModel?: { providerID?: string; modelID?: string },
+    options?: { requireSourceProvenance?: boolean },
+): ProviderReportedWireUsage | undefined {
+    for (let index = messages.length - 1; index >= 0; index--) {
+        const message = messages[index]
+        if (message.info.role !== "assistant") continue
+        const info = message.info as AssistantMessage
+        const tokens = info.tokens
+        const input = tokens?.input || 0
+        const output = tokens?.output || 0
+        if (input <= 0 && output <= 0) continue
+        if (
+            state.lastCompaction > 0 &&
+            (info.time.created < state.lastCompaction ||
+                (info.summary === true && info.time.created === state.lastCompaction))
+        ) {
+            return undefined
+        }
+        const infoWithModel = info as AssistantMessage & {
+            providerID?: string
+            modelID?: string
+            __acpProviderUsageProvenance?: {
+                providerID?: unknown
+                modelID?: unknown
+                created?: unknown
+            }
+        }
+        if (options?.requireSourceProvenance) {
+            const provenance = infoWithModel.__acpProviderUsageProvenance
+            if (
+                !provenance ||
+                typeof provenance.providerID !== "string" ||
+                typeof provenance.modelID !== "string" ||
+                typeof provenance.created !== "number" ||
+                !Number.isFinite(provenance.created) ||
+                provenance.created !== info.time.created ||
+                provenance.providerID !== infoWithModel.providerID ||
+                provenance.modelID !== infoWithModel.modelID
+            ) {
+                return undefined
+            }
+        }
+        if (
+            (currentModel?.providerID && currentModel.providerID !== infoWithModel.providerID) ||
+            (currentModel?.modelID && currentModel.modelID !== infoWithModel.modelID)
+        ) {
+            return undefined
+        }
+        let additions = 0
+        for (let next = index + 1; next < messages.length; next++) {
+            additions += countAllMessageTokens(messages[next])
+        }
+        return {
+            assistantIndex: index,
+            tokens:
+                input +
+                output +
+                (tokens?.reasoning || 0) +
+                (tokens?.cache?.read || 0) +
+                (tokens?.cache?.write || 0) +
+                additions,
+        }
+    }
+    return undefined
+}
+
 export function resolveCompletionReserveTokens(config: PluginConfig): number {
     const configuredReserve = config.compress?.completionReserveTokens
     return typeof configuredReserve === "number" &&

@@ -20,7 +20,7 @@ type JsonRecord = Record<string, any>
 // Exact black-box values for the pinned OpenCode 2.0.3 fake-provider fixture.
 // Keeping them independent of ACP's implementation makes the installed test
 // fail if baseline transition logic drifts or resets unexpectedly.
-const EXPECTED_NUDGE_BASELINES = { initial: 11_062, first: 11_609, second: 15_226 }
+const EXPECTED_NUDGE_BASELINES = { initial: 11_315, first: 11_862, second: 15_479 }
 
 interface ToolResultObservation {
     name?: string
@@ -96,6 +96,7 @@ const observationsPath = requiredEnv("E2E_OBSERVATIONS")
 const stateDir = requiredEnv("E2E_STATE_DIR")
 const sessionFile = `${root}/v2/session.json`
 const baselineFile = `${root}/v2/restart-baseline.json`
+const reliabilityBaselineFile = `${root}/v2/reliability-restart-baseline.json`
 const locationQuery = `location%5Bdirectory%5D=${encodeURIComponent(workspace)}`
 const auth = `Basic ${Buffer.from("opencode:e2e-dummy", "utf8").toString("base64")}`
 const acpTools = ["compress", "decompress", "search_context", "acp_status", "acp_context_recap"]
@@ -1127,6 +1128,13 @@ function reliabilityEvidence(observation: RequestObservation): ReliabilityObserv
     return observation.reliability
 }
 
+function summaryFingerprints(state: JsonRecord): JsonRecord[] {
+    return stateBlocks(state).map((block) => ({
+        blockId: block.blockId,
+        summary: block.summary,
+    }))
+}
+
 async function stageReliability(): Promise<void> {
     await health()
     await inventory(true)
@@ -1227,6 +1235,116 @@ async function stageReliability(): Promise<void> {
     record(
         "unselected opaque V2 shell stdout and exit-status content remain in the immediate next model request",
         evidence.shellStdoutAndExitStatusPresent === true,
+    )
+
+    // This is deliberately a payload-free provider observation.  The fake
+    // server records only structural fields and boolean sentinel evidence, so
+    // this artifact can be used as the fixed pre-restart wire baseline without
+    // retaining request content.
+    writeJSON(reliabilityBaselineFile, {
+        sessionID,
+        observation: postCompression,
+        state: {
+            blockCount: countBlocks(state),
+            blockSummaryFingerprints: summaryFingerprints(state),
+        },
+    })
+    record(
+        "reliability wire baseline persists the current session and exact observation",
+        asRecord(readJSON(reliabilityBaselineFile)).sessionID === sessionID,
+    )
+}
+
+async function stageReliabilityPostRestart(): Promise<void> {
+    const sessionID = readSession()
+    const baseline = asRecord(readJSON(reliabilityBaselineFile))
+    const baselineObservation = asRecord(baseline.observation)
+    const baselineEvidence = asRecord(baselineObservation.reliability)
+    const baselineState = asRecord(baseline.state)
+
+    record(
+        "post-restart reliability reuses the persisted session ID",
+        baseline.sessionID === sessionID,
+    )
+    record(
+        "persisted reliability baseline contains the positive immediate wire proof",
+        baselineEvidence.targetedOriginalPresent === false &&
+            baselineEvidence.compressionSummaryPresent === true &&
+            baselineEvidence.protectedRecentPresent === true &&
+            baselineEvidence.shellStdoutAndExitStatusPresent === true,
+    )
+
+    await health()
+    const info = await inventory(true)
+    record("post-restart reliability plugin inventory is present", info !== undefined)
+
+    const beforePromptState = await verifyState(sessionID, 1)
+    record(
+        "post-restart reliability block count matches the persisted baseline",
+        countBlocks(beforePromptState) === baselineState.blockCount,
+    )
+    record(
+        "post-restart reliability summary matches the persisted baseline",
+        stableSerialize(summaryFingerprints(beforePromptState)) ===
+            stableSerialize(baselineState.blockSummaryFingerprints),
+    )
+
+    const listed = await waitForCommands(true)
+    const names = commandNames(listed)
+    record("post-restart reliability ACP command has no duplicate", countNamed(names, "acp") === 1)
+    record("post-restart reliability DCP command has no duplicate", countNamed(names, "dcp") === 1)
+
+    const result = await promptAndObserve(
+        sessionID,
+        "Verify the persisted reliability compression on a fresh provider request after the owned V2 restart.",
+    )
+    record(
+        "post-restart reliability produced a fresh provider observation",
+        result.newObservations.length > 0,
+    )
+    record(
+        "post-restart reliability request reaches the direct fake route",
+        result.observation.requestPath?.endsWith("/v1/chat/completions") === true,
+    )
+    assertAcpCatalog(result.observation, true)
+
+    const evidence = reliabilityEvidence(result.observation)
+    record(
+        "targeted original remains absent after the V2/plugin restart",
+        evidence.targetedOriginalPresent === false,
+    )
+    record(
+        "exact compression summary sentinel remains present after the V2/plugin restart",
+        evidence.compressionSummaryPresent === true &&
+            result.observation.summaryMarkerPresent === true,
+    )
+    record(
+        "protected recent sentinel remains present when retained by host history",
+        baselineEvidence.protectedRecentPresent === true &&
+            evidence.protectedRecentPresent === true,
+    )
+    record(
+        "opaque shell stdout and exit-status remain after the V2/plugin restart",
+        evidence.shellStdoutAndExitStatusPresent === true,
+    )
+    record(
+        "restarted wire still identifies the opaque shell call without prose",
+        evidence.shellToolCallHasNoProse === true &&
+            evidence.shellToolCallHasAcpIdBeforeOpaqueCall === true,
+    )
+
+    const afterPromptState = await verifyState(sessionID, 1)
+    record(
+        "post-restart fresh request leaves compression block count stable",
+        countBlocks(afterPromptState) === baselineState.blockCount,
+    )
+    record(
+        "post-restart fresh request leaves compression summary stable",
+        stableSerialize(summaryFingerprints(afterPromptState)) ===
+            stableSerialize(baselineState.blockSummaryFingerprints),
+    )
+    console.log(
+        "  INFO orphan compression-message replay is intentionally outside the public installed E2E; runtime/private-state coverage owns that case and this scenario does not edit the database.",
     )
 }
 
@@ -1412,7 +1530,7 @@ async function stagePermission(): Promise<void> {
 async function run(): Promise<void> {
     if (!stage)
         throw new Error(
-            "Usage: installed-v2.ts <activate|main|proxy-disabled|reenabled|toggle-disabled|toggle-restored|post-restart|nudge-growth|reliability|permission>",
+            "Usage: installed-v2.ts <activate|main|proxy-disabled|reenabled|toggle-disabled|toggle-restored|post-restart|nudge-growth|reliability|reliability-post-restart|permission>",
         )
     if (stage === "activate") {
         const info = await inventory(false, false)
@@ -1433,6 +1551,7 @@ async function run(): Promise<void> {
     else if (stage === "post-restart") await stagePostRestart()
     else if (stage === "nudge-growth") await stageNudgeGrowth()
     else if (stage === "reliability") await stageReliability()
+    else if (stage === "reliability-post-restart") await stageReliabilityPostRestart()
     else if (stage === "permission") await stagePermission()
     else throw new Error(`unknown installed V2 stage ${stage}`)
     console.log(`  PASS ${stage} stage completed (${assertions} assertions)`)

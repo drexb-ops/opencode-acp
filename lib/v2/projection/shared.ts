@@ -221,7 +221,18 @@ export function makeAssistantInfo(
     sessionID: string,
     options: V2ProjectionOptions,
 ): InternalInfo {
-    const model = modelForSource(source, options)
+    const sourceModel = modelRecord(source.model)
+    const model = sourceModel ?? modelForSource(source, options)
+    const sourceTimeRecord = isRecord(source.time) ? source.time : undefined
+    const sourceCreated = sourceTimeRecord?.created
+    const providerUsageProvenance =
+        sourceModel && typeof sourceCreated === "number" && Number.isFinite(sourceCreated)
+            ? {
+                  providerID: sourceModel.providerID,
+                  modelID: sourceModel.id,
+                  created: sourceCreated,
+              }
+            : undefined
     const sourceTokens = isRecord(source.tokens) ? source.tokens : undefined
     const sourceCache =
         sourceTokens && isRecord(sourceTokens.cache) ? sourceTokens.cache : undefined
@@ -233,6 +244,9 @@ export function makeAssistantInfo(
         parentID: "",
         modelID: model.id,
         providerID: model.providerID,
+        ...(providerUsageProvenance
+            ? { __acpProviderUsageProvenance: providerUsageProvenance }
+            : {}),
         mode: "code",
         agent: stringValue(source.agent) ?? options.agent ?? "code",
         path: { cwd: options.directory ?? "", root: options.directory ?? "" },

@@ -731,35 +731,48 @@ if (
 
 function installArtifactForVerification(pkg, tarballPath) {
     ensureApprovedStagingParent()
-    const installRoot = mkdtempSync(path.join(approvedStagingParent, installPrefix))
-    const installIdentity = captureOwnedDirectory(installRoot, {
-        label: "package install root",
-        parent: approvedStagingParent,
-        prefix: installPrefix,
-    })
-    const npmrc = path.join(installRoot, "npmrc")
-    const globalNpmrc = path.join(installRoot, "global-npmrc")
-    const installHome = path.join(installRoot, "home")
-    const installTmp = path.join(installRoot, "tmp")
-    const installCache = path.join(installRoot, "npm-cache")
-    mkdirSync(installHome, { recursive: true })
-    mkdirSync(installTmp, { recursive: true })
-    mkdirSync(installCache, { recursive: true })
-    writeFileSync(
-        npmrc,
-        "registry=https://registry.npmjs.org/\nfund=false\naudit=false\nupdate-notifier=false\n",
-    )
-    writeFileSync(globalNpmrc, "")
-    const npmEnv = buildMinimalProbeEnv({
-        home: installHome,
-        tmpdir: installTmp,
-        userconfig: npmrc,
-        globalconfig: globalNpmrc,
-        cache: installCache,
-        npm: true,
-    })
-    assertMinimalProbeEnv(npmEnv, true)
+    let installRoot
+    let installIdentity
     try {
+        installRoot = mkdtempSync(path.join(approvedStagingParent, installPrefix))
+        installIdentity = captureOwnedDirectory(installRoot, {
+            label: "package install root",
+            parent: approvedStagingParent,
+            prefix: installPrefix,
+        })
+        const npmrc = path.join(installRoot, "npmrc")
+        const globalNpmrc = path.join(installRoot, "global-npmrc")
+        const installHome = path.join(installRoot, "home")
+        const installTmp = path.join(installRoot, "tmp")
+        const installCache = path.join(installRoot, "npm-cache")
+        mkdirSync(installHome, { recursive: true })
+        mkdirSync(installTmp, { recursive: true })
+        mkdirSync(installCache, { recursive: true })
+        // npm 11 treats `npm install --no-save <tarball>` in an entirely empty
+        // directory as a no-op. A private probe manifest makes the isolated root a
+        // real project without adding the candidate package to persistent metadata.
+        writeFileSync(
+            path.join(installRoot, "package.json"),
+            `${JSON.stringify({
+                name: "opencode-acp-package-verification",
+                version: "1.0.0",
+                private: true,
+            })}\n`,
+        )
+        writeFileSync(
+            npmrc,
+            "registry=https://registry.npmjs.org/\nfund=false\naudit=false\nupdate-notifier=false\n",
+        )
+        writeFileSync(globalNpmrc, "")
+        const npmEnv = buildMinimalProbeEnv({
+            home: installHome,
+            tmpdir: installTmp,
+            userconfig: npmrc,
+            globalconfig: globalNpmrc,
+            cache: installCache,
+            npm: true,
+        })
+        assertMinimalProbeEnv(npmEnv, true)
         try {
             execFileSync(
                 "npm",
@@ -771,8 +784,12 @@ function installArtifactForVerification(pkg, tarballPath) {
                     env: npmEnv,
                 },
             )
-        } catch {
-            fail("isolated npm install of the real ACP tarball failed")
+        } catch (error) {
+            const stderr = error?.stderr ? String(error.stderr).trim() : ""
+            const stdout = error?.stdout ? String(error.stdout).trim() : ""
+            const detail =
+                stderr || stdout || (error instanceof Error ? error.message : "unknown error")
+            fail(`isolated npm install of the real ACP tarball failed: ${detail}`)
         }
         const packageDir = path.join(installRoot, "node_modules", pkg.name)
         if (!existsSync(path.join(packageDir, "package.json"))) {
@@ -785,7 +802,17 @@ function installArtifactForVerification(pkg, tarballPath) {
         })
         validateInstalledModules(pkg, installIdentity.realPath, packageIdentity.realPath)
     } finally {
-        removeExactStagingRoot(installIdentity, installPrefix)
+        if (installIdentity) {
+            removeExactStagingRoot(installIdentity, installPrefix)
+        } else if (
+            installRoot &&
+            path.dirname(installRoot) === approvedStagingParent &&
+            path.basename(installRoot).startsWith(installPrefix)
+        ) {
+            // `mkdtempSync` produced this exact private child, but setup failed
+            // before identity capture completed. Remove only that generated path.
+            rmSync(installRoot, { recursive: true, force: true })
+        }
     }
 }
 

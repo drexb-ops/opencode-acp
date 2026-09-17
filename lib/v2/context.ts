@@ -10,6 +10,7 @@ import {
     type HostPermissionSnapshot,
 } from "../host-permissions"
 import type { SessionState, SessionStateRegistry } from "../state"
+import { findLastCompactionTimestamp } from "../state/utils"
 import type { Logger } from "../logger"
 import { saveSessionState } from "../state/persistence"
 import { DeferredMutationEffects } from "../state/transaction"
@@ -21,7 +22,12 @@ import {
     type V2ProjectionModel,
 } from "./projection"
 import { isAcpOwnedNoticeId } from "./projection/shared"
-import { createV2TokenBudget, estimateV2WireTokens } from "./token-budget"
+import {
+    createV2RequestTokenAccounting,
+    createV2TokenBudget,
+    estimateV2WireTokens,
+} from "./token-budget"
+import { providerReportedWireUsage } from "../messages/enforce-budget"
 import { assessV2HistoryCompatibility, attachV2CompactionTimestamp } from "./history"
 
 export interface V2ContextEvent {
@@ -212,6 +218,26 @@ export function createV2ContextHandler(
                         (entry) => entry.normalizedMessageId,
                     ),
                 })
+                const projectionCompactionTimestamp = findLastCompactionTimestamp(
+                    projection.messages,
+                )
+                const reportedUsage =
+                    projectionCompactionTimestamp > state.lastCompaction
+                        ? undefined
+                        : providerReportedWireUsage(
+                              state,
+                              projection.messages,
+                              {
+                                  providerID: event.model.providerID,
+                                  modelID: event.model.id,
+                              },
+                              { requireSourceProvenance: true },
+                          )
+                const requestAccounting = createV2RequestTokenAccounting(
+                    tokenBudget,
+                    projection.messages,
+                    reportedUsage?.tokens,
+                )
                 const prepared = await prepareMessageTransformTransaction(
                     projection.messages,
                     state,
@@ -231,8 +257,16 @@ export function createV2ContextHandler(
                     true,
                     effects,
                     {
-                        authoritativeOverheadTokens: tokenBudget.overheadTokens,
-                        estimateWireTokens: tokenBudget.estimateMessages,
+                        authoritativeOverheadTokens: requestAccounting.overheadTokens,
+                        safetyEstimate: requestAccounting.safetyEstimate,
+                        growthEstimate: requestAccounting.growthEstimate,
+                        nudgeEstimate: requestAccounting.nudgeEstimate,
+                        // Compatibility for callers that still inspect the
+                        // original request-scoped estimator field. Safety is
+                        // deliberately conservative; nudge thresholds use
+                        // the separate provider-calibrated estimate above.
+                        estimateWireTokens: requestAccounting.safetyEstimate,
+                        source: requestAccounting.source,
                     },
                 )
                 // A non-resuming command notice remains in projected session
@@ -288,11 +322,19 @@ export function createV2ContextHandler(
                     messages: patch.messages,
                     tools: event.tools,
                 })
+                const nudgeEstimate = requestAccounting.nudgeEstimate(prepared.workingMessages)
+                const safetyEstimate = requestAccounting.safetyEstimate(prepared.workingMessages)
                 effects.defer(() =>
                     logger.info("V2 context patch accepted", {
                         sessionId: event.sessionID,
                         estimatedWireTokens: wireEstimate.totalTokens,
                         estimatedOverheadTokens: tokenBudget.overheadTokens,
+                        estimatedSafetyTokens: safetyEstimate,
+                        estimatedSafetyOverheadTokens: requestAccounting.safetyOverheadTokens,
+                        estimatedNudgeTokens: nudgeEstimate,
+                        nudgeEstimateSource: requestAccounting.source,
+                        tokenEstimateSource: requestAccounting.source,
+                        calibrationRatio: requestAccounting.calibrationRatio,
                         outgoingMessages: patch.messages.length,
                     }),
                 )

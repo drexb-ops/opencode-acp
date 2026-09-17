@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import test from "node:test"
 import { getActiveSummaryTokenUsage, createPruneMessagesState } from "../lib/state/utils"
 import type { CompressionBlock, SessionState } from "../lib/state/types"
+import { v2CompressionSummaryMessageId } from "../lib/synthetic-ids"
 
 function makeBlock(overrides: Partial<CompressionBlock> & { blockId: number }): CompressionBlock {
     return {
@@ -89,13 +90,35 @@ test("getActiveSummaryTokenUsage: all blocks visible returns same as unfiltered"
     assert.equal(getActiveSummaryTokenUsage(state as SessionState, visible), 300)
 })
 
-test("getActiveSummaryTokenUsage: blocks without compressMessageId counted when filter provided", () => {
+test("getActiveSummaryTokenUsage: missing compress message requires its recovered summary ID", () => {
     const state = buildSessionState([
-        makeBlock({ blockId: 1, summaryTokens: 100, compressMessageId: undefined }),
+        makeBlock({
+            blockId: 1,
+            summaryTokens: 100,
+            compressMessageId: undefined,
+            effectiveMessageIds: ["source-A"],
+        }),
         makeBlock({ blockId: 2, summaryTokens: 200, compressMessageId: "msg-B" }),
     ])
-    const visible = new Set(["msg-B"])
-    assert.equal(getActiveSummaryTokenUsage(state as SessionState, visible), 300)
+    assert.equal(getActiveSummaryTokenUsage(state as SessionState, new Set(["msg-B"])), 200)
+    assert.equal(
+        getActiveSummaryTokenUsage(
+            state as SessionState,
+            new Set([v2CompressionSummaryMessageId(1), "msg-B"]),
+            true,
+        ),
+        300,
+    )
+    assert.equal(
+        getActiveSummaryTokenUsage(state as SessionState, new Set(["source-A", "msg-B"]), true),
+        200,
+        "visible sources are not evidence that the recovered summary reached the wire",
+    )
+    assert.equal(
+        getActiveSummaryTokenUsage(state as SessionState, new Set(["source-A", "msg-B"])),
+        300,
+        "legacy V1 blocks retain visible-source summary-buffer accounting",
+    )
 })
 
 test("getActiveSummaryTokenUsage: simulates 448-block session with only 26 visible", () => {

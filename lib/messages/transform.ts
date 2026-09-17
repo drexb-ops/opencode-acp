@@ -45,7 +45,15 @@ export interface MessageTransformTokenAccounting {
      * bypasses historical assistant usage without changing V1's cache/fallback.
      */
     authoritativeOverheadTokens: number
+    /** Conservative semantic estimate used by safety/truncation decisions. */
+    safetyEstimate?: WireTokenEstimator
+    /** Stable semantic estimate used by persisted growth/cadence state. */
+    growthEstimate?: WireTokenEstimator
+    /** Provider-calibrated estimate used for user-visible nudge thresholds. */
+    nudgeEstimate?: WireTokenEstimator
+    /** Legacy alias; V2 callers should provide the named safety estimator. */
     estimateWireTokens: WireTokenEstimator
+    source?: "provider-calibrated" | "semantic-estimate"
 }
 
 export interface MessageTransformOptions {
@@ -197,9 +205,14 @@ export async function runMessageTransform(
     if (batchResult.mergedCount > 0) {
         options.effects.requestPersistence()
     }
-    const prePruneTokens = options.tokenAccounting
-        ? options.tokenAccounting.estimateWireTokens(messages)
+    const safetyEstimate =
+        options.tokenAccounting?.safetyEstimate ?? options.tokenAccounting?.estimateWireTokens
+    const growthEstimate = options.tokenAccounting?.growthEstimate ?? safetyEstimate
+    const nudgeEstimate = options.tokenAccounting?.nudgeEstimate ?? safetyEstimate
+    const prePruneTokens = growthEstimate
+        ? growthEstimate(messages)
         : getCurrentTokenUsage(state, messages)
+    const preNudgeTokens = nudgeEstimate ? nudgeEstimate(messages) : prePruneTokens
     const candidateMessages = config.compress.candidates === true ? messages.slice() : undefined
     prune(state, logger, config, messages)
     hideConsumedCompressCalls(state, messages)
@@ -223,31 +236,25 @@ export async function runMessageTransform(
         prePruneTokens,
         candidateMessages,
         options.effects,
-        options.tokenAccounting?.estimateWireTokens(messages),
+        nudgeEstimate ? nudgeEstimate(messages) : undefined,
+        growthEstimate ? growthEstimate(messages) : undefined,
     )
     truncateLargeToolOutputs(
         state,
         config,
         logger,
         messages.filter((message) => !isSyntheticMessage(message)),
-        options.tokenAccounting
-            ? { currentTokens: options.tokenAccounting.estimateWireTokens(messages) }
-            : undefined,
+        safetyEstimate ? { currentTokens: safetyEstimate(messages) } : undefined,
     )
-    enforceContextBudget(
-        state,
-        config,
-        logger,
-        messages,
-        options.tokenAccounting?.estimateWireTokens,
-    )
+    enforceContextBudget(state, config, logger, messages, safetyEstimate)
     injectMessageIds(state, config, messages, compressionPriorities)
     hideFailedCompressCalls(messages)
     stripStaleMetadata(messages)
     dropEmptyMessages(messages)
-    const postTokens = options.tokenAccounting
-        ? options.tokenAccounting.estimateWireTokens(messages)
+    const postTokens = safetyEstimate
+        ? safetyEstimate(messages)
         : getCurrentTokenUsage(state, messages)
+    const nudgeTokens = nudgeEstimate ? nudgeEstimate(messages) : undefined
     if (postTokens !== undefined && effectiveLimit) {
         const budget = options.tokenAccounting
             ? effectiveLimit.limit - resolveCompletionReserveTokens(config)
@@ -274,6 +281,7 @@ export async function runMessageTransform(
         model: state.modelID,
         messages: messages.length,
         prePruneTokens,
+        preNudgeTokens,
         postTokens,
         contextLimit: effectiveLimit?.limit,
         contextLimitSource: effectiveLimit?.source,
@@ -281,6 +289,11 @@ export async function runMessageTransform(
             postTokens !== undefined && effectiveLimit
                 ? `${((postTokens / effectiveLimit.limit) * 100).toFixed(1)}%`
                 : undefined,
+        safetyEstimateSource: options.tokenAccounting ? "semantic-estimate" : undefined,
+        tokenEstimateSource: options.tokenAccounting?.source,
         nudged: state.nudges.shouldInjectThisTurn,
+        safetyEstimateTokens: postTokens,
+        nudgeEstimateTokens: nudgeTokens,
+        nudgeEstimateSource: options.tokenAccounting?.source,
     })
 }

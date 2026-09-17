@@ -26,6 +26,10 @@
             "topic": "V2 multipart shell reliability",
             "targetSentinel": "V2_RELIABILITY_TARGETED_ORIGINAL_SENTINEL",
             "summary": "V2_RELIABILITY_COMPRESSION_SUMMARY_SENTINEL: The selected older assistant record was consolidated while recent user intent remains visible."
+        },
+        {
+            "respond": "text",
+            "text": "V2_RELIABILITY_POST_RESTART_SENTINEL: persisted compression was verified on the fresh provider request."
         }
     ]
 }
