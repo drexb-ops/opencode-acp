@@ -1,0 +1,31 @@
+{
+    "name": "acp-installed-v2-multipart-shell-reliability",
+    "description": "A real V2 shell result has stdout plus the host exit-status notice; ACP must patch its opaque no-prose tool-call history and remove the exact selected older assistant source from the immediate next request.",
+    "turns": [
+        {
+            "respond": "text",
+            "text": "V2_RELIABILITY_TARGETED_ORIGINAL_SENTINEL: this older assistant record is the exact source selected for compression."
+        },
+        {
+            "respond": "tool",
+            "tool": "shell",
+            "toolArgs": {
+                "command": "printf '%s\\n' V2_RELIABILITY_SHELL_STDOUT_SENTINEL"
+            }
+        },
+        {
+            "respond": "text",
+            "text": "A second older completed record remains eligible for deterministic range compression."
+        },
+        {
+            "respond": "text",
+            "text": "Recent intent has been acknowledged and must remain protected by the configured recent-message window."
+        },
+        {
+            "respond": "compress",
+            "topic": "V2 multipart shell reliability",
+            "targetSentinel": "V2_RELIABILITY_TARGETED_ORIGINAL_SENTINEL",
+            "summary": "V2_RELIABILITY_COMPRESSION_SUMMARY_SENTINEL: The selected older assistant record was consolidated while recent user intent remains visible."
+        }
+    ]
+}

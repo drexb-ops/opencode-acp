@@ -2,6 +2,7 @@ import type { PluginConfig } from "../../config"
 import { countMessageCharacters } from "../../token-utils"
 import { isIgnoredUserMessage, isSyntheticMessage } from "../query"
 import type { SessionState, WithParts } from "../../state"
+import { isAcpNonRemovableMessage } from "../opaque"
 import { computeProtectedRefs } from "./utils"
 import { messageContainsProtectedTool } from "../../compress/protected-content"
 import { buildSearchContext } from "../../compress/search"
@@ -17,6 +18,7 @@ export type CandidateOmissionReason =
     | "synthetic-or-ignored"
     | "active-compression"
     | "protected-tool-or-file"
+    | "non-removable-source"
     | "recent-protection"
     | "below-minimum"
     | "executor-selection-drift"
@@ -158,6 +160,10 @@ function buildAtomicUnits(
         const refs = source.map((message) => state.messageIds.byRawId.get(message.info.id))
         const startRef = refs[0]
         const endRef = refs[refs.length - 1]
+        if (source.some(isAcpNonRemovableMessage)) {
+            omissions.push({ kind: "micro", startRef, endRef, reason: "non-removable-source" })
+            continue
+        }
         const invalidShape = source.some(
             (message) => isSyntheticMessage(message) || isIgnoredUserMessage(message),
         )

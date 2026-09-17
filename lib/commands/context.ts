@@ -46,6 +46,11 @@ import type { NoticeSink } from "../host"
 import { sendIgnoredMessage } from "../ui/notification"
 import { formatTokenCount } from "../ui/utils"
 import { isIgnoredUserMessage } from "../messages/query"
+import {
+    hasV2NativePrefix,
+    isAcpNonRemovableMessage,
+    isV2ProjectedMessage,
+} from "../messages/opaque"
 import { isMessageCompacted } from "../state/utils"
 import { countTokens, extractCompletedToolOutput, getCurrentParams } from "../token-utils"
 import type { AssistantMessage, TextPart, ToolPart } from "@opencode-ai/sdk/v2"
@@ -59,6 +64,9 @@ export interface ContextCommandContext {
 }
 
 interface TokenBreakdown {
+    v2Estimate?: boolean
+    overheadKnown?: boolean
+    nativePrefixOutsideView?: boolean
     system: number
     user: number
     assistant: number
@@ -72,7 +80,15 @@ interface TokenBreakdown {
 }
 
 function analyzeTokens(state: SessionState, messages: WithParts[]): TokenBreakdown {
+    const v2Estimate = messages.some(isV2ProjectedMessage)
     const breakdown: TokenBreakdown = {
+        ...(v2Estimate
+            ? {
+                  v2Estimate: true,
+                  overheadKnown: state.systemPromptTokens !== undefined,
+                  nativePrefixOutsideView: hasV2NativePrefix(messages),
+              }
+            : {}),
         system: 0,
         user: 0,
         assistant: 0,
@@ -120,6 +136,7 @@ function analyzeTokens(state: SessionState, messages: WithParts[]): TokenBreakdo
     breakdown.total = apiInput + apiOutput + apiReasoning + apiCacheRead + apiCacheWrite
 
     const userTextParts: string[] = []
+    const assistantTextParts: string[] = []
     const toolInputParts: string[] = []
     const toolOutputParts: string[] = []
     let firstUserText = ""
@@ -132,12 +149,22 @@ function analyzeTokens(state: SessionState, messages: WithParts[]): TokenBreakdo
     for (const msg of messages) {
         allMessageIds.add(msg.info.id)
         const parts = Array.isArray(msg.parts) ? msg.parts : []
-        const isCompacted = isMessageCompacted(state, msg)
         const pruneEntry = state.prune.messages.byMessageId.get(msg.info.id)
         const isMessagePruned = !!pruneEntry && pruneEntry.activeBlockIds.length > 0
+        const isCompacted = v2Estimate
+            ? isMessagePruned && !isAcpNonRemovableMessage(msg)
+            : isMessageCompacted(state, msg)
         const isIgnoredUser = isIgnoredUserMessage(msg)
 
         for (const part of parts) {
+            if (
+                v2Estimate &&
+                !isCompacted &&
+                msg.info.role === "assistant" &&
+                (part.type === "text" || part.type === "reasoning")
+            ) {
+                assistantTextParts.push(part.text)
+            }
             if (part.type === "tool") {
                 const toolPart = part as ToolPart
                 if (toolPart.callID) {
@@ -203,7 +230,9 @@ function analyzeTokens(state: SessionState, messages: WithParts[]): TokenBreakdo
     const toolInputTokens = countTokens(toolInputParts.join("\n"))
     const toolOutputTokens = countTokens(toolOutputParts.join("\n"))
 
-    if (firstAssistant) {
+    if (v2Estimate) {
+        breakdown.system = state.systemPromptTokens ?? 0
+    } else if (firstAssistant) {
         const firstInput =
             (firstAssistant.tokens?.input || 0) +
             (firstAssistant.tokens?.cache?.read || 0) +
@@ -212,10 +241,12 @@ function analyzeTokens(state: SessionState, messages: WithParts[]): TokenBreakdo
     }
 
     breakdown.tools = toolInputTokens + toolOutputTokens
-    breakdown.assistant = Math.max(
-        0,
-        breakdown.total - breakdown.system - breakdown.user - breakdown.tools,
-    )
+    breakdown.assistant = v2Estimate
+        ? countTokens(assistantTextParts.join("\n"))
+        : Math.max(0, breakdown.total - breakdown.system - breakdown.user - breakdown.tools)
+    if (v2Estimate) {
+        breakdown.total = breakdown.system + breakdown.user + breakdown.assistant + breakdown.tools
+    }
 
     return breakdown
 }
@@ -247,6 +278,15 @@ function formatContextMessage(breakdown: TokenBreakdown): string {
     lines.push("╰───────────────────────────────────────────────────────────╯")
     lines.push("")
     lines.push("Session Context Breakdown:")
+    if (breakdown.v2Estimate) {
+        lines.push("Projected context estimate; system includes cached tool-schema overhead.")
+        if (breakdown.nativePrefixOutsideView)
+            lines.push(
+                "Partial history: the native checkpoint prefix is preserved but is outside this breakdown.",
+            )
+        if (!breakdown.overheadKnown)
+            lines.push("System/tool overhead unavailable until an accepted V2 context request.")
+    }
     lines.push("─".repeat(60))
     lines.push("")
 
@@ -265,7 +305,14 @@ function formatContextMessage(breakdown: TokenBreakdown): string {
 
     lines.push("Summary:")
 
-    if (breakdown.prunedTokens > 0) {
+    if (breakdown.v2Estimate) {
+        lines.push(`  Projected context: ~${formatTokenCount(breakdown.total)}`)
+        if (breakdown.prunedTokens > 0) {
+            lines.push(
+                `  Recorded historical compression: ~${formatTokenCount(breakdown.prunedTokens)} (not current wire savings)`,
+            )
+        }
+    } else if (breakdown.prunedTokens > 0) {
         const withoutPruning = breakdown.total + breakdown.prunedTokens
         const pruned = []
         if (breakdown.prunedToolCount > 0) pruned.push(`${breakdown.prunedToolCount} tools`)

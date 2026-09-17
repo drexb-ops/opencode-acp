@@ -36,6 +36,18 @@ export interface EnforceBudgetResult {
     clearedCount: number
 }
 
+/** Optional request-scoped estimator supplied by a host adapter (V2). */
+export type WireTokenEstimator = (messages: WithParts[]) => number
+
+export function resolveCompletionReserveTokens(config: PluginConfig): number {
+    const configuredReserve = config.compress?.completionReserveTokens
+    return typeof configuredReserve === "number" &&
+        Number.isFinite(configuredReserve) &&
+        configuredReserve >= 0
+        ? configuredReserve
+        : DEFAULT_COMPLETION_RESERVE_TOKENS
+}
+
 /**
  * Resolve the context window the budget guard enforces against.
  *
@@ -123,6 +135,7 @@ export function enforceContextBudget(
     config: PluginConfig,
     logger: Logger,
     messages: WithParts[],
+    estimateTokens?: WireTokenEstimator,
 ): EnforceBudgetResult | undefined {
     const window = resolveContextWindow(state)
     if (window === undefined) return undefined
@@ -131,17 +144,13 @@ export function enforceContextBudget(
     // defend here: a non-numeric reserve would make `budget` NaN and every
     // `<= budget` break condition false → the guard would truncate ALL
     // candidates with no early exit.
-    const configuredReserve = config.compress?.completionReserveTokens
-    const reserve =
-        typeof configuredReserve === "number" &&
-        Number.isFinite(configuredReserve) &&
-        configuredReserve >= 0
-            ? configuredReserve
-            : DEFAULT_COMPLETION_RESERVE_TOKENS
+    const reserve = resolveCompletionReserveTokens(config)
     const budget = window - reserve
     if (budget <= 0) return undefined
 
-    const estimatedTokens = estimateWireTokens(state, messages)
+    const estimatedTokens = estimateTokens
+        ? estimateTokens(messages)
+        : estimateWireTokens(state, messages)
     if (estimatedTokens <= budget) {
         return {
             applied: false,
@@ -183,6 +192,11 @@ export function enforceContextBudget(
     let saved = 0
     let truncatedCount = 0
     let clearedCount = 0
+    // V2's estimator walks the entire projected request. Use local output
+    // deltas while selecting candidates, then reconcile at phase boundaries
+    // and once at the end. This stays O(messages + candidates), rather than
+    // reserializing every projected part once per candidate.
+    let candidateEstimate = estimatedTokens
 
     const truncatable = candidates
         .filter(
@@ -193,7 +207,7 @@ export function enforceContextBudget(
         .sort((a, b) => b.tokens - a.tokens)
 
     for (const c of truncatable) {
-        if (estimatedTokens - saved <= budget) break
+        if (candidateEstimate <= budget) break
         const prefix = c.content.slice(0, KEEP_PREFIX_CHARS)
         const suffix = c.content.slice(-KEEP_SUFFIX_CHARS)
         const truncated =
@@ -203,11 +217,14 @@ export function enforceContextBudget(
         // Skip it (phase 2 may still clear it) instead of growing it.
         if (truncated.length >= c.content.length) continue
         c.part.state.output = truncated
-        saved += c.tokens - countTokens(truncated)
+        const delta = c.tokens - countTokens(truncated)
+        saved += delta
+        candidateEstimate = Math.max(0, candidateEstimate - delta)
         truncatedCount++
     }
 
-    if (estimatedTokens - saved > budget) {
+    if (estimateTokens) candidateEstimate = estimateTokens(messages)
+    if (candidateEstimate > budget) {
         const clearable = candidates
             .filter((c) => {
                 const out = extractCompletedToolOutput(c.part)
@@ -220,16 +237,20 @@ export function enforceContextBudget(
             .sort((a, b) => a.index - b.index)
 
         for (const c of clearable) {
-            if (estimatedTokens - saved <= budget) break
+            if (candidateEstimate <= budget) break
             const current = extractCompletedToolOutput(c.part)
             if (current === undefined || current === COMPACTED_TOOL_OUTPUT_PLACEHOLDER) continue
             c.part.state.output = COMPACTED_TOOL_OUTPUT_PLACEHOLDER
-            saved += countTokens(current) - countTokens(COMPACTED_TOOL_OUTPUT_PLACEHOLDER)
+            const delta = countTokens(current) - countTokens(COMPACTED_TOOL_OUTPUT_PLACEHOLDER)
+            saved += delta
+            candidateEstimate = Math.max(0, candidateEstimate - delta)
             clearedCount++
         }
     }
 
-    const finalEstimate = Math.max(0, estimatedTokens - saved)
+    const finalEstimate = estimateTokens
+        ? estimateTokens(messages)
+        : Math.max(0, estimatedTokens - saved)
     if (truncatedCount > 0 || clearedCount > 0) {
         logger.warn("Context budget guard: pruned tool outputs to fit the request", {
             session: state.sessionId,
@@ -239,7 +260,7 @@ export function enforceContextBudget(
             reserve,
             truncatedCount,
             clearedCount,
-            estimatedSavedTokens: Math.round(saved),
+            estimatedSavedTokens: Math.round(Math.max(0, estimatedTokens - finalEstimate)),
             finalEstimate: Math.round(finalEstimate),
         })
     }

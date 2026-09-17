@@ -19,9 +19,13 @@ import {
 import { applyCompressOverrides } from "./inject/utils"
 import { DEFAULT_COMPRESS_REASONING } from "../config"
 import { getLastUserMessage, isSyntheticMessage } from "./query"
-import { OUTPUT_RESERVE_TOKENS, truncateLargeToolOutputs } from "./truncate-tools"
+import { truncateLargeToolOutputs } from "./truncate-tools"
 import { resolveEffectiveContextLimit } from "../state/utils"
-import { enforceContextBudget } from "./enforce-budget"
+import {
+    enforceContextBudget,
+    resolveCompletionReserveTokens,
+    type WireTokenEstimator,
+} from "./enforce-budget"
 import { syncCompressPermissionState } from "../compress-permission"
 import { cacheSystemPromptTokens } from "../ui/utils"
 import { runBatchCleanup } from "../gc/merge"
@@ -35,6 +39,15 @@ import { hideFailedCompressCalls } from "../compress/hide-failed"
 import { isAcpOpaquePart } from "./opaque"
 
 /** Inputs resolved by the host adapter before entering a state transaction. */
+export interface MessageTransformTokenAccounting {
+    /**
+     * Request-scoped V2 accounting derived from the current host event. This
+     * bypasses historical assistant usage without changing V1's cache/fallback.
+     */
+    authoritativeOverheadTokens: number
+    estimateWireTokens: WireTokenEstimator
+}
+
 export interface MessageTransformOptions {
     requestModelLimit?: number
     modelLimitKnown?: boolean
@@ -43,6 +56,7 @@ export interface MessageTransformOptions {
     debugNotify?: (text: string) => void | Promise<void>
     /** V2 has no post-generation hook; only historical assistant text is sanitized. */
     sanitizeAssistantTextOnly?: boolean
+    tokenAccounting?: MessageTransformTokenAccounting
 }
 
 /**
@@ -161,7 +175,13 @@ export async function runMessageTransform(
         isSubAgent: state.isSubAgent,
         modelContextLimit: effectiveLimit?.limit,
     })
-    cacheSystemPromptTokens(state, messages)
+    cacheSystemPromptTokens(
+        state,
+        messages,
+        options.tokenAccounting
+            ? { authoritativeOverheadTokens: options.tokenAccounting.authoritativeOverheadTokens }
+            : undefined,
+    )
     assignMessageRefs(state, messages)
     const activeBlockCountBefore = state.prune.messages.activeBlockIds.size
     const compressionStateChanged = syncCompressionBlocks(state, logger, messages)
@@ -177,7 +197,9 @@ export async function runMessageTransform(
     if (batchResult.mergedCount > 0) {
         options.effects.requestPersistence()
     }
-    const prePruneTokens = getCurrentTokenUsage(state, messages)
+    const prePruneTokens = options.tokenAccounting
+        ? options.tokenAccounting.estimateWireTokens(messages)
+        : getCurrentTokenUsage(state, messages)
     const candidateMessages = config.compress.candidates === true ? messages.slice() : undefined
     prune(state, logger, config, messages)
     hideConsumedCompressCalls(state, messages)
@@ -201,22 +223,37 @@ export async function runMessageTransform(
         prePruneTokens,
         candidateMessages,
         options.effects,
+        options.tokenAccounting?.estimateWireTokens(messages),
     )
     truncateLargeToolOutputs(
         state,
         config,
         logger,
         messages.filter((message) => !isSyntheticMessage(message)),
+        options.tokenAccounting
+            ? { currentTokens: options.tokenAccounting.estimateWireTokens(messages) }
+            : undefined,
     )
-    enforceContextBudget(state, config, logger, messages)
+    enforceContextBudget(
+        state,
+        config,
+        logger,
+        messages,
+        options.tokenAccounting?.estimateWireTokens,
+    )
     injectMessageIds(state, config, messages, compressionPriorities)
     hideFailedCompressCalls(messages)
     stripStaleMetadata(messages)
     dropEmptyMessages(messages)
-    const postTokens = getCurrentTokenUsage(state, messages)
+    const postTokens = options.tokenAccounting
+        ? options.tokenAccounting.estimateWireTokens(messages)
+        : getCurrentTokenUsage(state, messages)
     if (postTokens !== undefined && effectiveLimit) {
-        const budget =
-            effectiveLimit.limit - (state.systemPromptTokens ?? 0) - OUTPUT_RESERVE_TOKENS
+        const budget = options.tokenAccounting
+            ? effectiveLimit.limit - resolveCompletionReserveTokens(config)
+            : effectiveLimit.limit -
+              (state.systemPromptTokens ?? 0) -
+              resolveCompletionReserveTokens(config)
         if (postTokens > budget) {
             logger.error("ACP hard guard: context exceeds model budget after in-flight reduction", {
                 session: state.sessionId,

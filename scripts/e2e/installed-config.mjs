@@ -17,6 +17,22 @@ import {
 import { dirname, isAbsolute, relative } from "node:path"
 import { pathToFileURL } from "node:url"
 
+const args = process.argv.slice(2)
+const systemFixtureFlag = args.indexOf("--system-fixture")
+let systemFixturePluginDir
+if (systemFixtureFlag !== -1) {
+    systemFixturePluginDir = args[systemFixtureFlag + 1]
+    if (
+        !systemFixturePluginDir ||
+        systemFixturePluginDir.startsWith("-") ||
+        args.indexOf("--system-fixture", systemFixtureFlag + 1) !== -1
+    ) {
+        process.stderr.write("--system-fixture requires one local plugin directory\n")
+        process.exit(2)
+    }
+    args.splice(systemFixtureFlag, 2)
+}
+
 const [
     mode,
     outputPath,
@@ -30,7 +46,7 @@ const [
     nudgeGrowthTokensArg,
     minNudgeGrowthFloorArg,
     qualityGateEnabledArg,
-] = process.argv.slice(2)
+] = args
 
 if (!mode || !outputPath) {
     process.stderr.write(
@@ -44,6 +60,42 @@ function writeAtomic(path, value) {
     const temporary = `${path}.tmp-${process.pid}`
     writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, "utf8")
     renameSync(temporary, path)
+}
+
+const NUDGE_SYSTEM_FIXTURE_MARKER = "ACP_E2E_FIXED_NUDGE_SYSTEM_FIXTURE"
+const NUDGE_SYSTEM_FIXTURE_TEXT =
+    `${NUDGE_SYSTEM_FIXTURE_MARKER}: This private installed-E2E instruction ` +
+    "replaces host-generated system metadata only for deterministic ACP nudge baseline checks."
+
+if (mode === "system-fixture") {
+    if (!isAbsolute(outputPath)) {
+        process.stderr.write("System fixture directory must be absolute\n")
+        process.exit(2)
+    }
+    mkdirSync(outputPath, { recursive: true })
+    writeAtomic(`${outputPath}/package.json`, {
+        name: "acp-e2e-fixed-nudge-system",
+        version: "1.0.0",
+        private: true,
+        type: "module",
+    })
+    writeFileSync(
+        `${outputPath}/server.js`,
+        `const text = ${JSON.stringify(NUDGE_SYSTEM_FIXTURE_TEXT)}\n` +
+            `export default {\n` +
+            `  id: "acp-e2e-fixed-nudge-system",\n` +
+            `  setup: async (context) => {\n` +
+            `    const registration = await context.session.hook("context", async (event) => {\n` +
+            `      const first = event.system[0]\n` +
+            `      if (!first) throw new Error("fixed-system fixture received no host system instruction")\n` +
+            `      event.system.splice(0, event.system.length, { ...first, text })\n` +
+            `    })\n` +
+            `    return () => registration.dispose()\n` +
+            `  },\n` +
+            `}\n`,
+        "utf8",
+    )
+    process.exit(0)
 }
 
 if (mode === "wrapper") {
@@ -103,12 +155,19 @@ if (mode === "wrapper") {
 
 if (mode === "v2") {
     const permission = hostPermission ?? "allow"
+    if (systemFixturePluginDir && !isAbsolute(systemFixturePluginDir)) {
+        process.stderr.write("System fixture plugin path must be a local absolute directory\n")
+        process.exit(2)
+    }
     writeAtomic(outputPath, {
         $schema: "https://opencode.ai/config.json",
         update: "disable",
         share: "disabled",
         compaction: { auto: false },
-        plugins: [{ package: pluginTarget }],
+        plugins: [
+            ...(systemFixturePluginDir ? [{ package: systemFixturePluginDir }] : []),
+            { package: pluginTarget },
+        ],
         providers: {
             fake: {
                 name: "ACP installed-artifact fake provider",

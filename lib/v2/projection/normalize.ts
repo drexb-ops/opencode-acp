@@ -108,6 +108,12 @@ function outgoingSystem(
     indicesByText: ReadonlyMap<string, readonly number[]>,
     claimed: Set<number>,
 ): number | undefined {
+    // OpenCode lowers every system source to an ID-less Message.system(text).
+    // The callers visit source records in source order and this list retains
+    // lowered output order, so matching the next unclaimed exact occurrence is
+    // lossless even when the same instruction text is repeated. System sources
+    // remain opaque/non-removable; extra outgoing occurrences are intentionally
+    // left unclaimed rather than attributed to another source.
     for (const index of indicesByText.get(text) ?? []) {
         if (claimed.has(index)) continue
         claimed.add(index)
@@ -660,17 +666,14 @@ export function normalizeV2ProjectedHistory(
         }
         if (draft.source.type === "system") {
             const systemText = stringValue(draft.source.text) ?? ""
-            const candidates = (outgoingSystemIndicesByText.get(systemText) ?? []).filter(
-                (index) => !claimedMessages.has(index),
-            )
-            if (candidates.length > 1) {
+            mapped = outgoingSystem(systemText, outgoingSystemIndicesByText, claimedMessages)
+            if (mapped === undefined && outgoing.length > 0) {
                 rejection ??= {
                     code: "invalid-source",
-                    message: `System source ${draft.sourceMessageId ?? draft.sourceIndex} has multiple lowered origins`,
+                    message: `System source ${draft.sourceMessageId ?? draft.sourceIndex} has no exact lowered origin`,
                     sourceIndex: draft.sourceIndex,
                 }
             }
-            mapped = outgoingSystem(systemText, outgoingSystemIndicesByText, claimedMessages)
         } else {
             mapped = outgoingById(id, outgoingIndicesById, claimedMessages)
         }

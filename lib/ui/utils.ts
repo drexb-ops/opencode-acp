@@ -2,6 +2,15 @@ import { SessionState, WithParts } from "../state"
 import { countTokens } from "../token-utils"
 import { isIgnoredUserMessage } from "../messages/query"
 
+export interface SystemPromptTokenCacheOptions {
+    /**
+     * Current request overhead supplied by a host adapter. Unlike historical
+     * assistant usage, this is authoritative for this transform and replaces
+     * any prior cache (for example after V2 compaction or a model switch).
+     */
+    authoritativeOverheadTokens?: number
+}
+
 export function formatAge(createdAt: number): string {
     const elapsed = Date.now() - createdAt
     if (elapsed < 60_000) return "just now"
@@ -53,11 +62,24 @@ export function formatProgressBar(
     return `│${bar.join("")}│`
 }
 
-export function cacheSystemPromptTokens(state: SessionState, messages: WithParts[]): void {
+export function cacheSystemPromptTokens(
+    state: SessionState,
+    messages: WithParts[],
+    options: SystemPromptTokenCacheOptions = {},
+): void {
+    if (options.authoritativeOverheadTokens !== undefined) {
+        const overhead = options.authoritativeOverheadTokens
+        state.systemPromptTokens =
+            typeof overhead === "number" && Number.isFinite(overhead) && overhead >= 0
+                ? Math.round(overhead)
+                : undefined
+        return
+    }
+
     // [FIX #255] Never overwrite a stable positive cache - after compression
     // the first visible assistant's input includes large history, inflating
     // the estimate.
-    if (state.systemPromptTokens !== undefined && state.systemPromptTokens > 0) {
+    if (state.systemPromptTokens !== undefined) {
         return
     }
 

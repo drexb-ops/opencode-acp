@@ -248,6 +248,48 @@ test("normalizes every public source category and derives assistant step markers
     )
 })
 
+test("maps repeated ID-less lowered system instructions by ordered occurrence", () => {
+    const firstSystem = Message.make({ role: "system", content: "repeat these instructions" })
+    const secondSystem = Message.make({ role: "system", content: "repeat these instructions" })
+    const user = Message.make({ id: "msg_system-user", role: "user", content: "safe request" })
+    const projection = normalize(
+        validatePublicMessages([
+            {
+                type: "system",
+                id: "msg_system-first",
+                time: { created: 1 },
+                text: "repeat these instructions",
+            },
+            userSource("msg_system-user", "safe request"),
+            {
+                type: "system",
+                id: "msg_system-second",
+                time: { created: 2 },
+                text: "repeat these instructions",
+            },
+        ]),
+        [firstSystem, user, secondSystem],
+    )
+
+    assert.equal(projection.valid, true)
+    assert.deepEqual(
+        projection.entries
+            .filter((entry) => entry.sourceType === "system")
+            .map((entry) => entry.outgoingMessageIndices),
+        [[0], [2]],
+    )
+
+    const transformed = structuredClone(projection.messages)
+    transformed.find((message) => message.info.id === "msg_system-user")!.parts[0]!.text =
+        "safe request edited"
+    const result = applyV2ContextPatch(projection, transformed)
+    assert.equal(result.accepted, true)
+    if (!result.accepted) return
+    assert.strictEqual(result.messages[0], firstSystem)
+    assert.equal(result.messages[1]?.content[0]?.text, "safe request edited")
+    assert.strictEqual(result.messages[2], secondSystem)
+})
+
 test("correlates executed and separate role-tool results by call ID", () => {
     const projected = [
         userSource("msg_u-2", "request"),

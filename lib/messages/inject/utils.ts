@@ -30,7 +30,7 @@ import {
     hasContent,
 } from "../utils"
 import { getLastUserMessage, isIgnoredUserMessage, isSyntheticMessage } from "../query"
-import { isAcpOpaquePart } from "../opaque"
+import { isAcpOpaquePart, isAcpNonRemovableMessage, isV2ProjectedMessage } from "../opaque"
 import { getActiveSummaryTokenUsage, resolveEffectiveContextLimit } from "../../state/utils"
 
 export interface LastUserModelContext {
@@ -179,6 +179,7 @@ export function isContextOverLimits(
     providerId: string | undefined,
     modelId: string | undefined,
     messages: WithParts[],
+    authoritativeCurrentTokens?: number,
 ) {
     const summaryTokenExtension = config.compress.summaryBuffer
         ? getActiveSummaryTokenUsage(state, new Set(messages.map((m) => m.info.id)))
@@ -195,7 +196,12 @@ export function isContextOverLimits(
             ? undefined
             : resolvedMaxContextLimit + summaryTokenExtension
     const minContextLimit = resolveContextTokenLimit(config, state, providerId, modelId, "min")
-    const currentTokens = getCurrentTokenUsage(state, messages)
+    const currentTokens =
+        typeof authoritativeCurrentTokens === "number" &&
+        Number.isFinite(authoritativeCurrentTokens) &&
+        authoritativeCurrentTokens >= 0
+            ? authoritativeCurrentTokens
+            : getCurrentTokenUsage(state, messages)
 
     let overMaxLimit = maxContextLimit === undefined ? false : currentTokens > maxContextLimit
     const overMinLimit = minContextLimit === undefined ? false : currentTokens >= minContextLimit
@@ -728,9 +734,13 @@ export function estimateContextComposition(
         .sort((a, b) => b.tokens - a.tokens)
 
     const systemTokens =
-        state?.systemPromptTokens !== undefined && state.systemPromptTokens > 0
+        state?.systemPromptTokens !== undefined &&
+        (state.systemPromptTokens > 0 ||
+            (state.systemPromptTokens === 0 && messages.some(isV2ProjectedMessage)))
             ? state.systemPromptTokens
-            : estimateSystemPromptTokens(messages)
+            : messages.some(isV2ProjectedMessage)
+              ? 0
+              : estimateSystemPromptTokens(messages)
 
     return {
         toolTokens,
@@ -818,6 +828,16 @@ export function buildCompressibleRanges(
         if (!ref) continue
 
         const rn = parseInt(ref.slice(1), 10)
+
+        if (isAcpNonRemovableMessage(msg)) {
+            protectedMsgInfo.push({
+                ref,
+                refNum: rn,
+                tokens: Math.round(countMessageCharacters(msg) / 4),
+                tools: ["provider-owned content"],
+            })
+            continue
+        }
 
         if (
             (protectedTools.length > 0 || protectedFilePatterns.length > 0) &&

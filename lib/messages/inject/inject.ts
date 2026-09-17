@@ -94,6 +94,7 @@ export const injectCompressNudges = (
     preCompressTokens?: number,
     candidateMessages?: WithParts[],
     effects?: DeferredMutationEffects,
+    authoritativeCurrentTokens?: number,
 ): void => {
     if (compressPermission(state, config) === "deny") {
         return
@@ -118,6 +119,7 @@ export const injectCompressNudges = (
         providerId,
         modelId,
         messages,
+        authoritativeCurrentTokens,
     )
 
     const lastUserIdx = messages.findLastIndex(

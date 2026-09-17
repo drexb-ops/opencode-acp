@@ -96,6 +96,22 @@ export function findLastCompactionTimestamp(messages: WithParts[]): number {
         if (!isMessageWithInfo(msg)) {
             continue
         }
+        const rawInfo: unknown = msg.info
+        if (
+            rawInfo !== null &&
+            typeof rawInfo === "object" &&
+            !Array.isArray(rawInfo) &&
+            "__acpV2CompactionTimestamp" in rawInfo
+        ) {
+            const nativeTimestamp = rawInfo.__acpV2CompactionTimestamp
+            if (
+                typeof nativeTimestamp === "number" &&
+                Number.isFinite(nativeTimestamp) &&
+                nativeTimestamp > 0
+            ) {
+                return nativeTimestamp
+            }
+        }
         if (msg.info.role === "assistant" && msg.info.summary === true) {
             return msg.info.time.created
         }

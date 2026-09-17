@@ -1,6 +1,7 @@
 import type { SessionState, WithParts } from "../state"
 import type { Logger } from "../logger"
 import type { PluginConfig } from "../config"
+import { isAcpNonRemovableMessage } from "./opaque"
 
 export const prune = (
     state: SessionState,
@@ -49,15 +50,15 @@ const stripStepMarkers = (messages: WithParts[]): void => {
     }
 }
 
-const filterCompressedRanges = (
-    state: SessionState,
-    messages: WithParts[],
-): void => {
+const filterCompressedRanges = (state: SessionState, messages: WithParts[]): void => {
     if (state.prune.messages.byMessageId.size === 0) {
         return
     }
 
     const survive: boolean[] = messages.map((msg) => {
+        // Older persisted blocks may claim an opaque V2 source. Keep it visible
+        // throughout budgeting as well as patching; restoration is a last guard.
+        if (isAcpNonRemovableMessage(msg)) return true
         const pruneEntry = state.prune.messages.byMessageId.get(msg.info.id)
         if (!pruneEntry || pruneEntry.activeBlockIds.length === 0) {
             return true

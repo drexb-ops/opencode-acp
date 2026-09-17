@@ -1,19 +1,33 @@
-import type { Plugin as V2Api } from "@opencode/plugin"
 import { findV2BiliProxyProviders } from "../bili-proxy"
 import type { Logger } from "../logger"
+import {
+    detectV2CatalogCapabilities,
+    isV2CatalogUpdateEvent,
+    v2CatalogListEntries,
+    type V2CatalogCapabilities,
+} from "./capabilities"
+import type { V2Context } from "./host"
 
-export type V2Context = Parameters<V2Api.Plugin["setup"]>[0]
+export type { V2Context } from "./host"
 
 export interface V2ProxyState {
     disabled: boolean
 }
 
-export async function catalogHasV2BiliProxy(context: V2Context): Promise<boolean> {
+export async function catalogHasV2BiliProxy(
+    context: V2Context,
+    capabilities = detectV2CatalogCapabilities(context),
+): Promise<boolean> {
     const [providers, models] = await Promise.all([
-        context.catalog.provider.list(),
-        context.catalog.model.list(),
+        capabilities.listProviders(),
+        capabilities.listModels(),
     ])
-    return findV2BiliProxyProviders(providers, models).length > 0
+    return (
+        findV2BiliProxyProviders(
+            v2CatalogListEntries(providers, "provider"),
+            v2CatalogListEntries(models, "model"),
+        ).length > 0
+    )
 }
 
 export async function initializeV2ProxyState(
@@ -40,6 +54,18 @@ export function startV2ProxyMonitor(
     logger: Logger,
     onChanged: (disabled: boolean, previousDisabled: boolean) => Promise<void> | void,
 ): { stop(): Promise<void> } {
+    let capabilities: V2CatalogCapabilities
+    try {
+        capabilities = detectV2CatalogCapabilities(context)
+        if (!capabilities.providerAvailable || !capabilities.modelAvailable) {
+            throw new Error("provider and model list capabilities are both required")
+        }
+    } catch (error) {
+        logger.warn("V2 catalog proxy monitor unavailable", {
+            error: error instanceof Error ? error.message : String(error),
+        })
+        return { stop: async () => {} }
+    }
     const controller = new AbortController()
     let stopped = false
     const subscription = context.event.subscribe({ signal: controller.signal })
@@ -50,10 +76,11 @@ export function startV2ProxyMonitor(
                 const result = await iterator.next()
                 if (result.done) return
                 const event = result.value
-                if (controller.signal.aborted || event.type !== "catalog.updated") continue
+                if (controller.signal.aborted || !isV2CatalogUpdateEvent(capabilities, event))
+                    continue
                 let nextDisabled: boolean
                 try {
-                    nextDisabled = await catalogHasV2BiliProxy(context)
+                    nextDisabled = await catalogHasV2BiliProxy(context, capabilities)
                 } catch (error) {
                     logger.warn("V2 catalog proxy refresh failed; retaining prior state", {
                         error: error instanceof Error ? error.message : String(error),

@@ -911,7 +911,7 @@ test("rejects missing lowered correlation, duplicate transformed IDs, and duplic
         { type: "system", id: "correlation-system", time: { created: 1 }, text: "expected system" },
         { type: "user", id: "correlation-user", time: { created: 2 }, text: "user" },
     ]
-    const correlationProjection = normalizeV2ProjectedHistory(
+    const invalidProjection = normalizeV2ProjectedHistory(
         opaqueProjected,
         [
             Message.make({ role: "system", content: "different system" }),
@@ -919,8 +919,30 @@ test("rejects missing lowered correlation, duplicate transformed IDs, and duplic
         ],
         { sessionID: "missing-correlation", currentModel: model },
     )
+    assert.equal(invalidProjection.valid, false)
+    assert.match(invalidProjection.rejection?.message ?? "", /no exact lowered origin/)
+    const correlationProjection = normalizeV2ProjectedHistory(
+        opaqueProjected,
+        [
+            Message.make({ role: "system", content: "expected system" }),
+            Message.make({ id: "correlation-user", role: "user", content: "user" }),
+        ],
+        { sessionID: "missing-correlation", currentModel: model },
+    )
     assert.equal(correlationProjection.valid, true)
-    const missingCorrelation = restoreMissingV2OpaqueSources(correlationProjection, [])
+    // Simulate lost sidecar correlation after a valid normalization: restoration
+    // still must not invent an outgoing owner even when projection.valid was true.
+    const missingCorrelation = restoreMissingV2OpaqueSources(
+        {
+            ...correlationProjection,
+            entries: correlationProjection.entries.map((entry) =>
+                entry.sourceMessageId === "correlation-system"
+                    ? { ...entry, outgoingMessageIndices: [] }
+                    : entry,
+            ),
+        },
+        [],
+    )
     assert.equal(missingCorrelation.accepted, false)
     if (!missingCorrelation.accepted)
         assert.match(missingCorrelation.reason, /exact lowered correlation/)

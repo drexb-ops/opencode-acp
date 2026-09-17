@@ -7,6 +7,34 @@ import {
     isToolNameProtected,
 } from "../protected-patterns"
 import type { SearchContext, SelectionResolution } from "./types"
+import { isAcpNonRemovableMessage } from "../messages/opaque"
+
+/** Do not count provider-owned sources which the V2 patcher must restore unchanged. */
+export function filterNonRemovableMessages(
+    selection: SelectionResolution,
+    searchContext: SearchContext,
+): SelectionResolution {
+    const removed = new Set(
+        selection.messageIds.filter((id) =>
+            isAcpNonRemovableMessage(searchContext.rawMessagesById.get(id)),
+        ),
+    )
+    if (removed.size === 0) return selection
+    const toolIds = new Set<string>()
+    for (const id of removed) {
+        for (const part of searchContext.rawMessagesById.get(id)?.parts ?? []) {
+            if (part.type === "tool") toolIds.add(part.callID)
+        }
+    }
+    return {
+        ...selection,
+        messageIds: selection.messageIds.filter((id) => !removed.has(id)),
+        messageTokenById: new Map(
+            [...selection.messageTokenById].filter(([id]) => !removed.has(id)),
+        ),
+        toolIds: selection.toolIds.filter((id) => !toolIds.has(id)),
+    }
+}
 
 export function appendProtectedUserMessages(
     summary: string,

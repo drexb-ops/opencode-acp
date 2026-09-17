@@ -25,6 +25,7 @@ import {
 import { fetchSessionMessages } from "./search"
 import { hideConsumedCompressCalls } from "./hide-consumed"
 import { estimateSystemPromptTokens } from "../token-utils"
+import { hasV2NativePrefix, isV2ProjectedMessage } from "../messages/opaque"
 
 const ACP_STATUS_TOOL_DESCRIPTION = `Show context status — overview includes compressible ranges (compression candidates when compress.candidates is enabled).
 
@@ -196,9 +197,13 @@ function collectVisibleMessages(
         messages: result,
         summaryTokens,
         systemTokens:
-            ctx.state.systemPromptTokens !== undefined && ctx.state.systemPromptTokens > 0
+            ctx.state.systemPromptTokens !== undefined &&
+            (ctx.state.systemPromptTokens > 0 ||
+                (ctx.state.systemPromptTokens === 0 && rawMessages.some(isV2ProjectedMessage)))
                 ? ctx.state.systemPromptTokens
-                : estimateSystemPromptTokens(rawMessages),
+                : rawMessages.some(isV2ProjectedMessage)
+                  ? 0
+                  : estimateSystemPromptTokens(rawMessages),
     }
 }
 
@@ -239,6 +244,19 @@ function renderOverview(
         const reasoningPct = pct(totalReasoning, total)
 
         lines.push("CONTEXT BREAKDOWN")
+        if (rawMessages.some(isV2ProjectedMessage)) {
+            lines.push("  Projected estimate; system includes cached tool-schema overhead.")
+            if (hasV2NativePrefix(rawMessages)) {
+                lines.push(
+                    "  Partial history: the native checkpoint prefix is preserved but is outside this breakdown.",
+                )
+            }
+            if (ctx.state.systemPromptTokens === undefined) {
+                lines.push(
+                    "  System/tool overhead unavailable until an accepted V2 context request.",
+                )
+            }
+        }
         lines.push(
             `  ${formatTokens(systemTokens)} system (${sysPct}%) | ${formatTokens(totalTool)} tool (${toolPct}%) | ${formatTokens(totalText)} text (${textPct}%) | ${formatTokens(summaryTokens)} summaries (${summaryPct}%) | ${formatTokens(totalReasoning)} reasoning (${reasoningPct}%)`,
         )
@@ -268,6 +286,17 @@ function renderOverview(
         )
         const header = `COMPRESSED BLOCKS — ${blocks.length} active (${formatTokens(totalSummary)} summary, ${formatTokens(totalEffective)} original)`
         lines.push(header)
+        if (rawMessages.some(isV2ProjectedMessage)) {
+            const visible = new Set(rawMessages.map((message) => message.info.id))
+            const archived = blocks.filter(
+                (block) => !block.effectiveMessageIds.some((id) => visible.has(id)),
+            ).length
+            if (archived > 0) {
+                lines.push(
+                    `  ${archived} active block(s) are outside current projected history; stored totals are historical, not current wire savings.`,
+                )
+            }
+        }
         const breakdown = tierBreakdown(blocks)
         if (breakdown) {
             lines.push(`  Tier usage: ${breakdown}`)

@@ -16,3 +16,5 @@ import { join } from "node:path"
 
 process.env.XDG_CONFIG_HOME = mkdtempSync(join(tmpdir(), "acp-test-config-"))
 process.env.XDG_DATA_HOME = mkdtempSync(join(tmpdir(), "acp-test-data-"))
+// An inherited config-dir override would bypass the sandboxed global config.
+delete process.env.OPENCODE_CONFIG_DIR

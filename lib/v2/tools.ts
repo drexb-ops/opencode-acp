@@ -50,7 +50,11 @@ function errorMessage(error: unknown): string {
 }
 
 function errorResult(message: string, metadata: Record<string, unknown>): V2ToolResult {
-    return { content: message, metadata }
+    const acpError =
+        typeof metadata.acpError === "string" && metadata.acpError.trim()
+            ? metadata.acpError
+            : "resolved-error"
+    return { content: message, metadata: { ...metadata, acpError } }
 }
 
 function resultMetadata(

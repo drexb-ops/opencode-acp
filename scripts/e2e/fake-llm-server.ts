@@ -21,6 +21,7 @@
  */
 
 import { readFileSync, writeFileSync, existsSync } from "fs"
+import { classifyToolResult } from "./tool-result-classifier.mjs"
 
 declare const Bun: {
     serve(options: {
@@ -55,6 +56,8 @@ interface ScenarioStep {
     }
     /** For compress: "all" to compress everything, or explicit [startIdx, endIdx] of mNNNNN refs */
     range?: "all" | [number, number]
+    /** Select the ID-tagged message containing this exact fixture sentinel. */
+    targetSentinel?: string
     /** For batch compress: multiple ranges */
     ranges?: Array<{ summary: string; topic?: string; range?: "all" | [number, number] }>
     /** For task: subagent spawn parameters */
@@ -97,6 +100,15 @@ interface Scenario {
     /** Number of ACP-enabled model requests that should receive text first. */
     warmupTurns?: number
     warmupText?: string
+}
+
+interface ReliabilityObservation {
+    targetedOriginalPresent: boolean
+    compressionSummaryPresent: boolean
+    protectedRecentPresent: boolean
+    shellStdoutAndExitStatusPresent: boolean
+    shellToolCallHasNoProse: boolean
+    shellToolCallHasAcpIdBeforeOpaqueCall: boolean
 }
 
 const scenario: Scenario = JSON.parse(readFileSync(SCENARIO_PATH, "utf-8"))
@@ -142,12 +154,16 @@ export interface RequestObservation {
     commandSentinelLeakage: boolean
     /** An ACP-owned synthetic notice reached this model request. */
     acpOwnedNoticePresent: boolean
+    /** The private deterministic V2 nudge-system fixture was visible. */
+    fixedSystemFixturePresent: boolean
     /** Tool calls already present in the incoming conversation. */
     calledToolNames: string[]
     /** Redacted tool-call shape; argument payloads are never recorded. */
     toolParameterObservations: ToolParameterObservation[]
     /** Statuses of tool results present in the incoming conversation. */
     toolResultStatuses: ToolResultObservation[]
+    /** Payload-free evidence used by the V2 multipart reliability scenario. */
+    reliability: ReliabilityObservation
 }
 
 export interface ToolResultObservation {
@@ -232,9 +248,11 @@ function recordObservation(
         summaryMarkerPresent: hasSummaryMarker(messages),
         commandSentinelLeakage: hasCommandSentinel(body),
         acpOwnedNoticePresent: hasAcpOwnedNotice(messages),
+        fixedSystemFixturePresent: hasFixedSystemFixture(body),
         calledToolNames: calledNames,
         toolParameterObservations,
         toolResultStatuses,
+        reliability: inspectReliabilityEvidence(messages),
     })
     for (const result of toolResultStatuses) {
         observations.toolResults.push(result)
@@ -567,7 +585,14 @@ function handleCompressStep(
         )
     }
 
-    const [startId, endId] = resolveRange(refs, step.range ?? "all")
+    const range = step.targetSentinel
+        ? resolveRangeContainingSentinel(messages, step.targetSentinel)
+        : resolveRange(refs, step.range ?? "all")
+    if (!range) {
+        log("  ⚠ target sentinel had no message-ID tag — emitting fallback text")
+        return textResponse(model, "No tagged compression target found.", isStream, inputTokens)
+    }
+    const [startId, endId] = range
     const content = [
         {
             topic: step.topic ?? "Compression",
@@ -751,12 +776,7 @@ function inspectToolResults(messages: any[]): ToolResultObservation[] {
         const text = extractMessageText(message)
         const id = typeof message?.tool_call_id === "string" ? message.tool_call_id : undefined
         const name = normalizeToolName(message?.name) ?? (id ? namesByCallId.get(id) : undefined)
-        const status =
-            /(?:^|\n)\s*(?:error:|ACP cannot request|ACP tool execution is disabled|ACP .* execution failed|permission .* blocked|invalid .* input|COMPRESSION REJECTED|QUALITY GATE FAILURE)/i.test(
-                text,
-            )
-                ? "error"
-                : "completed"
+        const status = classifyToolResult(name, text)
         const actionable = /permission|allow|deny/i.test(text)
         results.push({ ...(name ? { name } : {}), status, actionable })
     }
@@ -866,6 +886,76 @@ function hasAcpOwnedNotice(messages: any[]): boolean {
         const metadata = JSON.stringify(message?.metadata ?? {})
         return message?.id?.startsWith("msg_acp_notice_") || metadata.includes('"acpOwned":true')
     })
+}
+
+function hasFixedSystemFixture(body: any): boolean {
+    return systemText(body).includes("ACP_E2E_FIXED_NUDGE_SYSTEM_FIXTURE")
+}
+
+const RELIABILITY_TARGETED_ORIGINAL = "V2_RELIABILITY_TARGETED_ORIGINAL_SENTINEL"
+const RELIABILITY_COMPRESSION_SUMMARY = "V2_RELIABILITY_COMPRESSION_SUMMARY_SENTINEL"
+const RELIABILITY_PROTECTED_RECENT = "V2_RELIABILITY_PROTECTED_RECENT_SENTINEL"
+const RELIABILITY_SHELL_STDOUT = "V2_RELIABILITY_SHELL_STDOUT_SENTINEL"
+const RELIABILITY_SHELL_EXIT_STATUS = "Command exited with code 0."
+const DCP_MESSAGE_ID_TAG = /<dcp-message-id[^>]*>[^<]+<\/dcp-message-id>/g
+
+function directMessageText(message: any): string {
+    if (typeof message?.content === "string") return message.content
+    if (!Array.isArray(message?.content)) return ""
+    return message.content
+        .map((part: any) => {
+            if (typeof part === "string") return part
+            if (typeof part?.text === "string") return part.text
+            if (typeof part?.content === "string") return part.content
+            return ""
+        })
+        .join("")
+}
+
+function toolCallNames(message: any): string[] {
+    if (!Array.isArray(message?.tool_calls)) return []
+    return message.tool_calls
+        .map((call: any) => normalizeToolName(call?.function?.name ?? call?.name))
+        .filter((name): name is string => name !== undefined)
+}
+
+function inspectReliabilityEvidence(messages: any[]): ReliabilityObservation {
+    const serialized = JSON.stringify(messages)
+    let shellToolCallHasNoProse = false
+    let shellToolCallHasAcpIdBeforeOpaqueCall = false
+
+    for (let index = 0; index < messages.length; index++) {
+        const message = messages[index]
+        if (message?.role !== "assistant" || !toolCallNames(message).includes("shell")) continue
+        const directText = directMessageText(message)
+        const nonAcpText = directText.replace(DCP_MESSAGE_ID_TAG, "").trim()
+        shellToolCallHasNoProse ||= nonAcpText.length === 0
+        const previous = messages[index - 1]
+        const hasOwnId = DCP_MESSAGE_ID_TAG.test(directText)
+        DCP_MESSAGE_ID_TAG.lastIndex = 0
+        const hasStandalonePriorId =
+            previous?.role === "assistant" &&
+            toolCallNames(previous).length === 0 &&
+            DCP_MESSAGE_ID_TAG.test(directMessageText(previous))
+        DCP_MESSAGE_ID_TAG.lastIndex = 0
+        shellToolCallHasAcpIdBeforeOpaqueCall ||= hasOwnId || hasStandalonePriorId
+    }
+
+    return {
+        targetedOriginalPresent: serialized.includes(RELIABILITY_TARGETED_ORIGINAL),
+        compressionSummaryPresent: serialized.includes(RELIABILITY_COMPRESSION_SUMMARY),
+        protectedRecentPresent: serialized.includes(RELIABILITY_PROTECTED_RECENT),
+        shellStdoutAndExitStatusPresent: messages.some((message) => {
+            const text = directMessageText(message)
+            return (
+                (message?.role === "tool" || message?.role === "function") &&
+                text.includes(RELIABILITY_SHELL_STDOUT) &&
+                text.includes(RELIABILITY_SHELL_EXIT_STATUS)
+            )
+        }),
+        shellToolCallHasNoProse,
+        shellToolCallHasAcpIdBeforeOpaqueCall,
+    }
 }
 
 function hasAdvertisedAcpTools(body: any): boolean {
@@ -1135,6 +1225,22 @@ function parseMessageRefs(messages: any[]): string[] {
     }
 
     return refs
+}
+
+function resolveRangeContainingSentinel(
+    messages: any[],
+    sentinel: string,
+): [string, string] | undefined {
+    const tagRegex = /<dcp-message-id[^>]*>(m\d+)<\/dcp-message-id>/g
+    for (const message of messages) {
+        const text = extractMessageText(message)
+        if (!text.includes(sentinel)) continue
+        const refs: string[] = []
+        let match: RegExpExecArray | null
+        while ((match = tagRegex.exec(text)) !== null) refs.push(match[1]!)
+        if (refs.length > 0) return [refs[0]!, refs.at(-1)!]
+    }
+    return undefined
 }
 
 function parseCompressionCandidate(

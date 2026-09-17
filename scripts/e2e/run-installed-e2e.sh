@@ -703,7 +703,14 @@ run_v1_checks() {
 
 write_v2_route() {
     local base_url="$1"
-    "$NODE_BIN" "$SCRIPT_DIR/installed-config.mjs" v2 "$V2_CONFIG_FILE" "$CURRENT_PLUGIN_TARGET" "$base_url" allow "$V2_STORAGE" "$V2_WORKSPACE"
+    local system_fixture_dir="${2:-}"
+    local fixture_args=()
+    if [[ -n "$system_fixture_dir" ]]; then
+        [[ "$system_fixture_dir" == "$V2_ROOT/"* && -d "$system_fixture_dir" && ! -L "$system_fixture_dir" ]] || \
+            die "V2 system fixture must be a private non-symlink directory"
+        fixture_args=(--system-fixture "$system_fixture_dir")
+    fi
+    "$NODE_BIN" "$SCRIPT_DIR/installed-config.mjs" v2 "$V2_CONFIG_FILE" "$CURRENT_PLUGIN_TARGET" "$base_url" allow "$V2_STORAGE" "$V2_WORKSPACE" "${fixture_args[@]}"
 }
 
 run_v2_checks() {
@@ -821,6 +828,16 @@ run_v2_nudge_growth() {
     step "run installed V2 nudge/growth/compress/refire cycle"
     V2_NUDGE_OBSERVATIONS="$V2_ROOT/nudge-observations.json"
     V2_NUDGE_COUNTER="$V2_ROOT/nudge-turn-counter"
+    V2_NUDGE_SYSTEM_FIXTURE="$V2_ROOT/nudge-system-fixture"
+    [[ "$V2_NUDGE_SYSTEM_FIXTURE" == "$V2_ROOT/"* && ! -L "$V2_NUDGE_SYSTEM_FIXTURE" ]] || \
+        die "V2 nudge system fixture escaped its private host root"
+    "$NODE_BIN" "$SCRIPT_DIR/installed-config.mjs" system-fixture "$V2_NUDGE_SYSTEM_FIXTURE"
+    [[ -f "$V2_NUDGE_SYSTEM_FIXTURE/package.json" && -f "$V2_NUDGE_SYSTEM_FIXTURE/server.js" ]] || \
+        die "V2 nudge system fixture was not created"
+    # Configured package order is registration order in OpenCode 2.0.3. Load
+    # this E2E-only system fixture before ACP so ACP sees fixed host system
+    # text; tools and every ACP hook remain otherwise unchanged.
+    write_v2_route "http://127.0.0.1:$V2_FAKE_PORT/v1" "$V2_NUDGE_SYSTEM_FIXTURE"
     # This is intentionally a separate installed session/config from the main
     # matrix. It keeps preserveRecentMessages > 0 and the small growth floor
     # scoped to the mandatory nudge proof without weakening the existing tool
@@ -844,7 +861,42 @@ run_v2_nudge_growth() {
     FAKE_PID=""
     stop_owned_pid "$V2_PID"
     V2_PID=""
+    # Subsequent reliability and permission sessions use the ordinary private
+    # host configuration; the fixed-system fixture is nudge-stage-only.
+    write_v2_route "http://127.0.0.1:$V2_FAKE_PORT/v1"
     pass "installed V2 nudge growth cycle preserved baselines and refired after two real compressions"
+}
+
+run_v2_reliability() {
+    step "run installed V2 multipart-shell compression reliability proof"
+    V2_RELIABILITY_OBSERVATIONS="$V2_ROOT/reliability-observations.json"
+    V2_RELIABILITY_COUNTER="$V2_ROOT/reliability-turn-counter"
+    # Keep this separate from the main/proxy/permission and nudge scenarios.
+    # Four recent host messages are intentionally non-removable. The selected
+    # older assistant record is resolved by its ID-tagged sentinel; the
+    # ordinary multipart shell result remains as an unselected opaque source.
+    # The quality gate is disabled only to keep this a wire reliability proof
+    # rather than a quality-algorithm fixture.
+    "$NODE_BIN" "$SCRIPT_DIR/installed-config.mjs" acp \
+        "$V2_ACP_CONFIG" "$CURRENT_PLUGIN_TARGET" "" allow "$V2_STORAGE" "$V2_WORKSPACE" \
+        "" 4 6000 5000 false
+    rm -f -- "$V2_RELIABILITY_OBSERVATIONS" "$V2_RELIABILITY_COUNTER"
+    start_fake \
+        "$V2_ROOT" \
+        "$V2_FAKE_PORT" \
+        "$SCRIPT_DIR/installed-scenarios/v2-reliability.json" \
+        "$V2_RELIABILITY_COUNTER" \
+        "$V2_RELIABILITY_OBSERVATIONS" \
+        "$V2_ROOT/logs/reliability-fake.log"
+    start_v2
+    E2E_ACTIVE_OBSERVATIONS="$V2_RELIABILITY_OBSERVATIONS"
+    run_v2_stage reliability
+    unset E2E_ACTIVE_OBSERVATIONS
+    stop_owned_pid "$FAKE_PID"
+    FAKE_PID=""
+    stop_owned_pid "$V2_PID"
+    V2_PID=""
+    pass "installed V2 reliability proof removed original wire content while preserving summary and shell result"
 }
 
 run_v2_permission_case() {
@@ -1007,6 +1059,7 @@ CURRENT_PLUGIN_TARGET="$ACP_TGZ_URL"
 run_v1_checks
 run_v2_checks
 run_v2_nudge_growth
+run_v2_reliability
 for permission in allow deny ask; do
     run_v2_permission_case "$permission"
 done

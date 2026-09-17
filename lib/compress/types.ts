@@ -3,13 +3,20 @@ import type { HostServices } from "../host"
 import { createLegacyHostServices } from "../host/legacy"
 import type { Logger } from "../logger"
 import type { PromptStore } from "../prompts/store"
-import type { CompressionBlock, CompressionMode, SessionState, WithParts } from "../state"
+import type {
+    CompressionBlock,
+    CompressionMode,
+    SessionMutationOptions,
+    SessionState,
+    WithParts,
+} from "../state"
 import {
     cloneSessionState,
     commitSessionState,
     DeferredMutationEffects,
 } from "../state/transaction"
 import { saveSessionState } from "../state/persistence"
+import { filterMessages } from "../messages/shape"
 import type { PendingCompressionDuration } from "./timing"
 import { QualityGateRejectionError } from "./quality-gate/rejection"
 import type { z } from "zod"
@@ -50,6 +57,20 @@ export interface ToolStateRegistry {
         sessionID: string,
         operation: (state: SessionState) => Promise<T> | T,
     ): Promise<T>
+    /**
+     * V2 direct tools must reserve, hydrate, and execute as one transaction.
+     * Optional so lightweight and V1-compatible registry fixtures retain their
+     * historical interface.
+     */
+    withSessionMutationAndInitialize?<T>(
+        sessions: HostServices["sessions"],
+        sessionID: string,
+        loadHistory: () => WithParts[] | Promise<WithParts[]>,
+        historyToMessages: (history: WithParts[]) => WithParts[] | undefined,
+        config: PluginConfig | undefined,
+        operation: (state: SessionState, history: WithParts[]) => Promise<T> | T,
+        options?: SessionMutationOptions<T>,
+    ): Promise<T | undefined>
 }
 
 export interface ToolAskInput {
@@ -110,6 +131,36 @@ export function resolveToolHost(ctx: ToolContext): HostServices {
     return ctx.host ?? createLegacyHostServices(legacyClient)
 }
 
+interface ToolTransaction {
+    effects: DeferredMutationEffects
+    isActive: () => boolean
+    /** A V2 reservation's fixed, filtered history for its target session. */
+    reservedHistory?: WithParts[]
+}
+
+function withReservedSessionHistory(
+    host: HostServices,
+    sessionID: string,
+    reservedHistory: WithParts[] | undefined,
+): HostServices {
+    if (!reservedHistory) return host
+
+    // Scope the snapshot to one ToolContext.  Other sessions and parent-history
+    // reads stay delegated to the real host; no process-wide cache is involved.
+    return {
+        ...host,
+        sessions: {
+            get: (requestedSessionID) => host.sessions.get(requestedSessionID),
+            messages: (requestedSessionID) =>
+                requestedSessionID === sessionID
+                    ? Promise.resolve(reservedHistory)
+                    : host.sessions.messages(requestedSessionID),
+            parentMessages: (requestedSessionID) =>
+                host.sessions.parentMessages(requestedSessionID),
+        },
+    }
+}
+
 // [FIX #33] Resolve the caller's per-session state at tool-call time and build a
 // ToolContext bound to it. A compress tool can only run after messages.transform
 // initialized the session, so the state is guaranteed present.
@@ -117,9 +168,13 @@ export function resolveToolContext(
     factoryCtx: ToolFactoryContext,
     sessionID: string,
     stateOverride?: SessionState,
-    transaction?: { effects: DeferredMutationEffects; isActive: () => boolean },
+    transaction?: ToolTransaction,
 ): ToolContext {
-    const host = resolveFactoryHost(factoryCtx)
+    const host = withReservedSessionHistory(
+        resolveFactoryHost(factoryCtx),
+        sessionID,
+        transaction?.reservedHistory,
+    )
     const state = stateOverride ?? factoryCtx.registry.get(sessionID)
     if (!state) {
         throw new Error(
@@ -171,30 +226,80 @@ export async function withToolSessionMutation<T>(
     operation: (ctx: ToolContext) => Promise<T> | T,
 ): Promise<T> {
     const active = toolCtx.isActive
+    type TimingSnapshot = {
+        pending: Map<
+            string,
+            { entry: PendingCompressionDuration; snapshot: PendingCompressionDuration }
+        >
+        starts: Map<string, number>
+    }
+    type V2MutationAttempt = {
+        result: T
+        working: SessionState
+        effects: DeferredMutationEffects
+        timing: TimingSnapshot
+        accepted: boolean
+    }
+
+    const runV2Attempt = async (
+        state: SessionState,
+        inheritedEffects?: DeferredMutationEffects,
+        reservedHistory?: WithParts[],
+    ): Promise<V2MutationAttempt> => {
+        if (!active || !active()) throw new Error("ACP tool operation is no longer active")
+
+        const working = cloneSessionState(state)
+        const timing: TimingSnapshot = {
+            pending: new Map(
+                [...state.compressionTiming.pendingByCallId].map(([key, entry]) => [
+                    key,
+                    { entry, snapshot: { ...entry } },
+                ]),
+            ),
+            starts: new Map(state.compressionTiming.startsByCallId),
+        }
+        const effects = inheritedEffects ?? new DeferredMutationEffects()
+        const context = resolveToolContext(factoryCtx, toolCtx.sessionID, working, {
+            effects,
+            isActive: active,
+            reservedHistory,
+        })
+        try {
+            const result = await operation(context)
+            const accepted = active()
+            if (!accepted) restoreSharedTiming(state, timing.pending, timing.starts)
+            return { result, working, effects, timing, accepted }
+        } catch (error) {
+            restoreSharedTiming(state, timing.pending, timing.starts)
+            throw error
+        }
+    }
+
+    const flushAcceptedV2Attempt = async (
+        state: SessionState,
+        attempt: V2MutationAttempt,
+    ): Promise<void> => {
+        if (!active || !active()) return
+        if (attempt.effects.persistenceRequested) {
+            if (!active()) return
+            await saveSessionState(state, factoryCtx.logger)
+        }
+        if (!active()) return
+        await attempt.effects.run(active)
+    }
+
     const run = async (state: SessionState): Promise<T> => {
         // V1 does not provide a lifecycle fence. Keep its historical live-state
         // behavior and avoid introducing a transaction boundary into that path.
         if (!active) return operation(resolveToolContext(factoryCtx, toolCtx.sessionID, state))
-        if (!active()) throw new Error("ACP tool operation is no longer active")
-
-        const working = cloneSessionState(state)
-        const pendingTimingBefore = new Map(
-            [...state.compressionTiming.pendingByCallId].map(([key, entry]) => [
-                key,
-                { entry, snapshot: { ...entry } },
-            ]),
-        )
-        const startsBefore = new Map(state.compressionTiming.startsByCallId)
-        const effects = new DeferredMutationEffects()
-        const context = resolveToolContext(factoryCtx, toolCtx.sessionID, working, {
-            effects,
-            isActive: active,
-        })
-        let result: T
         try {
-            result = await operation(context)
+            const attempt = await runV2Attempt(state)
+            if (!attempt.accepted) return attempt.result
+
+            commitSessionState(state, attempt.working)
+            await flushAcceptedV2Attempt(state, attempt)
+            return attempt.result
         } catch (error) {
-            restoreSharedTiming(state, pendingTimingBefore, startsBefore)
             // A quality rejection is deliberately retryable.  Keep only its
             // retry marker on the live V2 state; all other working-state,
             // timing, persistence, and host effects stay speculative.  V1 has
@@ -204,20 +309,33 @@ export async function withToolSessionMutation<T>(
             }
             throw error
         }
-        if (!active()) {
-            restoreSharedTiming(state, pendingTimingBefore, startsBefore)
-            return result
-        }
+    }
 
-        commitSessionState(state, working)
-        if (!active()) return result
-        if (effects.persistenceRequested) {
-            if (!active()) return result
-            await saveSessionState(working, context.logger)
-        }
-        if (!active()) return result
-        await effects.run(active)
-        return result
+    if (active && factoryCtx.registry.withSessionMutationAndInitialize) {
+        const host = resolveFactoryHost(factoryCtx)
+        // Initialization can request persistence when it restores persisted
+        // state. Share one deferred collector with the tool operation so even
+        // that write waits for the operation's accepted commit.
+        const effects = new DeferredMutationEffects()
+        const attempt = await factoryCtx.registry.withSessionMutationAndInitialize(
+            host.sessions,
+            toolCtx.sessionID,
+            async () => filterMessages(await host.sessions.messages(toolCtx.sessionID)),
+            (history) => history,
+            factoryCtx.config,
+            async (state, history) => runV2Attempt(state, effects, history),
+            {
+                effects,
+                isActive: active,
+                commitResult: (result) => result.accepted,
+                commit: (state, result) => commitSessionState(state, result.working),
+                postCommit: (state, result) => flushAcceptedV2Attempt(state, result),
+                retainQualityGateRetry: (error) =>
+                    error instanceof QualityGateRejectionError && active(),
+            },
+        )
+        if (!attempt) throw new Error("ACP tool operation is no longer active")
+        return attempt.result
     }
     if (factoryCtx.registry.withSessionMutation) {
         return factoryCtx.registry.withSessionMutation(toolCtx.sessionID, run)

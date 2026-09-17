@@ -25,7 +25,7 @@ import {
     type SessionStateRegistry,
 } from "./state"
 import { DeferredMutationEffects } from "./state/transaction"
-import { runMessageTransform } from "./messages/transform"
+import { runMessageTransform, type MessageTransformTokenAccounting } from "./messages/transform"
 
 const INTERNAL_AGENT_SIGNATURES = [
     "You are a title generator",
@@ -75,6 +75,7 @@ export async function prepareMessageTransformTransaction(
     debugNotify?: (text: string) => void | Promise<void>,
     sanitizeAssistantTextOnly = false,
     effects?: DeferredMutationEffects,
+    tokenAccounting?: MessageTransformTokenAccounting,
 ): Promise<PreparedMessageTransformTransaction> {
     const workingMessages = structuredClone(messages) as WithParts[]
     const workingState = cloneSessionState(state)
@@ -95,6 +96,7 @@ export async function prepareMessageTransformTransaction(
             effects: transactionEffects,
             debugNotify,
             sanitizeAssistantTextOnly,
+            tokenAccounting,
         },
     )
 

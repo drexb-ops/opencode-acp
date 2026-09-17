@@ -4,6 +4,7 @@ import type { PluginConfig } from "../config"
 import { countMessageCharacters } from "../token-utils"
 import {
     filterLastUserMessage,
+    filterNonRemovableMessages,
     filterProtectedRecentMessages,
     filterProtectedToolMessages,
 } from "./protected-content"
@@ -151,6 +152,10 @@ export function prepareExecutableRangePlans(
     const plans = resolvedPlans
         .map((plan) => ({
             ...plan,
+            selection: filterNonRemovableMessages(plan.selection, searchContext),
+        }))
+        .map((plan) => ({
+            ...plan,
             selection: filterProtectedToolMessages(
                 plan.selection,
                 searchContext,
@@ -175,7 +180,7 @@ export function prepareExecutableRangePlans(
 
     if (plans.length === 0) {
         throw new Error(
-            "All selected messages were filtered out (protected tool outputs and/or the last user message). They must remain in visible context.",
+            "All selected messages were filtered out (non-removable provider-owned sources, protected tool outputs, recent messages and/or the last user message). They must remain in visible context.",
         )
     }
 

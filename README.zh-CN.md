@@ -99,7 +99,7 @@ ACP 将上下文管理的所有权限全部交给模型自己，而不依靠外�
     }
     ```
 
-- **OpenCode V2（`>=2.0.3`）** — 使用原生 `plugins` 配置：
+- **OpenCode V2（安装宿主验证版本：`2.0.3`）** — 使用原生 `plugins` 配置：
 
     ```json
     {
@@ -142,6 +142,18 @@ OpenCode V2.0.3 不向 server plugin 暴露创建原生权限请求的能力。�
 OpenCode V2.0.3 没有在 assistant 完成文本持久化或显示前重写它的能力。因此，
 ACP 只会在历史 assistant 文本重新组装到发往模型的上下文时，清理模型臆造的
 ACP/DCP 标签；不会重写持久化历史或已显示的 transcript。
+
+V2 直接工具可在插件重新加载后恢复持久化会话状态，无需先执行上下文转换。
+不可移除的 provider 内容不会成为压缩目标。上下文诊断使用当前请求的估算；
+保存的压缩块统计属于历史记录，不代表这些原文仍在当前上下文窗口中。
+
+对于原生 provider checkpoint，OpenCode 的公开历史可能不同于模型实际回放的
+窗口。ACP 仅处理 checkpoint 之后可独立关联的消息，并原样保留原生或重新展开
+的前缀。如果没有可安全处理的后续消息，则保留请求并记录明确诊断；checkpoint
+本身不是 ACP 的压缩目标。
+
+ACP 同时识别 2.0.3 的 `catalog` 域和较新 V2 的顶层 `model`/`provider` 域及其
+更新事件。新接口兼容性测试与精确 2.0.3 安装宿主验证分开报告。
 
 设置 `BILLION_CONTEXT_PROXY` 时，ACP 会自行禁用。如果 provider 设置包含准确的
 `/bili/` 路由标记，ACP 也会自行禁用。在 V2 中，catalog 刷新事件会重新检查该

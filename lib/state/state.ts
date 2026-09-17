@@ -96,6 +96,20 @@ export interface SessionMutationOptions<Result = unknown> {
     commit?: (state: SessionState, result: Result) => void
     /** Flush persistence/effects while the same session reservation is held. */
     postCommit?: (state: SessionState, result: Result) => Promise<void> | void
+    /**
+     * Retain a quality-gate retry marker in this registry when a speculative
+     * operation fails. The marker is transient and bounded; it is restored on
+     * the next compatible reservation rather than persisting failed state.
+     */
+    retainQualityGateRetry?: (error: unknown) => boolean
+    /**
+     * Observe an unaccepted failure after its state snapshot is restored but
+     * before a fresh placeholder is discarded. This is limited to in-memory
+     * retry bookkeeping; callers must not perform persistence or host effects.
+     * Observer failures are ignored to preserve the triggering failure and
+     * guarantee fresh-placeholder cleanup.
+     */
+    onError?: (state: SessionState, error: unknown) => void
 }
 
 interface PendingTimingSnapshot {
@@ -158,6 +172,8 @@ export class SessionStateRegistry {
     private readonly guardedWork = new Map<string, number>()
     /** Work whose callback is currently executing and may mutate live state. */
     private readonly activeWork = new Map<string, number>()
+    /** Bounded retry markers that outlive only discarded/evicted live state. */
+    private readonly qualityGateRetries = new Map<string, true>()
     readonly compressionTiming: CompressionTimingState = {
         startsByCallId: new Map<string, number>(),
         pendingByCallId: new Map<string, PendingCompressionDuration>(),
@@ -375,6 +391,9 @@ export class SessionStateRegistry {
                 if (state.sessionId !== sessionId) {
                     throw new Error(`ACP: session ${sessionId} is not initialized`)
                 }
+                if (options?.retainQualityGateRetry && this.qualityGateRetries.has(sessionId)) {
+                    state.qualityGateRetryPending = true
+                }
                 const result = await operation(state, history)
                 const committed =
                     (options?.commitResult ? options.commitResult(result) : true) &&
@@ -392,6 +411,7 @@ export class SessionStateRegistry {
                 try {
                     if (options?.commit) options.commit(state, result)
                     commitAccepted = true
+                    this.clearConsumedQualityGateRetry(sessionId, state, options)
                     if (options?.postCommit) await options.postCommit(state, result)
                 } catch (error) {
                     if (commitAccepted) finishCreatedInitialization()
@@ -407,6 +427,16 @@ export class SessionStateRegistry {
                 // finalized above and the accepted state must remain visible.
                 if (!commitAccepted && this.states.get(sessionId) === state) {
                     if (operationSnapshot) restoreInitialization(state, operationSnapshot)
+                    if (this.shouldRetainQualityGateRetry(error, options)) {
+                        state.qualityGateRetryPending = true
+                        this.retainQualityGateRetry(sessionId)
+                    }
+                    try {
+                        options?.onError?.(state, error)
+                    } catch {
+                        // A rollback observer must not mask the operation error
+                        // or skip fresh-initialization cleanup below.
+                    }
                 }
                 if (
                     !commitAccepted &&
@@ -504,6 +534,43 @@ export class SessionStateRegistry {
         // Do not evict here: the getOrCreate caller is about to receive this
         // state, and no guarded-work reservation exists until it enters the
         // mutation queue. Subsequent insertions/guard releases enforce the cap.
+    }
+
+    private shouldRetainQualityGateRetry<Result>(
+        error: unknown,
+        options: SessionMutationOptions<Result> | undefined,
+    ): boolean {
+        try {
+            return options?.retainQualityGateRetry?.(error) === true
+        } catch {
+            // Retry classification is advisory and must not interrupt rollback.
+            return false
+        }
+    }
+
+    private retainQualityGateRetry(sessionId: string): void {
+        // Refresh insertion order so the oldest marker is evicted first.
+        this.qualityGateRetries.delete(sessionId)
+        this.qualityGateRetries.set(sessionId, true)
+        while (this.qualityGateRetries.size > REGISTRY_SOFT_CAP) {
+            const oldest = this.qualityGateRetries.keys().next()
+            if (oldest.done) return
+            this.qualityGateRetries.delete(oldest.value)
+        }
+    }
+
+    private clearConsumedQualityGateRetry<Result>(
+        sessionId: string,
+        state: SessionState,
+        options: SessionMutationOptions<Result> | undefined,
+    ): void {
+        if (
+            options?.retainQualityGateRetry &&
+            this.qualityGateRetries.has(sessionId) &&
+            !state.qualityGateRetryPending
+        ) {
+            this.qualityGateRetries.delete(sessionId)
+        }
     }
 
     private enforceSoftCap(): void {

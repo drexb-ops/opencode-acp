@@ -4,6 +4,7 @@ import { Logger } from "../logger"
 import { getCurrentTokenUsage, countTokens, extractCompletedToolOutput } from "../token-utils"
 import { resolveEffectiveContextLimit } from "../state/utils"
 import { isAcpOpaquePart } from "./opaque"
+import { resolveCompletionReserveTokens } from "./enforce-budget"
 
 const TRUNCATION_MARKER = "[truncated for context space"
 const MIN_OUTPUT_TOKENS = 1000
@@ -22,6 +23,12 @@ export const OUTPUT_RESERVE_TOKENS = 16384
 // Sessions that already received the "window too small" ERROR (logged once
 // per session — the condition is stable for the process's lifetime).
 const overheadErrorLogged = new Set<string>()
+
+/** Current request accounting supplied by a host adapter (V2). */
+export interface ToolOutputTruncationAccounting {
+    /** Includes current system and tool-definition overhead. */
+    currentTokens: number
+}
 
 function parseGcThreshold(
     threshold: number | `${number}%` | undefined,
@@ -44,11 +51,17 @@ export function truncateLargeToolOutputs(
     config: PluginConfig,
     logger: Logger,
     messages: WithParts[],
+    accounting?: ToolOutputTruncationAccounting,
 ): void {
     const effective = resolveEffectiveContextLimit(state, config)
     if (!effective) return
 
-    const currentTokens = getCurrentTokenUsage(state, messages)
+    const currentTokens =
+        typeof accounting?.currentTokens === "number" &&
+        Number.isFinite(accounting.currentTokens) &&
+        accounting.currentTokens >= 0
+            ? accounting.currentTokens
+            : getCurrentTokenUsage(state, messages)
     if (currentTokens === 0) return
 
     // [FIX #346] The serving wall is NOT the full window: the request also
@@ -64,7 +77,9 @@ export function truncateLargeToolOutputs(
         config.gc?.majorGcThresholdPercent,
         effective.limit,
     )
-    const overhead = (state.systemPromptTokens ?? 0) + OUTPUT_RESERVE_TOKENS
+    const overhead = accounting
+        ? resolveCompletionReserveTokens(config)
+        : (state.systemPromptTokens ?? 0) + OUTPUT_RESERVE_TOKENS
     const threshold = Math.min(configuredThreshold, effective.limit - overhead)
     if (threshold <= 0) {
         // The condition is stable for the life of the process (limit and the

@@ -437,6 +437,35 @@ function setContentPart(
     replacements.set(pointer.messageIndex, cloneAiMessage(message, content))
 }
 
+/**
+ * Provider-owned parts may shift when ACP inserts its own text before a tool
+ * call. Preserve those exact objects and their relative order, without tying
+ * validation to the original numeric content indexes.
+ */
+function opaqueContentIsRetainedInOrder(
+    opaqueContent: ReadonlyMap<number, AiContentPart>,
+    message: AiMessageValue,
+): boolean {
+    const content = aiContent(message)
+    const positions = new Map<AiContentPart, number>()
+    const duplicated = new Set<AiContentPart>()
+    for (let index = 0; index < content.length; index++) {
+        const part = content[index]!
+        if (positions.has(part)) duplicated.add(part)
+        else positions.set(part, index)
+    }
+    let previousIndex = -1
+    for (const [, originalPart] of [...opaqueContent.entries()].sort(
+        ([left], [right]) => left - right,
+    )) {
+        const foundIndex = positions.get(originalPart)
+        if (foundIndex === undefined || duplicated.has(originalPart) || foundIndex <= previousIndex)
+            return false
+        previousIndex = foundIndex
+    }
+    return true
+}
+
 function removeContentPointers(
     removed: Set<PointerKey>,
     pointers: readonly V2OutgoingPointer[],
@@ -1387,11 +1416,11 @@ export function applyV2ContextPatch(
             ) {
                 return reject("opaque-origin", "A replacement changed provider-owned content")
             }
-            for (const [contentIndex, originalPart] of opaqueOrigin?.opaqueContent ?? []) {
-                const candidate = aiContent(message)[contentIndex]
-                if (!candidate || candidate !== originalPart) {
-                    return reject("opaque-origin", "A replacement changed provider-owned content")
-                }
+            if (
+                opaqueOrigin?.opaqueContent !== undefined &&
+                !opaqueContentIsRetainedInOrder(opaqueOrigin.opaqueContent, message)
+            ) {
+                return reject("opaque-origin", "A replacement changed provider-owned content")
             }
         }
 

@@ -179,6 +179,19 @@ export function internalStepPart(sessionID: string, messageID: string, sourceInd
     })
 }
 
+function sourceRemovalMetadata(source: SourceRecord): {
+    __acpV2: true
+    __acpNonRemovable?: true
+} {
+    if (
+        ["user", "assistant", "skill", "shell", "location-switched"].includes(source.type) ||
+        (source.type === "synthetic" && isAcpOwnedId(stringValue(source.id)))
+    ) {
+        return { __acpV2: true }
+    }
+    return { __acpV2: true, __acpNonRemovable: true }
+}
+
 export function makeUserInfo(
     source: SourceRecord,
     messageID: string,
@@ -198,6 +211,7 @@ export function makeUserInfo(
         },
         time: { created: sourceTime(source, 0) },
         ...(isRecord(source.metadata) ? { metadata: source.metadata } : {}),
+        ...sourceRemovalMetadata(source),
     })
 }
 
@@ -235,6 +249,7 @@ export function makeAssistantInfo(
         ...(source.error !== undefined ? { error: source.error } : {}),
         ...(source.summary === true ? { summary: true } : {}),
         ...(isRecord(source.metadata) ? { metadata: source.metadata } : {}),
+        ...sourceRemovalMetadata(source),
     })
 }
 
@@ -492,6 +507,25 @@ export function parseToolInput(value: unknown): { input: Record<string, unknown>
     return { input: isRecord(value) ? value : {}, raw: canonical(value) }
 }
 
+function completedToolOutput(content: readonly unknown[]): string {
+    return content.map((item) => (isRecord(item) ? (stringValue(item.text) ?? "") : "")).join("\n")
+}
+
+function resolvedAcpToolError(
+    tool: Record<string, unknown>,
+    metadata: Record<string, unknown> | undefined,
+    output: string,
+): string | undefined {
+    const marker = stringValue(metadata?.acpError)
+    if (marker?.trim()) return output || `ACP ${stringValue(tool.name) ?? "tool"} failed: ${marker}`
+
+    // Before resolved V2 error results carried metadata, the only durable
+    // marker was the wrapper's text. Restrict this compatibility path to ACP's
+    // compression tool so arbitrary provider output is never reclassified.
+    if (tool.name === "compress" && /^\s*ACP compress failed:/i.test(output)) return output
+    return undefined
+}
+
 export function toolState(tool: Record<string, unknown>): {
     state: Record<string, unknown>
     opaqueResult: boolean
@@ -513,16 +547,28 @@ export function toolState(tool: Record<string, unknown>): {
         const single = content.length === 1 ? content[0] : undefined
         const output =
             isRecord(single) && single.type === "text" ? stringValue(single.text) : undefined
-        const normalizedOutput =
-            output ??
-            content.map((item) => (isRecord(item) ? (stringValue(item.text) ?? "") : "")).join("\n")
+        const normalizedOutput = output ?? completedToolOutput(content)
+        const metadata = isRecord(rawState.metadata) ? rawState.metadata : undefined
+        const resolvedError = resolvedAcpToolError(tool, metadata, normalizedOutput)
+        if (resolvedError !== undefined) {
+            return {
+                state: {
+                    status: "error",
+                    input,
+                    error: resolvedError,
+                    ...(metadata ? { metadata } : {}),
+                },
+                opaqueResult: true,
+                error: resolvedError,
+            }
+        }
         return {
             state: {
                 status: "completed",
                 input,
                 output: normalizedOutput,
                 title: "",
-                metadata: isRecord(rawState.metadata) ? rawState.metadata : {},
+                metadata: metadata ?? {},
             },
             opaqueResult: output === undefined,
             output: normalizedOutput,

@@ -112,7 +112,7 @@ One `opencode-acp` package supports both OpenCode runtime generations:
     }
     ```
 
-- **OpenCode V2 (`>=2.0.3`)** — use the native `plugins` configuration:
+- **OpenCode V2 (installed-host testing: `2.0.3`)** — use the native `plugins` configuration:
 
     ```json
     {
@@ -160,6 +160,21 @@ OpenCode V2.0.3 cannot rewrite completed assistant text before persistence or
 display. ACP instead sanitizes hallucinated ACP/DCP tags when historical
 assistant text is assembled into outbound model context. It does not rewrite
 persisted history or the displayed transcript.
+
+V2 direct tools can restore persisted session state after a reload without a
+preceding context transform. Compression targets exclude non-removable provider
+sources. Context diagnostics use current request estimates; saved block totals are
+historical and do not prove those originals are still present in the current window.
+
+For native provider checkpoints, OpenCode's public history can differ from the
+model's replay window. ACP processes only independently correlated messages after
+the checkpoint and preserves the native or re-expanded prefix unchanged. If no
+safe suffix is available, it preserves the request and records an explicit
+diagnostic. The checkpoint itself is not an ACP compression target.
+
+ACP recognizes both the 2.0.3 `catalog` domains and the newer V2 top-level
+`model`/`provider` domains and update events. Newer-domain compatibility tests are
+separate from the exact 2.0.3 installed-host verification.
 
 If `BILLION_CONTEXT_PROXY` is set, ACP self-disables. It also self-disables
 when provider settings contain the exact `/bili/` route marker. On V2, catalog

@@ -1,11 +1,14 @@
 import type { Message as AiMessageValue, SystemPart } from "@opencode/ai"
 import { SystemPart as SystemPartSchema } from "@opencode/ai"
 import type { PluginConfig } from "../config"
-import { compressPermission } from "../compress-permission"
 import { buildProtectedToolsExtension } from "../prompts/extensions/system"
 import { renderSystemPrompt, type PromptStore } from "../prompts"
 import { commitPreparedMessageTransformState, prepareMessageTransformTransaction } from "../hooks"
-import type { HostPermissionRule, HostPermissionSnapshot } from "../host-permissions"
+import {
+    resolveEffectiveCompressPermission,
+    type HostPermissionRule,
+    type HostPermissionSnapshot,
+} from "../host-permissions"
 import type { SessionState, SessionStateRegistry } from "../state"
 import type { Logger } from "../logger"
 import { saveSessionState } from "../state/persistence"
@@ -18,6 +21,8 @@ import {
     type V2ProjectionModel,
 } from "./projection"
 import { isAcpOwnedNoticeId } from "./projection/shared"
+import { createV2TokenBudget, estimateV2WireTokens } from "./token-budget"
+import { assessV2HistoryCompatibility, attachV2CompactionTimestamp } from "./history"
 
 export interface V2ContextEvent {
     readonly sessionID: string
@@ -25,6 +30,7 @@ export interface V2ContextEvent {
     readonly model: V2ProjectionModel
     system: SystemPart[]
     messages: AiMessageValue[]
+    tools?: Record<string, unknown>
 }
 
 interface PreparedV2ContextCommit {
@@ -133,28 +139,79 @@ export function createV2ContextHandler(
                 // invoked. Reading projected history outside that reservation
                 // would allow an older snapshot to commit after a newer request.
                 const projected = await host.projectedContext(event.sessionID)
-                const projection = normalizeV2ProjectedHistory(projected, event.messages, {
+                const history = assessV2HistoryCompatibility(projected, event.model, event.messages)
+                if (history.status !== "supported") {
+                    // Do not log history.projected: it contains private transcript data.
+                    logger.warn("V2 native history compatibility", {
+                        sessionId: event.sessionID,
+                        status: history.status,
+                        diagnostic: history.diagnostic,
+                        checkpointIds: history.checkpointIds,
+                        correlatedSources: history.independentlyCorrelatedSourceIds.length,
+                    })
+                }
+                if (history.preserveOriginalRequest) return undefined
+                const projection = normalizeV2ProjectedHistory(history.projected, event.messages, {
                     sessionID: event.sessionID,
                     agent: event.agent,
                     directory: host.directory,
                     currentModel: event.model,
                 })
+                attachV2CompactionTimestamp(projection.messages, history.nativeCompactionTimestamp)
                 if (!projection.valid) {
                     logger.warn("V2 context projection rejected", {
                         sessionId: event.sessionID,
                         reason: projection.rejection?.message,
                     })
                 }
-                return projection
+                return {
+                    projection,
+                    nativeSuffix:
+                        history.status === "degraded"
+                            ? {
+                                  sessionID: event.sessionID,
+                                  checkpointIds: history.checkpointIds,
+                                  nativeCompactionTimestamp: history.nativeCompactionTimestamp,
+                                  model: event.model,
+                                  sourceIds: history.independentlyCorrelatedSourceIds,
+                              }
+                            : undefined,
+                }
             }
 
             const effects = new DeferredMutationEffects()
 
             const run = async (
                 state: SessionState,
-                projection: Awaited<ReturnType<typeof loadProjection>>,
+                loaded: Awaited<ReturnType<typeof loadProjection>>,
             ): Promise<PreparedV2ContextCommit | undefined> => {
-                if (!projection.valid || !isActive()) return undefined
+                if (!loaded?.projection.valid || !isActive()) return undefined
+                const { projection } = loaded
+                prompts.reload()
+                const systemPrompt =
+                    !(state.isSubAgent && !config.allowSubAgents) &&
+                    resolveEffectiveCompressPermission(
+                        config.compress.permission,
+                        hostPermissions,
+                        event.agent,
+                    ) !== "deny"
+                        ? renderSystemPrompt(
+                              prompts.getRuntimePrompts(),
+                              buildProtectedToolsExtension(config.compress.protectedTools),
+                              state.isSubAgent && config.allowSubAgents,
+                          )
+                        : undefined
+                const systemPart = systemPrompt ? SystemPartSchema.make(systemPrompt) : undefined
+                const plannedSystem = systemPart ? [...event.system, systemPart] : event.system
+                const tokenBudget = createV2TokenBudget({
+                    system: plannedSystem,
+                    messages: event.messages,
+                    tools: event.tools,
+                    normalizedMessages: projection.messages,
+                    outgoingNormalizedMessageIds: projection.outgoing.map(
+                        (entry) => entry.normalizedMessageId,
+                    ),
+                })
                 const prepared = await prepareMessageTransformTransaction(
                     projection.messages,
                     state,
@@ -173,6 +230,10 @@ export function createV2ContextHandler(
                         }),
                     true,
                     effects,
+                    {
+                        authoritativeOverheadTokens: tokenBudget.overheadTokens,
+                        estimateWireTokens: tokenBudget.estimateMessages,
+                    },
                 )
                 // A non-resuming command notice remains in projected session
                 // history for the user, but must be removed from every later
@@ -214,22 +275,27 @@ export function createV2ContextHandler(
 
                 if (!isActive()) return undefined
 
-                let systemPrompt: string | undefined
-                if (
-                    !(prepared.workingState.isSubAgent && !config.allowSubAgents) &&
-                    compressPermission(prepared.workingState, config) !== "deny"
-                ) {
-                    systemPrompt = renderSystemPrompt(
-                        prompts.getRuntimePrompts(),
-                        buildProtectedToolsExtension(config.compress.protectedTools),
-                        prepared.workingState.isSubAgent && config.allowSubAgents,
-                    )
+                if (loaded.nativeSuffix) {
+                    const evidence = loaded.nativeSuffix
+                    effects.defer(() => host.recordAcceptedNativeSuffix?.(evidence))
                 }
 
                 // Build event values before the synchronous accepted boundary;
                 // initialization and transform effects stay staged until the
                 // registry accepts this result.
-                const systemPart = systemPrompt ? SystemPartSchema.make(systemPrompt) : undefined
+                const wireEstimate = estimateV2WireTokens({
+                    system: plannedSystem,
+                    messages: patch.messages,
+                    tools: event.tools,
+                })
+                effects.defer(() =>
+                    logger.info("V2 context patch accepted", {
+                        sessionId: event.sessionID,
+                        estimatedWireTokens: wireEstimate.totalTokens,
+                        estimatedOverheadTokens: tokenBudget.overheadTokens,
+                        outgoingMessages: patch.messages.length,
+                    }),
+                )
                 return { prepared, messages: patch.messages, systemPart }
             }
 
@@ -264,8 +330,10 @@ export function createV2ContextHandler(
                     host.sessions,
                     event.sessionID,
                     loadProjection,
-                    (projection) =>
-                        isActive() && projection.valid ? projection.messages : undefined,
+                    (loaded) =>
+                        isActive() && loaded?.projection.valid
+                            ? loaded.projection.messages
+                            : undefined,
                     config,
                     run,
                     {
@@ -322,8 +390,9 @@ export function createV2ContextHandler(
             } else {
                 // Compatibility for lightweight registry doubles from older
                 // V2 fixtures. Real registries always use the atomic path.
-                const projection = await loadProjection()
-                if (!projection.valid || !isActive()) return
+                const loaded = await loadProjection()
+                const projection = loaded?.projection
+                if (!projection?.valid || !isActive()) return
                 await registry.getOrCreate(
                     host.sessions,
                     event.sessionID,
@@ -332,7 +401,7 @@ export function createV2ContextHandler(
                 )
                 const state = registry.get(event.sessionID)
                 if (state) {
-                    const result = await run(state, projection)
+                    const result = await run(state, loaded)
                     if (result === undefined || !isActive()) return
                     if (!commitPreparedMessageTransformState(result.prepared, state, undefined))
                         return
