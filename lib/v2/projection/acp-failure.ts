@@ -67,10 +67,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 export function isAcpFailedToolOutput(
     toolName: string | undefined,
     rawState: Record<string, unknown>,
-    neutralizedOutput: string,
+    outputText: string,
 ): boolean {
     if (!isAcpToolName(toolName)) return false
     if (isRecord(rawState.metadata) && rawState.metadata[ACP_FAILURE_METADATA_KEY] === true)
         return true
-    return ACP_FAILURE_OUTPUT_PATTERN.test(neutralizedOutput)
+    return ACP_FAILURE_OUTPUT_PATTERN.test(outputText)
 }

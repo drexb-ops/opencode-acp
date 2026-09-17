@@ -34,6 +34,12 @@ import type { PluginConfig } from "../lib/config"
 import { createChatMessageTransformHandler } from "../lib/hooks"
 import { createTestRegistry } from "./registry-stub"
 import type { WithParts } from "@opencode-ai/plugin"
+import { Message } from "@opencode/ai"
+import type { Message as AiMessage } from "@opencode/ai"
+import { DateTime } from "effect"
+import { Info as SessionMessageInfo } from "@opencode/schema/session-message"
+import type { Info as SessionMessageInfoValue } from "@opencode/schema/session-message"
+import { normalizeV2ProjectedHistory, type V2Projection } from "../lib/v2/projection"
 
 // ─── (a) acp-failure pure module ────────────────────────────────────────────
 
@@ -684,6 +690,177 @@ describe("warm nudge baseline behavior around compress attempts", () => {
 
         assert.equal(state.nudges.shouldInjectThisTurn, false)
         assert.equal(state.nudges.compressBaselineSet, true)
-        assert.notEqual(state.nudges.lastPerMessageNudgeTokens, undefined)
+        // The baseline was seeded to 0 above; a genuine advancement must move
+        // it past the seed, not merely define it.
+        assert.ok(
+            (state.nudges.lastPerMessageNudgeTokens ?? -1) > 0,
+            "success baseline advanced beyond the seeded value",
+        )
+    })
+})
+
+// ─── (e) full projection integration ────────────────────────────────────────
+
+const PROJ_MODEL = { id: "model-a", providerID: "provider-a" }
+const PROJ_SID = "v2-fail-projection"
+const PROJ_CALL_ID = "call-acp-426"
+const PROJ_COMPRESS_INPUT = {
+    topic: "proj",
+    content: [{ startId: "m00001", endId: "m00004", summary: "s" }],
+}
+const FAILED_COMPRESS_TEXT = "ACP compress failed: simulated execution failure"
+
+function projUserSource(id: string): Record<string, unknown> {
+    return { type: "user", id, time: { created: 1 }, text: "compress the earlier turns" }
+}
+
+function projAssistantSource(
+    id: string,
+    toolStateRecord: Record<string, unknown>,
+): Record<string, unknown> {
+    return {
+        type: "assistant",
+        id,
+        time: { created: 2 },
+        agent: "code",
+        model: PROJ_MODEL,
+        content: [
+            {
+                type: "tool",
+                id: PROJ_CALL_ID,
+                name: "compress",
+                executed: false,
+                state: toolStateRecord,
+                time: { created: 2 },
+            },
+        ],
+    }
+}
+
+function projValidate(projected: readonly unknown[]): readonly unknown[] {
+    for (const message of projected) {
+        // Public transport encodes DateTime values as epoch millis; Info.make
+        // validates that form without coupling the test to npm's layout.
+        SessionMessageInfo.make(toProjSchemaValue(message) as SessionMessageInfoValue)
+    }
+    return projected
+}
+
+function toProjSchemaValue(value: unknown): unknown {
+    if (Array.isArray(value)) return value.map((entry) => toProjSchemaValue(entry))
+    if (!isProjRecord(value)) return value
+    return Object.fromEntries(
+        Object.entries(value).map(([key, entry]) => {
+            if (key !== "time" || !isProjRecord(entry)) return [key, toProjSchemaValue(entry)]
+            return [
+                key,
+                Object.fromEntries(
+                    Object.entries(entry).map(([timeKey, timeValue]) => [
+                        timeKey,
+                        typeof timeValue === "number"
+                            ? DateTime.makeUnsafe(timeValue)
+                            : toProjSchemaValue(timeValue),
+                    ]),
+                ),
+            ]
+        }),
+    )
+}
+
+function isProjRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function runProjection(toolStateRecord: Record<string, unknown>): V2Projection {
+    const projected = projValidate([
+        projUserSource("msg_proj_user"),
+        projAssistantSource("msg_proj_asst", toolStateRecord),
+    ])
+    const outgoing: AiMessage[] = [
+        Message.make({ id: "msg_proj_user", role: "user", content: "compress the earlier turns" }),
+        Message.make({
+            id: "msg_proj_asst",
+            role: "assistant",
+            content: [
+                {
+                    type: "tool-call" as const,
+                    id: PROJ_CALL_ID,
+                    name: "compress",
+                    input: PROJ_COMPRESS_INPUT,
+                },
+                {
+                    type: "tool-result" as const,
+                    id: PROJ_CALL_ID,
+                    name: "compress",
+                    result: { type: "text" as const, value: FAILED_COMPRESS_TEXT },
+                },
+            ],
+        }),
+    ]
+    return normalizeV2ProjectedHistory(projected, outgoing, {
+        sessionID: PROJ_SID,
+        agent: "code",
+        currentModel: PROJ_MODEL,
+    })
+}
+
+interface ProjCompressPart {
+    type: "tool"
+    tool: string
+    state: { status: string; error?: string; output?: string }
+}
+
+describe("full projection of host-shaped completed ACP failures", () => {
+    function assertFailureProjection(projection: V2Projection) {
+        assert.equal(
+            projection.valid,
+            true,
+            `projection must stay valid: ${projection.rejection?.message ?? ""}`,
+        )
+        const part = projection.messages
+            .flatMap((message) => message.parts)
+            .find((candidate) => candidate.type === "tool" && candidate.tool === "compress") as
+            ProjCompressPart | undefined
+        assert.ok(part, "internal projection must contain the compress tool part")
+        assert.equal(part.state.status, "error")
+        assert.equal(part.state.error, FAILED_COMPRESS_TEXT)
+        assert.ok(!("output" in part.state), "failed result must not carry a success output")
+        const entry = projection.entries.find(
+            (candidate) => candidate.sourceMessageId === "msg_proj_asst",
+        )
+        assert.ok(entry, "provenance must cover the assistant source")
+        const origin = entry.origins.find((candidate) => candidate.callId === PROJ_CALL_ID)
+        assert.ok(origin, "provenance must cover the tool call")
+        // No output fingerprint is recorded for the reclassified result, so
+        // the patcher can never rewrite the provider-owned host output.
+        assert.equal(origin.normalizedOutput, undefined)
+        assert.equal(origin.normalizedError, FAILED_COMPRESS_TEXT)
+    }
+
+    it("projects a completed record carrying acpFailed metadata as an error", () => {
+        assertFailureProjection(
+            runProjection({
+                status: "completed",
+                input: PROJ_COMPRESS_INPUT,
+                content: [{ type: "text", text: FAILED_COMPRESS_TEXT }],
+                time: { start: 2, end: 3 },
+                metadata: {
+                    [ACP_FAILURE_METADATA_KEY]: true,
+                    acpError: "execution",
+                    tool: "compress",
+                },
+            }),
+        )
+    })
+
+    it("projects historical completed failure output without metadata as an error", () => {
+        assertFailureProjection(
+            runProjection({
+                status: "completed",
+                input: PROJ_COMPRESS_INPUT,
+                content: [{ type: "text", text: FAILED_COMPRESS_TEXT }],
+                time: { start: 2, end: 3 },
+            }),
+        )
     })
 })

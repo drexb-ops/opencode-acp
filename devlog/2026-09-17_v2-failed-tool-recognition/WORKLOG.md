@@ -57,8 +57,9 @@
   non-ACP tools.
 - `scripts/e2e/installed-v2.ts` — nudge-growth stage asserts the observed
   compress result status is genuinely `"completed"` after each nudge.
-- `tests/v2-failed-tool-recognition.test.ts` — NEW: 18 tests across four
-  sections (pure module, projection, cold rebuild, warm nudge baselines).
+- `tests/v2-failed-tool-recognition.test.ts` — NEW: 20 tests across five
+  sections (pure module, projection, cold rebuild, warm nudge baselines, full
+  projection integration).
 - `devlog/2026-09-17_v2-failed-tool-recognition/{REQ,WORKLOG,DESIGN}.md`.
 
 ## 3. Design & Implementation Notes
@@ -75,6 +76,22 @@ See `DESIGN.md` for the full data-flow analysis and invariants. Key points:
   historical failure text inside a larger success output can never
   misclassify it.
 
+### Post-review adjustments (dual-agent review of PR #3)
+
+- Renamed `isAcpFailedToolOutput`'s third parameter
+  `neutralizedOutput` → `outputText`: the function only pattern-tests the
+  joined output text; nothing is neutralized.
+- Strengthened the warm-nudge control assertion: the success baseline must
+  advance past its seeded value (0), not merely become defined — the old
+  `notEqual(undefined)` check would also pass if the baseline had stayed at
+  the seed.
+- Added two full-projection integration tests driving host-shaped completed
+  records through `normalizeV2ProjectedHistory` (both reviewers' main gap:
+  most tests exercised the pure module or downstream consumers rather than
+  the changed projection code path end-to-end).
+- Documented soft-string failures of shared tools as a known limitation
+  (DESIGN.md §6): classified identically on V1, no functional impact today.
+
 ## 4. Testing & Verification
 
 ### Build & Test Commands
@@ -87,7 +104,7 @@ npm run build
 
 ### Test Coverage
 
-- New test file: `tests/v2-failed-tool-recognition.test.ts` (18 tests):
+- New test file: `tests/v2-failed-tool-recognition.test.ts` (20 tests):
     - acp-failure module: name list, all 9 failure shapes match at position 0,
       mid-output occurrences rejected, success outputs rejected, metadata
       precedence, non-ACP exclusion.
@@ -101,7 +118,14 @@ npm run build
       AGENTS.md §5.7.1): failed attempt clears turn/iteration anchors and
       `lastNudgeShownTokens`, leaves `lastPerMessageNudgeTokens` unchanged and
       `compressBaselineSet` false; control proves a successful compress advances
-      the baseline and sets the flag.
+      the baseline past its seeded value and sets the flag.
+    - Full projection integration (via `normalizeV2ProjectedHistory`): a
+      host-shaped completed record with `acpFailed` metadata — and the
+      historical text-only variant — project to a valid history whose internal
+      compress part has status `error` with no `output`, while
+      `origin.normalizedOutput` stays undefined (provider-owned output is
+      never fingerprinted, so the patcher cannot rewrite it) and
+      `origin.normalizedError` carries the failure text.
 - Bug-detection check (AGENTS.md §5.7.3): with the `shared.ts` change reverted,
   the two recognition pinning tests fail; restored → all pass.
 - Full suite: 1429 tests, 1428 pass, 1 fail — `tests/soft-block.test.ts`

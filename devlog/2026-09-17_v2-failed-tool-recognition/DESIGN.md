@@ -197,3 +197,27 @@ tool part completed                   toolState():
 - **Looser (multiline, case-insensitive) pattern** — rejected: risk of
   demoting genuine success outputs that quote historical failure text
   (decompress/recap/search_context restore exactly such content).
+
+## 6. Known Limitations
+
+The shared ACP tools report some soft failures as plain resolved text instead
+of going through `errorResult`:
+
+- `decompress` returns `resolved.error` as ordinary output
+  (`lib/compress/decompress.ts:451`; error strings built around :230–:322, e.g.
+  `Error: No active compression blocks overlap the range …` at :322).
+- `search_context` returns `"Error: query is required."`
+  (`lib/compress/search.ts:561`).
+- `acp_context_recap` returns informational strings such as
+  `"No active compression blocks."` (`lib/compress/recap.ts:44`).
+- `acp_status` appends `"(unable to fetch messages)"` on fetch failure
+  (`lib/compress/status.ts:701`).
+
+These stay `completed` on both runtimes — identical classification to V1, where
+plain results were never native errors either — so this is not a regression,
+and there is zero functional impact today because the #426 logic keys only off
+compress success/failure (nudge baselines, rebuild replay, hide-failed).
+Extending the anchored position-0 pattern to a generic `Error:` prefix was
+rejected as too broad for a shared recognition rule. If these tools ever need
+failure semantics, they should gain explicit `errorResult`-style metadata like
+the compress path has.
