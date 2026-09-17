@@ -16,6 +16,7 @@ import type {
     ParsedBlockPlaceholder,
     ResolvedRangeCompression,
     SearchContext,
+    SelectionResolution,
 } from "./types"
 
 const BLOCK_PLACEHOLDER_REGEX = /\(b(\d+)\)|\{block_(\d+)\}/gi
@@ -124,6 +125,29 @@ export function validateNonOverlapping(plans: ResolvedRangeCompression[]): void 
 export interface ExecutableRangePlansResult {
     plans: ResolvedRangeCompression[]
     totalChars: number
+    /** [Issue #420] Message IDs dropped because the host marks them non-removable. */
+    excludedNonRemovableMessageIds?: string[]
+    /** [Issue #420] content[] indices of plans emptied entirely by that filter. */
+    skippedNonRemovablePlanIndices?: number[]
+}
+
+/**
+ * [Issue #420] Drop messages the host classifies as non-removable from outgoing
+ * context (provider-owned opaque sources, e.g. completed native compactions).
+ * They are restored verbatim on every request, so they must not enter
+ * selections or token accounting; counting them would report false savings.
+ */
+export function filterNonRemovableSources(
+    selection: SelectionResolution,
+    nonRemovableMessageIds: ReadonlySet<string>,
+): SelectionResolution {
+    const kept = selection.messageIds.filter((id) => !nonRemovableMessageIds.has(id))
+    if (kept.length === selection.messageIds.length) return selection
+    const messageTokenById = new Map(selection.messageTokenById)
+    for (const id of selection.messageIds) {
+        if (nonRemovableMessageIds.has(id)) messageTokenById.delete(id)
+    }
+    return { ...selection, messageIds: kept, messageTokenById }
 }
 
 /**
@@ -137,7 +161,7 @@ export function prepareExecutableRangePlans(
     state: SessionState,
     config: PluginConfig,
     logger?: Logger,
-    options?: { includeTokenAccounting?: boolean },
+    options?: { includeTokenAccounting?: boolean; nonRemovableMessageIds?: ReadonlySet<string> },
 ): ExecutableRangePlansResult {
     const normalizedArgs: CompressRangeToolArgs =
         "content" in args
@@ -147,6 +171,12 @@ export function prepareExecutableRangePlans(
               }
     const resolvedPlans = resolveRanges(normalizedArgs, searchContext, state, logger, options)
     validateNonOverlapping(resolvedPlans)
+
+    // [Issue #420] Run after the other soft filters so a plan emptied here was
+    // non-empty before and can be attributed to non-removable sources.
+    const nonRemovableMessageIds = options?.nonRemovableMessageIds
+    const excludedNonRemovableMessageIds: string[] = []
+    const skippedNonRemovablePlanIndices: number[] = []
 
     const plans = resolvedPlans
         .map((plan) => ({
@@ -171,9 +201,27 @@ export function prepareExecutableRangePlans(
                 config.compress,
             ),
         }))
+        .map((plan) => {
+            if (!nonRemovableMessageIds || nonRemovableMessageIds.size === 0) return plan
+            const hadMessages = plan.selection.messageIds.length > 0
+            const selection = filterNonRemovableSources(plan.selection, nonRemovableMessageIds)
+            if (selection === plan.selection) return plan
+            if (hadMessages && selection.messageIds.length === 0) {
+                skippedNonRemovablePlanIndices.push(plan.index)
+            }
+            excludedNonRemovableMessageIds.push(
+                ...plan.selection.messageIds.filter((id) => nonRemovableMessageIds.has(id)),
+            )
+            return { ...plan, selection }
+        })
         .filter((plan) => plan.selection.messageIds.length > 0)
 
     if (plans.length === 0) {
+        if (skippedNonRemovablePlanIndices.length > 0) {
+            throw new Error(
+                "The selected ranges contain only provider-owned sources (e.g. completed native compactions). These records are restored verbatim on every request, so compressing them would save nothing — ACP does not report savings for them. Choose a range that includes removable messages.",
+            )
+        }
         throw new Error(
             "All selected messages were filtered out (protected tool outputs and/or the last user message). They must remain in visible context.",
         )
@@ -196,7 +244,12 @@ export function prepareExecutableRangePlans(
         )
     }
 
-    return { plans, totalChars }
+    return {
+        plans,
+        totalChars,
+        excludedNonRemovableMessageIds,
+        skippedNonRemovablePlanIndices,
+    }
 }
 
 export function parseBlockPlaceholders(summary: string): ParsedBlockPlaceholder[] {

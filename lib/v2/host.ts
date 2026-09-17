@@ -3,6 +3,7 @@ import type { Plugin as V2Api } from "@opencode/plugin"
 import type { HostServices, ModelInventoryEntry, NotificationSink, SessionService } from "../host"
 import type { HostPermissionRule } from "../host-permissions"
 import { normalizeV2ProjectedHistory, type V2ProjectionOptions } from "./projection"
+import { isAcpOwnedNoticeId } from "./projection/shared"
 
 export type V2Context = Parameters<V2Api.Plugin["setup"]>[0]
 
@@ -55,6 +56,40 @@ function createSessionService(
             }).messages
         },
     }
+}
+
+/**
+ * [Issue #420] Raw IDs of sources that are restored verbatim on every request
+ * and can therefore never be compressed. The predicate mirrors
+ * restoreMissingV2OpaqueSources' protected entries exactly: opaque,
+ * non-removable, provider-owned (not ACP synthetic/notice).
+ */
+async function resolveNonRemovableSourceIds(
+    context: V2Context,
+    projectionOptions: V2ProjectionOptions,
+    sessionID: string,
+): Promise<ReadonlySet<string>> {
+    const projected = (await context.session.context({ sessionID })) as readonly unknown[]
+    const projection = normalizeV2ProjectedHistory(projected, [], {
+        ...projectionOptions,
+        sessionID,
+    })
+    // Provenance flags (opaque, allowSourceRemoval, sourceType,
+    // normalizedMessageId) are computed from projected source records alone,
+    // before lowered-outgoing correlation. Correlation rejections — expected
+    // here because we normalize without a request transcript — only affect
+    // outgoing mapping, so classification stays correct whether or not the
+    // projection is marked valid. Sources that cannot be normalized at all
+    // also produce no selectable message, so nothing is under-protected.
+    const ids = new Set<string>()
+    for (const entry of projection.entries) {
+        if (!entry.normalizedMessageId) continue
+        if (!entry.opaque || entry.allowSourceRemoval) continue
+        if (entry.sourceType === "acp-synthetic") continue
+        if (isAcpOwnedNoticeId(entry.sourceMessageId)) continue
+        ids.add(entry.normalizedMessageId)
+    }
+    return ids
 }
 
 function createModelInventory(context: V2Context): {
@@ -167,6 +202,8 @@ export function createV2Host(
         directory: context.location.directory,
         sessionAgent: createSessionAgent(context),
         agentPermissions: createAgentPermissions(context),
+        nonRemovableSourceIds: (sessionID) =>
+            resolveNonRemovableSourceIds(context, projectionOptions, sessionID),
         notices: createNoticeSink(context),
         notifications: notifications ?? {
             // Keep lightweight host fixtures and standalone callers usable when

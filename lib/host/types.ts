@@ -74,4 +74,11 @@ export interface HostServices {
     models: ModelInventory
     notices: NoticeSink
     notifications: NotificationSink
+    /**
+     * Raw IDs of session messages the host classifies as non-removable from
+     * outgoing context (provider-owned records such as completed native
+     * compactions). Only hosts with content-level provenance implement this;
+     * the shared engine treats absence as "all sources removable".
+     */
+    nonRemovableSourceIds?(sessionID: string): Promise<ReadonlySet<string>>
 }
