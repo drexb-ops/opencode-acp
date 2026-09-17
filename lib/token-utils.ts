@@ -2,9 +2,23 @@ import { SessionState, WithParts } from "./state"
 import { AssistantMessage, UserMessage } from "@opencode-ai/sdk/v2"
 import { Logger } from "./logger"
 import * as _anthropicTokenizer from "@anthropic-ai/tokenizer"
-const anthropicCountTokens = (_anthropicTokenizer.countTokens ??
-    (_anthropicTokenizer as any).default?.countTokens) as typeof _anthropicTokenizer.countTokens
 import { getLastUserMessage } from "./messages/query"
+
+type AnthropicTokenizerModule = {
+    countTokens?: typeof _anthropicTokenizer.countTokens
+    getTokenizer?: typeof _anthropicTokenizer.getTokenizer
+    default?: {
+        countTokens?: typeof _anthropicTokenizer.countTokens
+        getTokenizer?: typeof _anthropicTokenizer.getTokenizer
+    }
+}
+
+const anthropicTokenizer = _anthropicTokenizer as AnthropicTokenizerModule
+const anthropicCountTokens =
+    anthropicTokenizer.countTokens ?? anthropicTokenizer.default?.countTokens
+const getAnthropicTokenizer =
+    anthropicTokenizer.getTokenizer ?? anthropicTokenizer.default?.getTokenizer
+let cachedAnthropicTokenizer: ReturnType<typeof _anthropicTokenizer.getTokenizer> | undefined
 
 export function getCurrentTokenUsage(state: SessionState, messages: WithParts[]): number {
     for (let i = messages.length - 1; i >= 0; i--) {
@@ -126,9 +140,25 @@ export function getCurrentParams(
 
 export function countTokens(text: string): number {
     if (!text) return 0
+    let tokenizer = cachedAnthropicTokenizer
     try {
-        return anthropicCountTokens(text)
+        if (!tokenizer) {
+            if (!getAnthropicTokenizer) {
+                return anthropicCountTokens?.(text) ?? Math.round(text.length / 4)
+            }
+            tokenizer = getAnthropicTokenizer()
+            cachedAnthropicTokenizer = tokenizer
+        }
+        return tokenizer.encode(text.normalize("NFKC"), "all").length
     } catch {
+        if (tokenizer && cachedAnthropicTokenizer === tokenizer) {
+            cachedAnthropicTokenizer = undefined
+            try {
+                tokenizer.free()
+            } catch {
+                // Best effort after a failed encoder call.
+            }
+        }
         return Math.round(text.length / 4)
     }
 }

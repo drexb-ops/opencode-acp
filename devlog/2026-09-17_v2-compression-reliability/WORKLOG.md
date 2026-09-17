@@ -1,6 +1,6 @@
 # WORKLOG — Reliable V2 compression
 
-- Status: Verified — ready for local activation
+- Status: Unit/installed verification passed; live activation blocked by #427
 - Baseline: `1fe36e0`, local `master`
 - Date: 2026-09-17
 
@@ -119,3 +119,16 @@
   logs and unchanged-strength golden assertions. Their full source/test/E2E/doc
   scopes and all review corrections are recorded above.
 - Local commit and live activation follow; no package publication is part of this task.
+
+## Live activation outcome
+
+- Implementation committed locally as `5ff308c`.
+- Live activation did **not** succeed reliably. The user experienced repeated
+  unresponsiveness/recovery and removed ACP. Keep it disabled while investigating.
+- Follow-up #427 and `devlog/2026-09-17_tokenizer-stall/` record the independently
+  reproduced synchronous tokenizer bottleneck. Earlier isolated passing checks
+  did not cover this long-history workload.
+- The follow-up fix now passes a captured long-history replay and an actual
+  source-loaded private server with 250 seeded messages, completed replies, and
+  zero health failures, plus the full 1,482-test and installed-host matrices.
+  Shared activation remains deliberately disabled after the user's crash report.
