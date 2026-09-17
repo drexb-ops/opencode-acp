@@ -144,15 +144,40 @@ export function createCompressRangeToolDefinition(
                     ...ctx0,
                     config: applyCompressOverrides(ctx0.config, providerId, modelId),
                 }
+                // [Issue #420] Hosts with content-level provenance (V2) classify some
+                // session messages as non-removable from outgoing context (provider-owned
+                // records such as completed native compactions). They must never enter
+                // selections or token accounting, or ACP would report savings that are
+                // restored verbatim on the next request. Fail closed when provenance
+                // cannot be read: proceeding unfiltered silently reintroduces false
+                // savings. No state is mutated before this point, so the error is safe.
+                let nonRemovableMessageIds: ReadonlySet<string> | undefined
+                if (typeof ctx.host.nonRemovableSourceIds === "function") {
+                    try {
+                        nonRemovableMessageIds = await ctx.host.nonRemovableSourceIds(
+                            toolCtx.sessionID,
+                        )
+                    } catch (error) {
+                        throw new Error(
+                            `Cannot verify which session sources are removable from outgoing context (${error instanceof Error ? error.message : String(error)}). ACP refuses to plan compression without provenance because provider-owned sources must not be counted as saved. No state was changed; retry when the host recovers.`,
+                        )
+                    }
+                }
+
                 // Intentionally runs after prepareSession: resolution and char accounting
                 // require the prepared search context, and no state is persisted on error.
                 // Use the effective provider/model config so planning and execution agree.
-                const { plans: filteredPlans } = prepareExecutableRangePlans(
+                const {
+                    plans: filteredPlans,
+                    excludedNonRemovableMessageIds = [],
+                    skippedNonRemovablePlanIndices = [],
+                } = prepareExecutableRangePlans(
                     input,
                     searchContext,
                     ctx.state,
                     ctx.config,
                     ctx.logger,
+                    { nonRemovableMessageIds },
                 )
 
                 const notifications: NotificationEntry[] = []
@@ -378,7 +403,22 @@ export function createCompressRangeToolDefinition(
                 const ackNote = ignoredAcknowledgeRisk
                     ? `\n⚠️ acknowledgeRisk was ignored: no quality gate rejection was pending, so quality checks ran normally. Only pass it when retrying immediately after a quality gate rejection.\n`
                     : ""
-                return `Compressed ${totalCompressedMessages} messages into ${COMPRESSED_BLOCK_HEADER}.${skippedNote}${ackNote}\nIMPORTANT: This was an automatic context compression. You MUST continue your previous task exactly where you left off. Do NOT ask the user what to do next.\n💡 Tip: Use search_context('keyword') to find compressed content when you need it later.`
+                const nonRemovableParts: string[] = []
+                if (excludedNonRemovableMessageIds.length > 0) {
+                    nonRemovableParts.push(
+                        `${excludedNonRemovableMessageIds.length} provider-owned message(s) were excluded from compression`,
+                    )
+                }
+                if (skippedNonRemovablePlanIndices.length > 0) {
+                    nonRemovableParts.push(
+                        `${skippedNonRemovablePlanIndices.length} range(s) contained only such messages and were skipped`,
+                    )
+                }
+                const nonRemovableNote =
+                    nonRemovableParts.length > 0
+                        ? `\n⚠️ ${nonRemovableParts.join("; ")}: those records remain in visible context and NO savings were counted for them.\n`
+                        : ""
+                return `Compressed ${totalCompressedMessages} messages into ${COMPRESSED_BLOCK_HEADER}.${skippedNote}${nonRemovableNote}${ackNote}\nIMPORTANT: This was an automatic context compression. You MUST continue your previous task exactly where you left off. Do NOT ask the user what to do next.\n💡 Tip: Use search_context('keyword') to find compressed content when you need it later.`
             })
         },
     }
