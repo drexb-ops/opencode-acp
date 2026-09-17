@@ -14,6 +14,7 @@ import type {
     V2ProjectionOptions,
 } from "./types"
 import { isAcpOwnedId, isAcpOwnedNoticeId, isAcpSyntheticId } from "../../synthetic-ids"
+import { isAcpFailedToolOutput } from "./acp-failure"
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
     return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -516,6 +517,24 @@ export function toolState(tool: Record<string, unknown>): {
         const normalizedOutput =
             output ??
             content.map((item) => (isRecord(item) ? (stringValue(item.text) ?? "") : "")).join("\n")
+        if (isAcpFailedToolOutput(stringValue(tool.name), rawState, normalizedOutput)) {
+            // The pinned V2 Promise adapter has no safe native error channel,
+            // so createV2Tool returns resolved results for caught failures and
+            // the host records them as completed. Project them internally as
+            // failed tools without rewriting provider-owned output: no
+            // `output` field is exposed, so origin correlation and patching
+            // leave the lowered result untouched.
+            return {
+                state: {
+                    status: "error",
+                    input,
+                    error: normalizedOutput,
+                    ...(isRecord(rawState.metadata) ? { metadata: rawState.metadata } : {}),
+                },
+                opaqueResult: output === undefined,
+                error: normalizedOutput,
+            }
+        }
         return {
             state: {
                 status: "completed",
