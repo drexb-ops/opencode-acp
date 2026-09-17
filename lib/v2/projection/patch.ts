@@ -82,6 +82,16 @@ function partIdKey(part: AiContentPart): string | undefined {
     return type && id ? `${type}:${id}` : undefined
 }
 
+/**
+ * Parts ACP itself created in an earlier cycle. They are regenerated as fresh
+ * objects at their deterministic slot on every pass, so replayed outgoing
+ * snapshots must not pin their old object identity.
+ */
+function isAcpRegeneratedPart(part: AiContentPart): boolean {
+    const id = contentId(part)
+    return id?.startsWith("prt_dcp_text_") === true || id?.startsWith("prt_dcp_summary_") === true
+}
+
 function buildMessageIndexes(messages: readonly AiMessageValue[]): MessageIndexes {
     const byObject = new Map<object, number>()
     const byId = new Map<string, number | undefined>()
@@ -1387,11 +1397,27 @@ export function applyV2ContextPatch(
             ) {
                 return reject("opaque-origin", "A replacement changed provider-owned content")
             }
-            for (const [contentIndex, originalPart] of opaqueOrigin?.opaqueContent ?? []) {
-                const candidate = aiContent(message)[contentIndex]
-                if (!candidate || candidate !== originalPart) {
+            // Provider-owned opaque parts are retained by stable identity and
+            // relative order, not fixed numeric positions: ACP insertions may
+            // legally shift every later index inside the same message.
+            const requiredParts = [...(opaqueOrigin?.opaqueContent ?? [])]
+                .sort(([left], [right]) => left - right)
+                .map(([, part]) => part)
+                .filter((part) => !isAcpRegeneratedPart(part))
+            const content = aiContent(message)
+            let searchFrom = 0
+            for (const requiredPart of requiredParts) {
+                let matchIndex = -1
+                for (let i = searchFrom; i < content.length; i++) {
+                    if (content[i] === requiredPart) {
+                        matchIndex = i
+                        break
+                    }
+                }
+                if (matchIndex === -1) {
                     return reject("opaque-origin", "A replacement changed provider-owned content")
                 }
+                searchFrom = matchIndex + 1
             }
         }
 
