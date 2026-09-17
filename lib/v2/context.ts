@@ -14,6 +14,7 @@ import type { V2HostAdapter } from "./host"
 import {
     applyV2ContextPatch,
     normalizeV2ProjectedHistory,
+    restoreMissingV2OpaqueSources,
     type V2ProjectionModel,
 } from "./projection"
 import { isAcpOwnedNoticeId } from "./projection/shared"
@@ -183,6 +184,21 @@ export function createV2ContextHandler(
                             typeof message.info.id === "string" ? message.info.id : undefined,
                         ),
                 )
+                const opaqueRestoration = restoreMissingV2OpaqueSources(
+                    projection,
+                    prepared.workingMessages,
+                )
+                if (!opaqueRestoration.accepted) {
+                    logger.warn(
+                        "V2 opaque source restoration rejected; preserving provider request",
+                        {
+                            sessionId: event.sessionID,
+                            reason: opaqueRestoration.reason,
+                        },
+                    )
+                    return undefined
+                }
+                prepared.workingMessages = opaqueRestoration.messages
                 const patch = applyV2ContextPatch(
                     projection,
                     prepared.workingMessages,

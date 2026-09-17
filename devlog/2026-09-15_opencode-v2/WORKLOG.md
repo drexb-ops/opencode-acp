@@ -2,9 +2,9 @@
 
 - Task ID: `2026-09-15_opencode-v2`
 - Home Repo: `opencode-acp`
-- Status: ReadyForPR
-- Updated: 2026-09-16 20:43 UTC
-- Final audited range: `707e360..f392fb8`
+- Status: Completed — issue #418 moved to `2026-09-17_opaque-compaction-restore`
+- Updated: 2026-09-17
+- Final audited range (historical pre-#418 migration work): `707e360..f392fb8`
 - References: #395, #404, #407, #415
 
 ## 1. Summary
@@ -419,7 +419,7 @@
   fallback classification examines only fresh attempt logs and rejects any
   additional activation/schema/import diagnostics.
 
-## 15. Final verification evidence
+## 15. Historical final verification evidence before issue #418
 
 ### Lead-owned source and package checks
 
@@ -467,7 +467,14 @@
 - Interactive terminal rendering was intentionally not started; typed RPC-to-TUI
   behavior remains covered by `tests/v2-notifications.test.ts`.
 
-### Review gate
+## 16. Post-merge follow-up: issue #418
+
+- A real long-lived V2 session later exposed an opaque native-compaction
+  restoration case. It is tracked as [#418](https://github.com/ranxianglei/opencode-acp/issues/418)
+  on a separate follow-up branch and devlog. It is not part of this merged
+  migration commit range.
+
+### Historical review gate
 
 - Reviewer A and reviewer B each completed a full read-only source/test/E2E/doc
   review. They found quality-retry, replay correlation/performance,
@@ -483,7 +490,8 @@
 | Reviewer A — runtime correctness  | `ses_f54a18254ffeI7EOwAAg5TPrxo` | Every modified source/test/E2E/verifier/doc path; initial review plus three closure refreshes | No P0/P1/P2 findings; complete independent AGENTS.md review        |
 | Reviewer B — test/artifact safety | `ses_f54a10c54fferJdnE2EeYWIj7G` | Same complete inventory; independent initial review plus closure refreshes                    | No P0/P1/P2 findings; second complete independent AGENTS.md review |
 
-- **PASS**: the dual-agent source and test review requirement is satisfied for
-  the complete `707e360..f392fb8` corrective delta. Both reviewers used
-  current direct source for final sign-off. No merge, publish, version bump, or
-  changelog change was performed.
+- **PASS (historical scope only)**: the dual-agent source and test review
+  requirement was satisfied for the complete `707e360..f392fb8` corrective delta.
+  Both reviewers used current direct source for that prior scope. This does not
+  include issue #418. No merge, publish, version bump, or changelog change was
+  performed.
