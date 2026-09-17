@@ -160,30 +160,44 @@ function buildProviderCheckpoint(
 ): void {
     if (!draft.normalizedMessageId) return
     const parts: Part[] = []
-    let sequence = 0
-    for (const messageIndex of draft.outgoingMessageIndices) {
-        const message = messages[messageIndex]
-        const rendered = aiContent(message)
-            .map((part) => {
-                if (contentType(part) === "text") return contentText(part) ?? ""
-                if (contentType(part) === "reasoning") return contentText(part) ?? ""
-                if (contentType(part) === "tool-call") {
-                    return `[tool call ${contentCallId(part) ?? "unknown"}]`
-                }
-                if (contentType(part) === "tool-result")
-                    return `[tool result ${contentResultId(part) ?? "unknown"}]`
-                if (contentType(part) === "media") return "[media attachment]"
-                return `[${contentType(part) ?? "provider content"}]`
-            })
-            .join("\n")
-        const key = `source:${draft.sourceIndex}:checkpoint:${sequence++}`
-        const origin = newOrigin(draft, key, "text", true)
-        origin.normalizedText = rendered
-        for (let contentIndex = 0; contentIndex < aiContent(message).length; contentIndex++) {
-            addPointer(origin, { messageIndex, contentIndex }, messages)
+    if (draft.outgoingMessageIndices.length > 0) {
+        let sequence = 0
+        for (const messageIndex of draft.outgoingMessageIndices) {
+            const message = messages[messageIndex]
+            const rendered = aiContent(message)
+                .map((part) => {
+                    if (contentType(part) === "text") return contentText(part) ?? ""
+                    if (contentType(part) === "reasoning") return contentText(part) ?? ""
+                    if (contentType(part) === "tool-call") {
+                        return `[tool call ${contentCallId(part) ?? "unknown"}]`
+                    }
+                    if (contentType(part) === "tool-result")
+                        return `[tool result ${contentResultId(part) ?? "unknown"}]`
+                    if (contentType(part) === "media") return "[media attachment]"
+                    return `[${contentType(part) ?? "provider content"}]`
+                })
+                .join("\n")
+            const key = `source:${draft.sourceIndex}:checkpoint:${sequence++}`
+            const origin = newOrigin(draft, key, "text", true)
+            origin.normalizedText = rendered
+            for (let contentIndex = 0; contentIndex < aiContent(message).length; contentIndex++) {
+                addPointer(origin, { messageIndex, contentIndex }, messages)
+            }
+            draft.origins.push(origin)
+            parts.push(internalTextPart(sessionID, draft.normalizedMessageId, key, rendered, true))
         }
+    } else {
+        // No correlated outgoing message: the checkpoint is absent from the
+        // outgoing view (incompatible model switch excluded it and re-expanded
+        // the originals, or this is the direct-tool path with no outgoing).
+        // Render from the source compaction data so the model still sees the
+        // checkpoint's summary and recent context.
+        const text = lowerCompactionText(draft.source)
+        const key = `source:${draft.sourceIndex}:checkpoint:source`
+        const origin = newOrigin(draft, key, "text", true)
+        origin.normalizedText = text
         draft.origins.push(origin)
-        parts.push(internalTextPart(sessionID, draft.normalizedMessageId, key, rendered, true))
+        parts.push(internalTextPart(sessionID, draft.normalizedMessageId, key, text, true))
     }
     draft.normalized = {
         info: messageInfoForSource(draft, sessionID, options),
@@ -496,12 +510,18 @@ function claimCheckpointRanges(
             .sort((left, right) => left - right)[0]
         const start = previous === undefined ? 0 : previous + 1
         const end = next === undefined ? messages.length : next
+        // Claim only when exactly one unambiguous candidate exists. >1 means
+        // re-expanded originals from an incompatible model switch; 0 means the
+        // checkpoint is absent from the outgoing view. Both must stay
+        // uncorrelated so originals remain individually addressable.
+        const candidates: number[] = []
         for (let index = start; index < end; index++) {
-            if (!claimed.has(index)) {
-                claimed.add(index)
-                checkpoint.outgoingMessageIndices.push(index)
-            }
+            if (!claimed.has(index)) candidates.push(index)
         }
+        if (candidates.length !== 1) continue
+        const index = candidates[0]!
+        claimed.add(index)
+        checkpoint.outgoingMessageIndices.push(index)
     }
 }
 
