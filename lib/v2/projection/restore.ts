@@ -137,6 +137,13 @@ export function restoreMissingV2OpaqueSources(
         const source = normalizedById.get(id)
         if (!source) return reject(`Opaque source ${id} has no normalized source message`)
         if (entry.outgoingMessageIndices.length === 0) {
+            // A provider checkpoint with no outgoing correlation is absent from
+            // this request by definition (incompatible model switch or direct
+            // view): the outgoing history already carries its information as
+            // re-expanded host-owned originals, and the patcher accepts an
+            // absent uncorrelated entry. Restoring it would fabricate a message
+            // the host never sent, so skip instead of rejecting the whole patch.
+            if (entry.providerCheckpoint) return undefined
             return reject(`Opaque source ${id} has no exact lowered correlation`)
         }
 

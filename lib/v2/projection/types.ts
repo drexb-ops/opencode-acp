@@ -88,6 +88,19 @@ export interface V2ProvenanceEntry {
     protectedFields?: string[]
     /** Source removal is safe only when the origin is exact and unambiguous. */
     allowSourceRemoval: boolean
+    /**
+     * Native provider compaction checkpoint. When `outgoingMessageIndices` is
+     * empty this entry discloses an unsupported window: the checkpoint is
+     * visible in the public context but absent from the outgoing (model-aware)
+     * request — for example an incompatible model switch excluded it and
+     * re-expanded the original transcript, or the direct-tool view has no
+     * outgoing history at all. ACP then renders the entry from source
+     * compaction data (summary + recent context) and keeps every uncorrelated
+     * outgoing message as its own opaque host entry instead of inferring
+     * ownership from array position. Residual limitation: when exactly one
+     * candidate sits in the window ACP claims it as the decoded checkpoint, so
+     * a single re-expanded original is indistinguishable from it positionally.
+     */
     providerCheckpoint?: boolean
 }
 

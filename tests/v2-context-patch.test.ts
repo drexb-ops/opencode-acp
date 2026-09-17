@@ -942,3 +942,75 @@ test("rejects missing lowered correlation, duplicate transformed IDs, and duplic
     assert.equal(duplicateOrder.accepted, false)
     if (!duplicateOrder.accepted) assert.match(duplicateOrder.reason, /source order .* ambiguous/i)
 })
+
+test("keeps patches alive when an uncorrelated provider checkpoint is compressed away", () => {
+    const projected = [
+        {
+            type: "compaction",
+            id: "switch-compaction",
+            time: { created: 1 },
+            status: "completed",
+            reason: "auto",
+            summary: "earlier work summary",
+            recent: "recent context tail",
+            providerContext: {
+                version: 1,
+                provenance: {
+                    providerID: "provider-a",
+                    provider: "provider-a",
+                    modelID: "model-b",
+                    route: "responses",
+                    protocol: "openai-responses",
+                    endpoint: "https://provider.example/v1/responses",
+                },
+                messages: [],
+            },
+        },
+        { type: "user", id: "after-switch", time: { created: 2 }, text: "continue after the switch" },
+    ]
+    const originalUser = Message.make({
+        id: "original-user",
+        role: "user",
+        content: [{ type: "text", text: "original user request" }],
+    })
+    const originalAssistant = Message.make({
+        id: "original-assistant",
+        role: "assistant",
+        content: [{ type: "text", text: "original assistant reply" }],
+    })
+    const nextUser = Message.make({
+        id: "after-switch",
+        role: "user",
+        content: [{ type: "text", text: "continue after the switch" }],
+    })
+    const projection = normalizeV2ProjectedHistory(projected, [originalUser, originalAssistant, nextUser], {
+        sessionID: "switch-restore",
+        currentModel: model,
+    })
+    assert.equal(projection.valid, true)
+    const entry = projection.entries.find(
+        (candidate) => candidate.sourceMessageId === "switch-compaction",
+    )!
+    assert.equal(entry.providerCheckpoint, true)
+    assert.deepEqual(entry.outgoingMessageIndices, [])
+
+    // The shared engine compresses the normalized checkpoint away; only the
+    // uncorrelated re-expanded originals survive into the transformed sequence.
+    const transformed = projection.messages.filter(
+        (message) => message.info.id !== entry.normalizedMessageId,
+    )
+    assert.equal(transformed.length, projection.messages.length - 1)
+
+    // Pre-fix, restore rejected the whole patch here ("no exact lowered
+    // correlation"), discarding every ACP edit for the rest of the session.
+    const result = restoreMissingV2OpaqueSources(projection, transformed)
+    assert.equal(result.accepted, true)
+    if (!result.accepted) return
+    assert.deepEqual(result.restoredMessageIds, [])
+    assert.equal(result.messages.length, transformed.length)
+    for (const message of transformed) assert.ok(result.messages.includes(message))
+
+    // The full production pipeline stays green after the skip.
+    const patch = applyV2ContextPatch(projection, structuredClone(result.messages))
+    assert.equal(patch.accepted, true)
+})
