@@ -694,6 +694,7 @@ test("keeps re-expanded originals uncorrelated when an incompatible model switch
     assert.ok(providerEntry)
     assert.equal(providerEntry.sourceType, "provider-checkpoint")
     assert.equal(providerEntry.providerCheckpoint, true)
+    assert.equal(providerEntry.protected, true)
     // Two unclaimed candidates in the window mean the re-expanded originals;
     // claiming either by position would swallow host-owned content.
     assert.deepEqual(providerEntry.outgoingMessageIndices, [])
@@ -770,6 +771,10 @@ test("renders the provider checkpoint from source data when the direct view has 
         userSource("msg_direct-after", "direct question"),
     ]
     const projection = normalize(validatePublicMessages(projected), [])
+    // The direct view with non-checkpoint sources is rejected upstream; pin
+    // the disclosed unsupported window so it stays visible to readers.
+    assert.equal(projection.valid, false)
+    if (projection.rejection) assert.equal(projection.rejection.code, "invalid-source")
     const providerEntry = projection.entries.find(
         (entry) => entry.sourceMessageId === "msg_direct-checkpoint",
     )

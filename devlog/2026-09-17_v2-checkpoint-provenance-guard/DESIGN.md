@@ -26,12 +26,15 @@ Before this change, `claimCheckpointRanges` claimed **every unclaimed outgoing i
 | >1 | re-expanded originals from an incompatible model switch | leave all uncorrelated |
 | 0 | checkpoint absent from the outgoing view (incompatible switch or direct-tool view) | leave uncorrelated |
 
+Uniqueness here is positional, not content-based — see the first item in §5 for the single-re-expanded-original residual.
+
 Consequences of "uncorrelated":
 
 1. **Outgoing side**: each uncorrelated host message becomes its own `V2OutgoingProvenance` entry with `opaque: true` and `opaqueMessage = <message>` (`normalize.ts`, existing logic). The patcher rejects any non-object-identical replacement of such messages and keeps empty ones alive, so re-expanded originals survive into the final request byte-for-byte and remain individually identifiable in provenance.
 2. **Normalized side**: `buildProviderCheckpoint` now renders the entry from source compaction data when it has no outgoing indices — `lowerCompactionText(source)` (existing `<conversation-checkpoint>` envelope with summary + recent context) under origin key `source:{i}:checkpoint:source`, opaque text origin/part. The direct-tool path therefore sees the checkpoint content instead of zero parts.
 3. **Patch path safety** (verified in `patch.ts`): a normalized message whose entry has `outgoingMessageIndices: []` is skipped on removal without rejection; its opaque origins have no outgoing pointers so no content edits can be mapped; and because it carries a known normalized ID it can never become an ACP insertion — the fallback-rendered checkpoint is never injected into outgoing requests.
 4. **Disclosure**: an unsupported window is disclosed structurally — `providerCheckpoint: true` with `outgoingMessageIndices: []` — and documented on `V2ProvenanceEntry.providerCheckpoint`. No rejection is raised: the projection remains valid and usable, which matches the issue's "safe explicit fallback" acceptance option.
+5. **Restoration safety** (`restore.ts`, found during dual-agent review): once the shared engine compresses the normalized checkpoint away, `restoreMissingV2OpaqueSources` would otherwise reject the whole patch for an uncorrelated entry ("no exact lowered correlation") from `lib/v2/context.ts:187` — silently disabling every ACP edit for the rest of such sessions (a new failure mode this fix must not introduce). A provider checkpoint with empty indices is now skipped instead of restored: the outgoing request already carries its information as re-expanded host-owned originals, and fabricating a message the host never sent is worse than omitting one. Non-checkpoint opaque sources keep the fail-closed rejection.
 
 ## 3. Trade-offs Considered
 
@@ -44,3 +47,9 @@ Consequences of "uncorrelated":
 - Compatible single-decoded-checkpoint windows correlate exactly as before (regression-locked by test).
 - Opaque provider checkpoints remain protected and non-removable (`patch.ts` guard unchanged).
 - No persisted-state format, internal-tag, or public-API signature changes.
+
+## 5. Known Residual Limitations
+
+- **Single re-expanded original is ambiguous** (pre-existing, not a regression): if the checkpoint covered exactly one transcript message and the incompatible switch re-expands just that one, the window holds exactly one candidate and ACP claims it as the decoded checkpoint — identical to pre-fix behavior. Content-preserving either way (the entry stays opaque/protected); hardening would require cross-checking against `source.providerContext`, which is empty for most checkpoints.
+- **An earlier unclaimed checkpoint widens the next window**: windows are computed over all drafts in source order. If an earlier checkpoint is incompatible (claims nothing), its re-expanded originals sit inside the *next* checkpoint's candidate scan, pushing its count above 1 and leaving a genuinely compatible decoded checkpoint uncorrelated (rendered from source data instead of the decoded message). Fail-safe and content-preserving; do not "simplify" the windowing without re-reading this.
+- **Multi-message decoded checkpoints are now uncorrelated**: pre-fix, a checkpoint lowering to multiple outgoing messages had all of them claimed; post-fix (>1 candidates) none are claimed. Content is still preserved via `lowerCompactionText`; correlation precision degrades only for providers that decode a checkpoint into more than one message.

@@ -97,7 +97,9 @@ export interface V2ProvenanceEntry {
      * outgoing history at all. ACP then renders the entry from source
      * compaction data (summary + recent context) and keeps every uncorrelated
      * outgoing message as its own opaque host entry instead of inferring
-     * ownership from array position.
+     * ownership from array position. Residual limitation: when exactly one
+     * candidate sits in the window ACP claims it as the decoded checkpoint, so
+     * a single re-expanded original is indistinguishable from it positionally.
      */
     providerCheckpoint?: boolean
 }
