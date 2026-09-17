@@ -6,20 +6,56 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Message, SystemPart } from "@opencode/ai"
 import type { PluginConfig } from "../lib/config"
+import { createCompressRangeToolDefinition } from "../lib/compress"
 import { createV2ContextHandler } from "../lib/v2/context"
 import { createV2Host, type V2Context, type V2HostAdapter } from "../lib/v2/host"
+import { createV2Tool } from "../lib/v2/tools"
 import { Logger } from "../lib/logger"
 import { PromptStore } from "../lib/prompts/store"
 import {
     cloneSessionState,
+    createSessionState,
     saveSessionState,
     SessionStateRegistry,
     type CompressionBlock,
+    type SessionState,
     type WithParts,
 } from "../lib/state"
 
 const modelA = { id: "model-a", providerID: "provider-a" }
 const modelB = { id: "model-b", providerID: "provider-b" }
+
+function makeNativeCompactionFixture(id: string) {
+    const expectedContent = [
+        {
+            type: "compaction" as const,
+            provider: "provider-a",
+            text: "native provider checkpoint",
+        },
+    ] as const
+    const expectedProviderMetadata = {
+        "provider-a": {
+            checkpoint: { responseID: "native-summary", sequence: 7 },
+        },
+    } as const
+    const expectedNative = {
+        "provider-a": {
+            checkpoint: { encrypted: false, source: "fixture" },
+        },
+    } as const
+    return {
+        expectedContent,
+        expectedProviderMetadata,
+        expectedNative,
+        message: Message.make({
+            id,
+            role: "user",
+            content: expectedContent,
+            providerMetadata: expectedProviderMetadata,
+            native: expectedNative,
+        }),
+    }
+}
 
 function config(storagePath: string, debug = false): PluginConfig {
     return {
@@ -42,13 +78,29 @@ function config(storagePath: string, debug = false): PluginConfig {
             candidates: false,
             maxContextLimit: 90_000,
             minContextLimit: 80_000,
+            contextLimitFallback: 128_000,
             nudgeFrequency: 5,
+            minNudgeContextPercent: 5,
+            nudgeGrowthTokens: 50_000,
+            toolOutputNudgeThreshold: 5_000,
             iterationNudgeThreshold: 15,
             nudgeForce: "soft",
             protectedTools: [],
             protectTags: false,
             protectUserMessages: false,
+            maxSummaryLengthHard: 20_000,
+            minCompressRange: 5_000,
+            minNudgeGrowthRatio: 0.45,
+            minNudgeGrowthFloor: 5_000,
+            emergencyThresholdPercent: "98%",
+            maxVisibleSegments: 50,
+            keepEmbedMaxChars: 2_000,
+            lastSegmentSoftBlock: true,
+            preserveRecentMessages: 5,
+            preserveRecentTokens: 5_000,
+            preserveLastUserMessage: true,
             reasoning: { drop: true, threshold: 2048 },
+            completionReserveTokens: 32_768,
         },
         gc: {
             algorithm: "truncate",
@@ -58,9 +110,76 @@ function config(storagePath: string, debug = false): PluginConfig {
             majorGcThresholdPercent: "100%",
             batchCleanup: { lowThreshold: "60%", highThreshold: "75%", forceThreshold: "90%" },
         },
-        qualityGate: { enabled: false, algorithm: "rouge-recall-v1", algorithms: {} },
-        messageFilters: { enabled: false, filters: {} },
+        qualityGate: {
+            enabled: false,
+            algorithm: "rouge-recall-v1",
+            algorithms: {
+                "rouge-recall-v1": {
+                    layer1MinChars: 200,
+                    layer1MinRetentionPct: 5,
+                    layer2MaxRougeF1: 0.05,
+                    layer2MaxTop20Recall: 0.2,
+                },
+            },
+        },
+        messageFilters: {
+            enabled: false,
+            filters: {
+                "omo-system-reminder": { enabled: true },
+                "omo-todo-continuation": { enabled: true },
+                "omo-context": { enabled: true },
+                "omo-task-directive": { enabled: true },
+                "omo-mode-injection": { enabled: true },
+            },
+        },
     }
+}
+
+function seedActiveCompactionBlock(
+    state: SessionState,
+    messageID: string,
+    blockId = 1,
+): CompressionBlock {
+    const block: CompressionBlock = {
+        blockId,
+        runId: blockId,
+        active: true,
+        deactivatedByUser: false,
+        compressedTokens: 1,
+        effectiveCompressedTokens: 1,
+        summaryTokens: 1,
+        durationMs: 0,
+        mode: "range",
+        tier: 1,
+        topic: "opaque compaction fixture",
+        startId: messageID,
+        endId: messageID,
+        anchorMessageId: messageID,
+        compressMessageId: "opaque-before",
+        includedBlockIds: [],
+        consumedBlockIds: [],
+        parentBlockIds: [],
+        directMessageIds: [messageID],
+        directToolIds: [],
+        effectiveMessageIds: [messageID],
+        effectiveToolIds: [],
+        createdAt: 1,
+        summary: "opaque compaction fixture",
+        survivedCount: 0,
+        generation: "young",
+    }
+    state.prune.messages.blocksById.set(block.blockId, block)
+    state.prune.messages.activeBlockIds.add(block.blockId)
+    state.prune.messages.activeByAnchorMessageId.set(block.anchorMessageId, block.blockId)
+    state.prune.messages.byMessageId.set(messageID, {
+        tokenCount: block.compressedTokens,
+        allBlockIds: [block.blockId],
+        activeBlockIds: [block.blockId],
+    })
+    state.prune.messages.nextBlockId = blockId + 1
+    state.prune.messages.nextRunId = blockId + 1
+    state.prune.messages.membershipsVerified = true
+    return block
 }
 
 function host(
@@ -609,6 +728,257 @@ test("completed V2 compaction resets transient state while retaining active comp
     }
 })
 
+test("fresh V2 context commits opaque compaction restoration and initializes state", async () => {
+    const storage = mkdtempSync(join(tmpdir(), "acp-v2-fresh-opaque-"))
+    const seedLogger = new Logger(false, "silent")
+    const cfg = config(storage)
+    const seededState = createSessionState()
+    seededState.sessionId = "session"
+    seededState.storageDir = storage
+    seededState.stats.pruneTokenCounter = 41
+    seededState.stats.totalPruneTokens = 82
+    const seededBlock = seedActiveCompactionBlock(seededState, "fresh-opaque-compaction", 7)
+    await saveSessionState(seededState, seedLogger)
+    const stateFile = join(storage, "session.json")
+    const persistedBefore = readFileSync(stateFile, "utf8")
+
+    const logger = new Logger(false, "silent")
+    const registry = new SessionStateRegistry(logger, "/tmp/opencode-v2-context")
+    const prompts = new PromptStore(logger, "/tmp/opencode-v2-context")
+    const noticeID = "msg_acp_notice_abcdef0123456789"
+    const compaction = {
+        type: "compaction",
+        id: "fresh-opaque-compaction",
+        time: { created: 2 },
+        status: "completed",
+        reason: "auto",
+        summary: "native summary",
+        recent: "native recent",
+        providerState: { responseId: "native-summary" },
+    }
+    const staleAssistantText = "assistant <dcp-message-id>m00001</dcp-message-id>"
+    const projected = [
+        { type: "user", id: "opaque-before", time: { created: 1 }, text: "before" },
+        {
+            type: "synthetic",
+            id: noticeID,
+            time: { created: 1.5 },
+            text: "command output",
+            metadata: { acpOwned: true },
+        },
+        compaction,
+        {
+            type: "assistant",
+            id: "fresh-opaque-assistant",
+            time: { created: 3 },
+            agent: "code",
+            model: modelA,
+            content: [{ type: "text", text: staleAssistantText }],
+        },
+    ]
+    const adapter = host(new Map([["session", projected]]), [
+        { providerId: "provider-a", modelId: "model-a", contextLimit: 100_000 },
+    ])
+    const handler = createV2ContextHandler(adapter, registry, logger, cfg, prompts, {
+        global: undefined,
+        agents: {},
+    })
+    const nativeFixture = makeNativeCompactionFixture("fresh-opaque-compaction")
+    const nativeCompaction = nativeFixture.message
+    const event = context("session", modelA, [
+        Message.make({ id: "opaque-before", role: "user", content: "before" }),
+        Message.make({ id: noticeID, role: "user", content: "command output" }),
+        nativeCompaction,
+        Message.make({
+            id: "fresh-opaque-assistant",
+            role: "assistant",
+            content: staleAssistantText,
+        }),
+    ])
+
+    try {
+        assert.equal(registry.get("session"), undefined)
+        await handler(event)
+
+        const state = registry.get("session")
+        assert.ok(state)
+        assert.notEqual(readFileSync(stateFile, "utf8"), persistedBefore)
+        assert.equal(state.lastCompaction, 2)
+        assert.equal(state.modelContextLimit, 100_000)
+        assert.equal(state.stats.pruneTokenCounter, 41)
+        assert.equal(state.stats.totalPruneTokens, 82)
+        const recoveredBlock = state.prune.messages.blocksById.get(seededBlock.blockId)
+        assert.ok(recoveredBlock)
+        assert.equal(recoveredBlock.summary, seededBlock.summary)
+        assert.equal(recoveredBlock.active, true)
+
+        const restoredCompaction = event.messages.find(
+            (message) => message.id === "fresh-opaque-compaction",
+        )
+        assert.strictEqual(restoredCompaction, nativeCompaction)
+        assert.strictEqual(restoredCompaction?.content[0], nativeCompaction.content[0])
+        assert.deepEqual(restoredCompaction?.content, nativeFixture.expectedContent)
+        assert.deepEqual(
+            restoredCompaction?.providerMetadata,
+            nativeFixture.expectedProviderMetadata,
+        )
+        assert.deepEqual(restoredCompaction?.native, nativeFixture.expectedNative)
+        assert.equal(
+            event.messages.some((message) => message.id === noticeID),
+            false,
+        )
+        const sanitizedAssistant = event.messages.find(
+            (message) => message.id === "fresh-opaque-assistant",
+        )?.content[0]?.text
+        assert.match(sanitizedAssistant ?? "", /^assistant /)
+        assert.equal(sanitizedAssistant?.includes("m00001"), false)
+        assert.equal(event.system.length, 1)
+
+        const factoryCtx = {
+            host: adapter,
+            registry,
+            logger,
+            config: cfg,
+            prompts,
+        }
+        const compressTool = createV2Tool(
+            createCompressRangeToolDefinition(factoryCtx),
+            factoryCtx,
+            adapter,
+            { global: undefined, agents: {} },
+        )
+        const toolResult = await compressTool.execute(
+            {
+                content: [{ startId: "m99999", endId: "m99999", summary: "not executed" }],
+            },
+            {
+                sessionID: "session",
+                agent: "code",
+                messageID: "fresh-opaque-tool-message",
+                id: "fresh-opaque-tool-call",
+                progress: async () => {},
+            },
+        )
+        assert.doesNotMatch(String(toolResult.content), /no initialized state/i)
+    } finally {
+        rmSync(storage, { recursive: true, force: true })
+    }
+})
+
+test("V2 restores a dropped opaque compaction source before committing context state", async () => {
+    const run = runHandler(
+        [{ type: "user", id: "opaque-before", time: { created: 1 }, text: "before" }],
+        [Message.make({ id: "opaque-before", role: "user", content: "before" })],
+    )
+    await run.handler(run.event)
+
+    const state = run.registry.get("session")
+    assert.ok(state)
+    const compactBlock = seedActiveCompactionBlock(state, "opaque-compaction")
+
+    const noticeID = "msg_acp_notice_0123456789abcdef"
+    const compaction = {
+        type: "compaction",
+        id: "opaque-compaction",
+        time: { created: 2 },
+        status: "completed",
+        reason: "auto",
+        summary: "native summary",
+        recent: "native recent",
+        providerState: { responseId: "native-summary" },
+    }
+    const staleAssistantText = "assistant <dcp-message-id>m00001</dcp-message-id>"
+    run.adapter.projectedContext = async () => [
+        { type: "user", id: "opaque-before", time: { created: 1 }, text: "before" },
+        {
+            type: "synthetic",
+            id: noticeID,
+            time: { created: 1.5 },
+            text: "command output",
+            metadata: { acpOwned: true },
+        },
+        compaction,
+        {
+            type: "assistant",
+            id: "opaque-assistant",
+            time: { created: 3 },
+            agent: "code",
+            model: modelA,
+            content: [{ type: "text", text: staleAssistantText }],
+        },
+    ]
+
+    const nativeFixture = makeNativeCompactionFixture("opaque-compaction")
+    const nativeCompaction = nativeFixture.message
+    const event = context("session", modelA, [
+        Message.make({ id: "opaque-before", role: "user", content: "before" }),
+        Message.make({ id: noticeID, role: "user", content: "command output" }),
+        nativeCompaction,
+        Message.make({ id: "opaque-assistant", role: "assistant", content: staleAssistantText }),
+    ])
+
+    try {
+        await run.handler(event)
+
+        assert.equal(
+            event.messages.some((message) => message.id === "opaque-compaction"),
+            true,
+        )
+        const restoredCompaction = event.messages.find(
+            (message) => message.id === "opaque-compaction",
+        )
+        assert.strictEqual(restoredCompaction, nativeCompaction)
+        assert.strictEqual(restoredCompaction?.content[0], nativeCompaction.content[0])
+        assert.deepEqual(restoredCompaction?.content, nativeFixture.expectedContent)
+        assert.deepEqual(
+            restoredCompaction?.providerMetadata,
+            nativeFixture.expectedProviderMetadata,
+        )
+        assert.deepEqual(restoredCompaction?.native, nativeFixture.expectedNative)
+        assert.equal(
+            event.messages.some((message) => message.id === noticeID),
+            false,
+        )
+        const sanitizedAssistant = event.messages.find(
+            (message) => message.id === "opaque-assistant",
+        )?.content[0]?.text
+        assert.match(sanitizedAssistant ?? "", /^assistant /)
+        assert.equal(sanitizedAssistant?.includes("m00001"), false)
+        assert.equal(event.system.length, 1)
+        assert.ok(run.registry.get("session"))
+        assert.equal(existsSync(join(run.storage, "session.json")), true)
+
+        const factoryCtx = {
+            host: run.adapter,
+            registry: run.registry,
+            logger: run.logger,
+            config: run.config,
+            prompts: run.prompts,
+        }
+        const compressTool = createV2Tool(
+            createCompressRangeToolDefinition(factoryCtx),
+            factoryCtx,
+            run.adapter,
+            { global: undefined, agents: {} },
+        )
+        const toolResult = await compressTool.execute(
+            {
+                content: [{ startId: "m99999", endId: "m99999", summary: "not executed" }],
+            },
+            {
+                sessionID: "session",
+                agent: "code",
+                messageID: "opaque-tool-message",
+                id: "opaque-tool-call",
+                progress: async () => {},
+            },
+        )
+        assert.doesNotMatch(String(toolResult.content), /no initialized state/i)
+    } finally {
+        rmSync(run.storage, { recursive: true, force: true })
+    }
+})
+
 test("V2 sanitation is outbound-only for historical assistant text", async () => {
     const stale = "assistant <dcp-message-id>m00001</dcp-message-id>"
     const projected = [
@@ -694,7 +1064,7 @@ test("V2 denied agent permissions suppress the ACP prompt and nudges", async () 
     }
 })
 
-test("V2 rejected patch rolls back live state, event, persistence, and deferred effects", async () => {
+test("V2 ambiguous opaque restoration rolls back live state, event, persistence, and deferred effects", async () => {
     const storage = mkdtempSync(join(tmpdir(), "acp-v2-rejection-"))
     const logger = new Logger(false, "silent")
     const cfg = config(storage, true)
@@ -774,7 +1144,9 @@ test("V2 rejected patch rolls back live state, event, persistence, and deferred 
             { type: "user", id: "after-rejection", time: { created: 3 }, text: "safe user" },
         ])
         const event = context("session", modelA, [
-            Message.make({ role: "system", content: "opaque system" }),
+            // The changed opaque source has no exact lowered correlation; the
+            // restoration helper must fail closed rather than inventing one.
+            Message.make({ role: "system", content: "newer opaque system" }),
             Message.make({ id: "after-rejection", role: "user", content: "safe user" }),
         ])
         const eventMessagesBefore = event.messages

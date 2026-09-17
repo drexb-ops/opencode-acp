@@ -6,6 +6,7 @@ import type { Message as AiMessage, ContentPart } from "@opencode/ai"
 import {
     applyV2ContextPatch,
     normalizeV2ProjectedHistory,
+    restoreMissingV2OpaqueSources,
     type V2Projection,
 } from "../lib/v2/projection"
 
@@ -724,4 +725,220 @@ test("patches a realistic tool-heavy history with bounded provenance fingerprint
     // correlation correctness and bounded fingerprints are the deterministic
     // assertions, while the pre-indexed path must not regress catastrophically.
     assert.ok(elapsed < 30_000, `large history patch took ${elapsed}ms`)
+})
+
+test("restores missing protected opaque sources in source order without duplicating existing ones", () => {
+    const projected = [
+        { type: "user", id: "ordered-user-0", time: { created: 0 }, text: "first" },
+        { type: "system", id: "ordered-system", time: { created: 1 }, text: "system" },
+        { type: "user", id: "ordered-user-1", time: { created: 2 }, text: "middle" },
+        {
+            type: "compaction",
+            id: "ordered-compaction",
+            time: { created: 3 },
+            status: "completed",
+            summary: "summary",
+            recent: "recent",
+        },
+        {
+            type: "synthetic",
+            id: "ordered-foreign-synthetic",
+            time: { created: 4 },
+            text: "foreign synthetic",
+            metadata: { nested: { value: "original" } },
+        },
+        { type: "user", id: "ordered-user-2", time: { created: 5 }, text: "last" },
+    ]
+    const outgoing = [
+        Message.make({ id: "ordered-user-0", role: "user", content: "first" }),
+        Message.make({ role: "system", content: "system" }),
+        Message.make({ id: "ordered-user-1", role: "user", content: "middle" }),
+        Message.make({ id: "ordered-compaction", role: "user", content: "checkpoint" }),
+        Message.make({
+            id: "ordered-foreign-synthetic",
+            role: "user",
+            content: "foreign synthetic",
+        }),
+        Message.make({ id: "ordered-user-2", role: "user", content: "last" }),
+    ]
+    const projection = normalizeV2ProjectedHistory(projected, outgoing, {
+        sessionID: "ordered-opaque",
+        currentModel: model,
+    })
+    assert.equal(projection.valid, true)
+
+    const existingCompaction = projection.messages.find(
+        (message) => message.info.id === "ordered-compaction",
+    )!
+    const synthetic = structuredClone(projection.messages[0]!)
+    synthetic.info.id = "msg_dcp_summary_0123456789abcdef"
+    synthetic.parts = [
+        {
+            id: "prt_dcp_summary_0123456789abcdef",
+            sessionID: "ordered-opaque",
+            messageID: "msg_dcp_summary_0123456789abcdef",
+            type: "text",
+            text: "ACP summary",
+        },
+    ]
+    const transformed = [
+        projection.messages.find((message) => message.info.id === "ordered-user-0")!,
+        projection.messages.find((message) => message.info.id === "ordered-user-1")!,
+        existingCompaction,
+        synthetic,
+        projection.messages.find((message) => message.info.id === "ordered-user-2")!,
+    ]
+
+    const result = restoreMissingV2OpaqueSources(projection, transformed)
+    assert.equal(result.accepted, true)
+    if (!result.accepted) return
+    assert.deepEqual(
+        result.messages.map((message) => message.info.id),
+        [
+            "ordered-user-0",
+            "ordered-system",
+            "ordered-user-1",
+            "ordered-compaction",
+            "msg_dcp_summary_0123456789abcdef",
+            "ordered-foreign-synthetic",
+            "ordered-user-2",
+        ],
+    )
+    assert.deepEqual(result.restoredMessageIds, ["ordered-system", "ordered-foreign-synthetic"])
+    assert.equal(
+        result.messages.filter((message) => message.info.id === "ordered-compaction").length,
+        1,
+    )
+    assert.strictEqual(result.messages[3], existingCompaction)
+    assert.strictEqual(result.messages[4], synthetic)
+
+    const restoredSystem = result.messages[1]!
+    const originalSystem = projection.messages.find(
+        (message) => message.info.id === "ordered-system",
+    )!
+    assert.notStrictEqual(restoredSystem, originalSystem)
+    assert.notStrictEqual(restoredSystem.parts, originalSystem.parts)
+    restoredSystem.parts[0]!.text = "restoration copy"
+    assert.equal(originalSystem.parts[0]!.text, "system")
+
+    const restoredForeign = result.messages.find(
+        (message) => message.info.id === "ordered-foreign-synthetic",
+    )!
+    const originalForeign = projection.messages.find(
+        (message) => message.info.id === "ordered-foreign-synthetic",
+    )!
+    const restoredMetadata = (restoredForeign.info as { metadata?: Record<string, unknown> })
+        .metadata
+    const originalMetadata = (originalForeign.info as { metadata?: Record<string, unknown> })
+        .metadata
+    const restoredNested = restoredMetadata?.nested as Record<string, unknown>
+    restoredNested.value = "changed in restoration"
+    assert.equal((originalMetadata?.nested as Record<string, unknown>).value, "original")
+})
+
+test("fails closed when protected opaque provenance is missing or out of order", () => {
+    const projected = [
+        { type: "system", id: "ambiguous-system", time: { created: 0 }, text: "system" },
+        { type: "user", id: "ambiguous-user", time: { created: 1 }, text: "user" },
+    ]
+    const outgoing = [
+        Message.make({ role: "system", content: "system" }),
+        Message.make({ id: "ambiguous-user", role: "user", content: "user" }),
+    ]
+    const projection = normalizeV2ProjectedHistory(projected, outgoing, {
+        sessionID: "ambiguous-opaque",
+        currentModel: model,
+    })
+    assert.equal(projection.valid, true)
+
+    const missingSource = restoreMissingV2OpaqueSources(
+        {
+            ...projection,
+            messages: projection.messages.filter(
+                (message) => message.info.id !== "ambiguous-system",
+            ),
+        },
+        [projection.messages.find((message) => message.info.id === "ambiguous-user")!],
+    )
+    assert.equal(missingSource.accepted, false)
+    if (!missingSource.accepted) assert.match(missingSource.reason, /no normalized source message/)
+
+    const reversed = restoreMissingV2OpaqueSources(projection, [...projection.messages].reverse())
+    assert.equal(reversed.accepted, false)
+    if (!reversed.accepted) assert.match(reversed.reason, /ambiguous order/)
+})
+
+test("restores multiple opaque sources in order from an empty transformed sequence", () => {
+    const projected = [
+        {
+            type: "compaction",
+            id: "empty-compaction-1",
+            time: { created: 1 },
+            status: "completed",
+            summary: "one",
+            recent: "one",
+        },
+        {
+            type: "compaction",
+            id: "empty-compaction-2",
+            time: { created: 2 },
+            status: "completed",
+            summary: "two",
+            recent: "two",
+        },
+    ]
+    const outgoing = [
+        Message.make({ id: "empty-compaction-1", role: "user", content: "one" }),
+        Message.make({ id: "empty-compaction-2", role: "user", content: "two" }),
+    ]
+    const projection = normalizeV2ProjectedHistory(projected, outgoing, {
+        sessionID: "empty-opaque",
+        currentModel: model,
+    })
+    assert.equal(projection.valid, true)
+
+    const result = restoreMissingV2OpaqueSources(projection, [])
+    assert.equal(result.accepted, true)
+    if (!result.accepted) return
+    assert.deepEqual(
+        result.messages.map((message) => message.info.id),
+        ["empty-compaction-1", "empty-compaction-2"],
+    )
+})
+
+test("rejects missing lowered correlation, duplicate transformed IDs, and duplicate source order", () => {
+    const opaqueProjected = [
+        { type: "system", id: "correlation-system", time: { created: 1 }, text: "expected system" },
+        { type: "user", id: "correlation-user", time: { created: 2 }, text: "user" },
+    ]
+    const correlationProjection = normalizeV2ProjectedHistory(
+        opaqueProjected,
+        [
+            Message.make({ role: "system", content: "different system" }),
+            Message.make({ id: "correlation-user", role: "user", content: "user" }),
+        ],
+        { sessionID: "missing-correlation", currentModel: model },
+    )
+    assert.equal(correlationProjection.valid, true)
+    const missingCorrelation = restoreMissingV2OpaqueSources(correlationProjection, [])
+    assert.equal(missingCorrelation.accepted, false)
+    if (!missingCorrelation.accepted)
+        assert.match(missingCorrelation.reason, /exact lowered correlation/)
+
+    const duplicateTransformed = restoreMissingV2OpaqueSources(correlationProjection, [
+        correlationProjection.messages[1]!,
+        correlationProjection.messages[1]!,
+    ])
+    assert.equal(duplicateTransformed.accepted, false)
+    if (!duplicateTransformed.accepted)
+        assert.match(duplicateTransformed.reason, /transformed source message .* duplicated/i)
+
+    const entries = correlationProjection.entries.map((entry) =>
+        entry.sourceMessageId === "correlation-user"
+            ? { ...entry, sourceIndex: correlationProjection.entries[0]!.sourceIndex }
+            : entry,
+    )
+    const duplicateOrder = restoreMissingV2OpaqueSources({ ...correlationProjection, entries }, [])
+    assert.equal(duplicateOrder.accepted, false)
+    if (!duplicateOrder.accepted) assert.match(duplicateOrder.reason, /source order .* ambiguous/i)
 })
